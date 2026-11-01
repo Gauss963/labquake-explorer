@@ -353,19 +353,19 @@ class PZTSpectrumView(EventView):
         self.channel_combobox = ttk.Combobox(frame, width=14, state="readonly")
         self.channel_combobox.grid(row=2, column=1, padx=4, pady=2, sticky="w")
         self.channel_combobox.bind("<<ComboboxSelected>>", self.on_channel_selected)
-        ttk.Label(frame, text="Result set:").grid(row=3, column=0, padx=4, pady=2, sticky="e")
-        self.set_combobox = ttk.Combobox(frame, width=14, values=[DEFAULT_SET])   # editable: a new name creates a set
-        self.set_combobox.set(DEFAULT_SET)
-        self.set_combobox.grid(row=3, column=1, padx=4, pady=2, sticky="w")
-        for sequence in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
-            self.set_combobox.bind(sequence, self.on_set_changed, add="+")
-        ttk.Label(frame, text="type a new name to start another set (e.g. BAC, EGF)",
-                  foreground="#606060").grid(row=4, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w")
         ttk.Label(frame, text="Trigger:").grid(row=3, column=0, padx=4, pady=2, sticky="e")
         self.trigger_combobox = ttk.Combobox(frame, width=14, state="readonly", values=list(TRIGGERS))
         self.trigger_combobox.set(TRIGGER_EVENT_TIME)
         self.trigger_combobox.grid(row=3, column=1, padx=4, pady=2, sticky="w")
         self._live(self.trigger_combobox)
+        ttk.Label(frame, text="Result set:").grid(row=4, column=0, padx=4, pady=2, sticky="e")
+        self.set_combobox = ttk.Combobox(frame, width=14, values=[DEFAULT_SET])   # editable: a new name creates a set
+        self.set_combobox.set(DEFAULT_SET)
+        self.set_combobox.grid(row=4, column=1, padx=4, pady=2, sticky="w")
+        for sequence in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            self.set_combobox.bind(sequence, self.on_set_changed, add="+")
+        ttk.Label(frame, text="type a new name to start another set (e.g. BAC, EGF)",
+                  foreground="#606060").grid(row=5, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w")
 
     def _build_window_frame(self, master) -> None:
         frame = ttk.LabelFrame(master, text="Window")
