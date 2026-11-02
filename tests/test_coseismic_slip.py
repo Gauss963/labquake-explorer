@@ -336,3 +336,52 @@ def test_onset_step_and_shared_event_times():
     assert cs.restore_inputs(rec, rec["channels"])["shared_shift_s"] == pytest.approx(0.03)
     with pytest.raises(ValueError, match="onset threshold"):
         run(event, methods="onset", onset_fraction=1.5)
+
+
+def test_burst_time_and_levels_mode():
+    fs = 2e6
+    t = np.arange(0, 0.02, 1 / fs)
+    te = 0.010
+    slip = np.array([5.0 * (1 + np.tanh((t - te - k * 1e-4) / 2e-4)) for k in range(4)])     # 10 um steps
+    pzt = np.array([np.exp(-((t - te - 3e-4) / 5e-5) ** 2) * np.sin(2 * np.pi * 50e3 * t),
+                    np.zeros(t.size)])                                                       # burst 0.3 ms after
+    assert cs.burst_time(t, pzt, te, 3e-3) == pytest.approx(te + 3e-4, abs=2e-5)
+    assert cs.burst_time(t, None, te) is None and cs.burst_time(t, np.zeros((0, t.size)), te) is None
+    assert cs.burst_time(t, pzt, te + 0.009, 1e-4) is None                                  # nothing in the search
+    r = cs.analyze_slip(t, slip, te, -0.01, 0.01, methods="burst", pzt=pzt, window_mode="levels",
+                        burst_halfwidth_s=1e-3, level_width_s=1e-4, rate_filter="boxcar", rate_smoothing_s=1e-4)
+    assert r.window_mode == "levels" and r.burst_source == "pzt_envelope"
+    assert r.t_burst == pytest.approx(te + 3e-4, abs=2e-5)
+    for s in r.sensors:
+        assert s.method == "burst" and s.window_mode == "levels" and s.flags == []
+        assert s.t_shift_s == pytest.approx(3e-4, abs=2e-5)
+        assert s.fit_before_s == pytest.approx((s.t_shift_s - 1.1e-3, s.t_shift_s - 1e-3))
+        assert s.fit_after_s == pytest.approx((s.t_shift_s + 1e-3, s.t_shift_s + 1.1e-3))
+        assert s.before_level == pytest.approx(0.0, abs=0.05) and s.after_level == pytest.approx(10.0, abs=0.05)
+        assert s.coseismic_slip == pytest.approx(10.0, abs=0.05)
+    d = r.as_dict()
+    for key in ("window_mode", "burst_halfwidth_s", "level_width_s", "burst_search_s", "burst_source",
+                "t_burst_shift_s", "before_level_um", "after_level_um"):
+        assert key in d
+    assert d["t_burst_shift_s"] == pytest.approx(3e-4, abs=2e-5) and d["before_level_um"][0] == pytest.approx(0.0, abs=0.05)
+    json.dumps(d)
+    back = cs.restore_inputs(d, d["channels"])
+    assert back["window_mode"] == "levels" and back["burst_halfwidth_s"] == 1e-3 and back["burst_source"] == "pzt_envelope"
+    # without PZT traces the burst is the peak slip rate, flagged; 'peak_rate' asks for that outright
+    r2 = cs.analyze_slip(t, slip, te, -0.01, 0.01, methods="burst", window_mode="levels", rate_filter="boxcar",
+                         rate_smoothing_s=1e-4)
+    assert r2.t_burst == pytest.approx(r2.t_ref) and cs.FLAG_NO_PZT in r2.sensors[0].flags
+    r3 = cs.analyze_slip(t, slip, te, -0.01, 0.01, methods="burst", pzt=pzt, burst_source="peak_rate",
+                         rate_filter="boxcar", rate_smoothing_s=1e-4)
+    assert r3.t_burst == pytest.approx(r3.t_ref) and r3.sensors[0].flags == [] and r3.window_mode == "lines"
+    assert math.isnan(r3.sensors[0].before_level) and r3.sensors[0].coseismic_slip == pytest.approx(10.0, abs=0.2)
+    # the lines mode keeps the given windows; a record without the new keys reads as lines
+    r4 = cs.analyze_slip(t, slip, te, -0.01, 0.01, fit_before_s=(-0.008, -0.002), fit_after_s=(0.002, 0.008),
+                         rate_filter="boxcar", rate_smoothing_s=1e-4)
+    assert r4.sensors[0].fit_before_s == (-0.008, -0.002) and math.isnan(r4.t_burst)
+    old = {k: v for k, v in r4.as_dict().items() if "burst" not in k and "level" not in k and k != "window_mode"}
+    assert cs.restore_inputs(old, old["channels"])["window_mode"] == "lines"
+    for bad in ({"window_mode": "x"}, {"burst_source": "y"}, {"level_width_s": 0.0}, {"burst_search_s": -1.0},
+                {"burst_halfwidth_s": -1.0}):
+        with pytest.raises(ValueError):
+            cs.analyze_slip(t, slip, te, -0.01, 0.01, rate_filter="boxcar", rate_smoothing_s=1e-4, **bad)

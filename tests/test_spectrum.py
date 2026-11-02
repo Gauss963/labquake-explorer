@@ -1023,3 +1023,48 @@ def test_moment_unit_and_gain_divisor(tmp_path):
     for bad in (0.0, -1.0, float("nan")):
         with pytest.raises(ValueError):
             sp.Calibration.from_arrays([1.0, 10.0], [1.0, 1.0], "V/m", gain_divisor=bad)
+
+
+def test_bin_estimators():
+    t, x = make_pulse(20e3)
+    rng = np.random.default_rng(3)
+    w = sp.extract_window(t, x + rng.normal(0, 1e-3 * np.abs(x).max(), x.size), T0, PRE, POST)
+    rms = sp.compute_spectrum(w)
+    assert rms.meta["estimator"] == "rms"
+    logmean = sp.compute_spectrum(w, estimator="logmean")
+    median = sp.compute_spectrum(w, estimator="median")
+    for s in (logmean, median):
+        assert s.n_bins == rms.n_bins and np.allclose(s.f_binned, rms.f_binned)
+        assert np.all(np.isfinite(s.noise_binned)) and s.meta["noise_subtracted"] is False
+    assert np.all(logmean.amp_binned <= rms.amp_binned * (1 + 1e-9))      # a geometric mean never exceeds the rms
+    # a bin's logmean is the geometric mean of its raw amplitudes, its median their median
+    f, a = rms.f, rms.amp_signal
+    lo, hi, bpd = rms.meta["fmin"], rms.meta["fmax"], rms.meta["bins_per_decade"]
+    edges = np.logspace(np.log10(lo), np.log10(hi), int(math.ceil((np.log10(hi) - np.log10(lo)) * bpd)) + 1)
+    edges[0], edges[-1] = lo, hi                                       # the edges bin_spectrum uses
+    b = np.digitize(logmean.f_binned[3], edges) - 1
+    inside = (f >= lo) & (f <= hi) & (np.clip(np.digitize(f, edges) - 1, 0, edges.size - 2) == b) & np.isfinite(a) & (a > 0)
+    assert logmean.amp_binned[3] == pytest.approx(np.exp(np.mean(np.log(a[inside]))), rel=1e-6)
+    assert median.amp_binned[3] == pytest.approx(np.median(a[inside]), rel=1e-6)
+    # the fit re-bins with the same estimator; a bad name is refused; subtraction only applies to rms
+    assert sp.fit_omega_n(logmean, bins_per_decade=20, snr_min=None).valid
+    with pytest.raises(ValueError):
+        sp.compute_spectrum(w, estimator="mean")
+    assert sp.compute_spectrum(w, estimator="median", noise_subtract=True).meta["noise_subtracted"] is False
+    assert sp.bin_spectrum(rms, estimator="logmean").meta["estimator"] == "logmean"
+
+
+def test_attenuation_hold_ends(tmp_path):
+    att = sp.Attenuation.from_arrays([1e3, 1e4], [0.1, 0.01], 1e-4)
+    assert att.hold_ends is False and np.isnan(att.q_inv_at([500.0, 2e4])).all() and att.factor([500.0])[0] == 1.0
+    held = sp.Attenuation.from_arrays([1e3, 1e4], [0.1, 0.01], 1e-4, hold_ends=True)
+    assert held.q_inv_at([500.0])[0] == pytest.approx(0.1) and held.q_inv_at([2e4])[0] == pytest.approx(0.01)
+    assert held.factor([2e4])[0] == pytest.approx(np.exp(np.pi * 2e4 * 1e-4 * 0.01))
+    np.testing.assert_allclose(held.q_inv_at([1e3, 3e3, 1e4]), att.q_inv_at([1e3, 3e3, 1e4]))   # the same inside
+    d = held.as_dict()
+    assert d["hold_ends"] is True and sp.Attenuation.from_dict(d).hold_ends
+    assert sp.Attenuation.from_dict(att.as_dict()).hold_ends is False
+    csv = tmp_path / "q.csv"
+    csv.write_text("freq_kHz,Qp_inv_median\n1,0.1\n10,0.01\n")
+    loaded = sp.load_q_csv(csv, 2e-4, hold_ends=True)
+    assert loaded.hold_ends and loaded.travel_time_s == 2e-4 and loaded.fmin == 1e3

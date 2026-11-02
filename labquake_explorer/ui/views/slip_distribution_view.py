@@ -84,6 +84,7 @@ from labquake_explorer.analysis import coseismic_slip as cs
 from labquake_explorer.analysis import slip_profile as sprof
 from labquake_explorer.data.channels import channel_names, is_channel_array
 from labquake_explorer.data.picks import extraction_record
+from labquake_explorer.data.sources import waveform_blocks, waveform_channels
 from labquake_explorer.data.settings import get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
@@ -93,10 +94,12 @@ LIVE_DELAY_MS = 400                    # recompute this long after the last keys
 HANDLE_PICK_PX = 6                     # a press this close (pixels) to t_i or a window edge grabs it
 ZOOM_HALF_S = 0.2                      # "Zoom to t_i" shows t_i +- this
 METHOD_LABELS = {cs.METHOD_MAX_RATE: "max slip rate", cs.METHOD_ONSET: "slip-rate onset", cs.METHOD_STEP: "slip step",
-                 cs.METHOD_SHARED: "shared", cs.METHOD_MANUAL: "manual"}
-T_I_TABS = cs.PICK_METHODS + (cs.METHOD_SHARED,)   # the event-time tabs
+                 cs.METHOD_SHARED: "shared", cs.METHOD_BURST: "burst", cs.METHOD_MANUAL: "manual"}
+T_I_TABS = cs.PICK_METHODS + (cs.METHOD_SHARED, cs.METHOD_BURST)   # the event-time tabs
 T_I_TAB_LABELS = {cs.METHOD_MAX_RATE: "Max slip rate", cs.METHOD_ONSET: "Rate onset", cs.METHOD_STEP: "Slip step",
-                  cs.METHOD_SHARED: "Shared"}
+                  cs.METHOD_SHARED: "Shared", cs.METHOD_BURST: "Burst"}
+WAVEFORM_FIELD_PREFIX = "waveform/"    # a field made of a full-rate record's eddy channels (2 MHz)
+ZERO_FRACTION = 0.01                   # a waveform field's slip is zeroed on this first share of its samples
 RATE_FILTER_LABELS = {"lowpass": "Low-pass", "savgol": "Savitzky-Golay", "boxcar": "Moving average"}   # the tabs
 LOWPASS_LABELS = {"butterworth": "Butterworth", "bessel": "Bessel"}
 DEFAULT_SAVGOL_WINDOW_S = 0.020        # the Savitzky-Golay tab's window (the moving average's: cs default)
@@ -300,9 +303,11 @@ def _parse_int(text: str, name: str) -> int:
     return int(value)
 
 
-def slip_fields(event) -> list:
+def slip_fields(event, run=None) -> list:
     """Channel arrays of an event aligned with its time axis and in micrometres
-    (``slip`` first): the fields this view can analyse."""
+    (``slip`` first), then every full-rate record (``waveform/<recorder>``)
+    that holds the voltage channels the run's ``slip`` was made from: the
+    fields this view can analyse."""
     if not isinstance(event, dict) or "time" not in event:
         return []
     n = len(np.asarray(event["time"]).ravel())
@@ -310,7 +315,72 @@ def slip_fields(event) -> list:
     for key, value in event.items():
         if is_channel_array(value) and value["data"].shape[1] == n and str(value.get("unit", "")) == "um":
             out.append(str(key))
-    return sorted(out, key=lambda k: (k != "slip", k))
+    out = sorted(out, key=lambda k: (k != "slip", k))
+    sources = slip_sources(run)
+    for key, block in waveform_blocks(event).items():
+        if sources and any(c in sources for c in waveform_channels(block)):
+            out.append(str(key))
+    return out
+
+
+def slip_sources(run) -> dict:
+    """``{voltage channel: (slip row, name, x_mm, um per V)}`` of the run's
+    ``slip`` array (its ``source`` channels and ``slope_mm_per_v``); empty
+    when the run has none."""
+    slip = run.get("slip") if isinstance(run, dict) else None
+    if not is_channel_array(slip):
+        return {}
+    names = channel_names(slip)
+    sources = slip.get("source")
+    if sources is None:
+        return {}
+    sources = [s.decode() if isinstance(s, bytes) else str(s) for s in np.asarray(sources).ravel()]
+    slope = np.asarray(slip.get("slope_mm_per_v", np.nan), dtype=float).ravel()
+    if slope.size not in (1, len(names)):
+        return {}
+    try:
+        x = np.asarray(slip["positions"]["x"], dtype=float).ravel()
+    except (KeyError, TypeError, ValueError):
+        x = np.full(len(names), np.nan)
+    if x.size != len(names):
+        x = np.full(len(names), np.nan)
+    out = {}
+    for j, source in enumerate(sources[:len(names)]):
+        um_per_v = float(slope[j] if slope.size > 1 else slope[0]) * 1e3
+        if math.isfinite(um_per_v) and um_per_v != 0.0:
+            out[source] = (j, names[j], float(x[j]), um_per_v)
+    return out
+
+
+def waveform_slip_array(event, run, key: str) -> dict:
+    """The slip channel array made from a full-rate record: its eddy channels
+    (those the run's ``slip`` was made from) in micrometres on the record's own
+    time axis, each zeroed on its first samples, with the sensors' positions,
+    plus ``pzt``, the record's PZT traces (volts) for the burst pick."""
+    block = waveform_blocks(event).get(key)
+    if block is None:
+        raise ValueError(f"{key}: no such full-rate record")
+    sources = slip_sources(run)
+    names = waveform_channels(block)
+    data = np.asarray(block["data"], dtype=float)
+    time = np.asarray(block["time"], dtype=float).ravel()
+    if data.ndim != 2 or data.shape[1] != time.size:
+        raise ValueError(f"{key}: the record's data and time do not match")
+    rows = sorted((sources[c][0], k) for k, c in enumerate(names) if c in sources)
+    if not rows:
+        raise ValueError(f"{key}: none of the slip array's source channels ({', '.join(sources) or 'none'}) is in this record")
+    head = max(1, int(ZERO_FRACTION * time.size))
+    slip, channels, x = [], [], []
+    for _, k in rows:
+        j, name, x_mm, um_per_v = sources[names[k]]
+        trace = data[k] * um_per_v
+        slip.append(trace - float(np.nanmean(trace[:head])))
+        channels.append(name)
+        x.append(x_mm)
+    pzt = [data[k] for k, c in enumerate(names) if c.lower().startswith("pzt")]
+    return {"data": np.array(slip), "channels": channels, "unit": "um", "positions": {"x": x},
+            "time": time, "pzt": np.array(pzt) if pzt else None,
+            "sample_rate": float(block.get("sample_rate", 1.0 / cs.sampling_interval(time)))}
 
 
 @register_view("Slip Distribution", kinds=[EVENT], order=15)
@@ -325,6 +395,7 @@ class SlipDistributionView(EventView):
         self.unit = "um"
         self.data: Optional[np.ndarray] = None
         self.time: Optional[np.ndarray] = None
+        self.pzt: Optional[np.ndarray] = None     # the PZT traces of a waveform field (the burst pick)
         self.t_event = 0.0
         self.start_s = -1.0
         self.end_s = 1.0
@@ -430,6 +501,10 @@ class SlipDistributionView(EventView):
         self.step_var = tk.StringVar(master=self, value=_text(cs.DEFAULT_STEP_FRACTION * 100))
         self.shared_shift_var = tk.StringVar(master=self, value="")
         self.shared_source_var = tk.StringVar(master=self, value="reference")
+        self.burst_source_var = tk.StringVar(master=self, value=cs.DEFAULT_BURST_SOURCE)
+        self.burst_halfwidth_var = tk.StringVar(master=self, value=_text(cs.DEFAULT_BURST_HALFWIDTH_S * 1e3))
+        self.level_width_var = tk.StringVar(master=self, value=_text(cs.DEFAULT_LEVEL_WIDTH_S * 1e3))
+        self.burst_search_var = tk.StringVar(master=self, value=_text(cs.DEFAULT_BURST_SEARCH_S * 1e3))
         for var in (self.onset_var, self.step_var, self.shared_shift_var):
             self._shown[str(var)] = var.get()
         for var in self.settings_vars():
@@ -491,6 +566,22 @@ class SlipDistributionView(EventView):
         self._entry_only(tab, self.shared_shift_var, 2, 2, "shared t_i", self.on_shared_shift_edited, width=8)
         ttk.Label(tab, text="dragging the red line moves it", foreground="#606060").grid(
             row=3, column=0, columnspan=3, padx=4, sticky="w")
+        tab = tabs[cs.METHOD_BURST]
+        ttk.Label(tab, text="one t_i for every sensor at the AE burst; slip =\nlevel after - level before "
+                            "(no line extrapolation):", foreground="#606060", justify="left").grid(
+            row=0, column=0, columnspan=2, padx=4, sticky="w")
+        ttk.Radiobutton(tab, text="peak of the PZT envelope (a waveform field)", value="pzt_envelope",
+                        variable=self.burst_source_var, command=self.on_burst_source).grid(
+            row=1, column=0, columnspan=2, padx=4, sticky="w")
+        ttk.Radiobutton(tab, text="peak of the mean slip rate", value="peak_rate",
+                        variable=self.burst_source_var, command=self.on_burst_source).grid(
+            row=2, column=0, columnspan=2, padx=4, sticky="w")
+        self._entry(tab, "Half-width w (ms):", self.burst_halfwidth_var, 3, self.on_settings_edited, name="burst w")
+        self._entry(tab, "Level width (ms):", self.level_width_var, 4, self.on_settings_edited, name="level width")
+        self._entry(tab, "Search +- (ms):", self.burst_search_var, 5, self.on_settings_edited, name="burst search")
+        ttk.Label(tab, text="windows [t_i-w-d, t_i-w] and [t_i+w, t_i+w+d];\nchoose the waveform/<recorder> field "
+                            "for 2 MHz", foreground="#606060", justify="left").grid(
+            row=6, column=0, columnspan=2, padx=4, sticky="w")
         for key in T_I_TABS:
             self.t_i_notebook.add(tabs[key], text=T_I_TAB_LABELS[key])
         self.t_i_notebook.bind("<<NotebookTabChanged>>", lambda e: self.on_t_i_tab_changed())
@@ -698,7 +789,7 @@ class SlipDistributionView(EventView):
         super().set_event(event_idx)
 
     def on_event_loaded(self) -> None:
-        fields = slip_fields(self.event)
+        fields = slip_fields(self.event, self.get_run())
         if not fields:
             raise ValueError(f"{self.event_path} has no slip channel array (one row per sensor, in um) "
                              "to compute the coseismic slip of")
@@ -723,18 +814,28 @@ class SlipDistributionView(EventView):
     def extraction_window(self) -> tuple[float, float]:
         """The event's extraction window ``(start_s, end_s)`` around the event
         time: from the run's ``event_extraction``, else the event's time axis."""
-        try:
-            record = extraction_record(self.get_run())
-            start, end = float(record["start_s"]), float(record["end_s"])
-            if start < 0.0 < end:
-                return start, end
-        except (KeyError, TypeError, ValueError):
-            pass
+        if not self.is_waveform_field():         # a full-rate record has its own extent
+            try:
+                record = extraction_record(self.get_run())
+                start, end = float(record["start_s"]), float(record["end_s"])
+                if start < 0.0 < end:
+                    return start, end
+            except (KeyError, TypeError, ValueError):
+                pass
         dt = cs.sampling_interval(self.time)
         return min(float(self.time[0]) - self.t_event, -dt), max(float(self.time[-1]) - self.t_event + dt, dt)
 
+    def is_waveform_field(self, field: Optional[str] = None) -> bool:
+        field = self.field if field is None else field
+        return bool(field) and str(field).startswith(WAVEFORM_FIELD_PREFIX)
+
     def load_field(self, field: str, saved=None) -> None:
-        array = self.event[field]
+        if self.is_waveform_field(field):
+            array = waveform_slip_array(self.event, self.get_run(), field)
+            self.pzt = array.get("pzt")
+        else:
+            array = self.event[field]
+            self.pzt = None
         self.field = field
         self.channels = channel_names(array)
         self.data = np.asarray(array["data"], dtype=float)
@@ -745,7 +846,7 @@ class SlipDistributionView(EventView):
         except (KeyError, TypeError, ValueError):
             x = np.full(len(self.channels), np.nan)
         self.x_mm = x if x.size == len(self.channels) else np.full(len(self.channels), np.nan)
-        self.time = np.asarray(self.event["time"], dtype=float).ravel()
+        self.time = np.asarray(array["time"] if self.is_waveform_field(field) else self.event["time"], dtype=float).ravel()
         self.t_event = float(self.event["event_time"])
         self.start_s, self.end_s = self.extraction_window()
         n = len(self.channels)
@@ -855,8 +956,14 @@ class SlipDistributionView(EventView):
         self.shared_source_var.set("reference" if math.isnan(shared) else "set")
         value = shared if math.isfinite(shared) else typed
         self._show(self.shared_shift_var, _text(round(value * 1e3, 6)) if math.isfinite(value) else "")
+        self._show(self.burst_halfwidth_var, _text(round(inputs["burst_halfwidth_s"] * 1e3, 6)))
+        self._show(self.level_width_var, _text(round(inputs["level_width_s"] * 1e3, 6)))
+        self._show(self.burst_search_var, _text(round(inputs["burst_search_s"] * 1e3, 6)))
+        self.burst_source_var.set(inputs["burst_source"])
         methods = inputs["methods"]
-        if cs.METHOD_SHARED in methods:
+        if cs.METHOD_BURST in methods:
+            tab = cs.METHOD_BURST
+        elif cs.METHOD_SHARED in methods:
             tab = cs.METHOD_SHARED
         else:
             picks = [m for m in methods if m in cs.PICK_METHODS]
@@ -915,7 +1022,8 @@ class SlipDistributionView(EventView):
     # ----------------------------------------------------------- settings
     def settings_vars(self) -> tuple:
         return (self.reference_var, self.smoothing_var, self.savgol_window_var, self.savgol_order_var,
-                self.cutoff_var, self.lowpass_order_var, self.search_var, self.snr_var, self.onset_var, self.step_var)
+                self.cutoff_var, self.lowpass_order_var, self.search_var, self.snr_var, self.onset_var, self.step_var,
+                self.burst_halfwidth_var, self.level_width_var, self.burst_search_var)
 
     def rate_filter(self) -> str:
         """The filter of the tab shown."""
@@ -974,12 +1082,27 @@ class SlipDistributionView(EventView):
         shared = float("nan")
         if self.shared_source_var.get() == "set":
             shared = _parse(self.shared_shift_var.get(), "shared t_i (ms)", 1e-3)
+        burst_w = _parse(self.burst_halfwidth_var.get(), "burst half-width (ms)", 1e-3)
+        level_d = _parse(self.level_width_var.get(), "level width (ms)", 1e-3)
+        burst_search = _parse(self.burst_search_var.get(), "burst search half-width (ms)", 1e-3)
+        if burst_w < 0:
+            raise ValueError("the burst half-width must be >= 0")
+        if level_d <= 0:
+            raise ValueError("the level width must be > 0")
+        if burst_search <= 0:
+            raise ValueError("the burst search half-width must be > 0")
+        burst_source = self.burst_source_var.get()
+        if burst_source not in cs.BURST_SOURCES:
+            raise ValueError("choose where the burst is picked")
         rate_filter = self.rate_filter()
         return {"rate_filter": rate_filter, "rate_cutoff_hz": cutoff, "rate_lowpass_order": lowpass_order,
                 "rate_lowpass_type": self.lowpass_type(), "rate_savgol_order": savgol_order,
                 "rate_smoothing_s": savgol if rate_filter == "savgol" else boxcar,
                 "search_halfwidth_s": search, "rate_snr": snr, "reference_halfwidth_s": reference,
-                "onset_fraction": onset, "step_fraction": step, "shared_shift_s": shared}
+                "onset_fraction": onset, "step_fraction": step, "shared_shift_s": shared,
+                "window_mode": "levels" if self.t_i_method() == cs.METHOD_BURST else "lines",
+                "burst_halfwidth_s": burst_w, "level_width_s": level_d, "burst_search_s": burst_search,
+                "burst_source": burst_source}
 
     def filter_windows(self) -> dict:
         """The windows of the two windowed filters, whichever tab is shown (s)."""
@@ -1029,7 +1152,7 @@ class SlipDistributionView(EventView):
             result = cs.analyze_slip(self.time, self.data, self.t_event, self.start_s, self.end_s,
                                      channels=self.channels, x_mm=self.x_mm, methods=self.methods,
                                      t_shift_s=self.t_shift, fit_before_s=self.fit_before,
-                                     fit_after_s=self.fit_after, **settings)
+                                     fit_after_s=self.fit_after, pzt=self.pzt, **settings)
         except ValueError as e:
             self.status_var.set(f"not recomputed: {e}")      # the plot still shows the last result
             self._stale = True
@@ -1175,8 +1298,8 @@ class SlipDistributionView(EventView):
     def methods_for(self, tab: str, methods) -> list:
         """The sensors' methods under ``tab``: all shared, or the tab's pick except
         for the sensors set by hand."""
-        if tab == cs.METHOD_SHARED:
-            return [cs.METHOD_SHARED] * len(methods)
+        if tab in (cs.METHOD_SHARED, cs.METHOD_BURST):
+            return [tab] * len(methods)
         return [m if m == cs.METHOD_MANUAL else tab for m in methods]
 
     def on_t_i_tab_changed(self) -> None:
@@ -1195,6 +1318,14 @@ class SlipDistributionView(EventView):
             self._show(self.shared_shift_var, _text(round(ref * 1e3, 6)))   # start from the reference
         if self.t_i_method() == cs.METHOD_SHARED:
             self.recompute()
+
+    def on_burst_source(self) -> None:
+        """The burst is picked elsewhere: recompute when the Burst tab is shown."""
+        self.flush_pending()
+        if self.t_i_method() == cs.METHOD_BURST:
+            self.recompute()
+        else:
+            self.update_status()
 
     def on_shared_shift_edited(self) -> None:
         if self._syncing or not self._edited(self.shared_shift_var):

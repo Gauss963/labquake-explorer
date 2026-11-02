@@ -1197,3 +1197,101 @@ def test_edges_kept_where_earlier_files_put_them_are_read_and_moved(slip_app, la
         assert dm.data["analysis"]["fault"] == {"patch_x_mm": [150.0, 410.0], "ends_x_mm": [0.0, 500.0]}
     finally:
         v.on_close()
+
+
+def block_2mhz(event, te, x, um_per_v):
+    """A 2 MHz record with eight eddy probes (a bell-shaped step at the event) and four PZTs (a burst 0.25 ms after)."""
+    from labquake_explorer.data.channels import channel_array
+    fs = 2e6
+    trig = te - 0.02
+    t = trig - 0.1 + np.arange(int(0.3 * fs)) / fs
+    names = [f"eddy_{j}" for j in range(1, 9)] + [f"pzt_{j}" for j in range(1, 5)]
+    rows = []
+    for xj in x:
+        amp = 12.0 * np.exp(-((xj - 250.0) / 120.0) ** 2)
+        rows.append(amp / um_per_v * 0.5 * (1 + np.tanh((t - te - 2e-4) / 1.5e-4))
+                    + 1e-4 * np.random.default_rng(int(xj)).normal(size=t.size))
+    for _ in range(4):
+        rows.append(0.3 * np.exp(-((t - te - 2.5e-4) / 8e-5) ** 2) * np.sin(2 * np.pi * 40e3 * t))
+    event["waveform"] = {"elsys": channel_array(np.array(rows, dtype=np.float32), names, unit="V",
+                                                positions={"x": list(x) + [100, 200, 300, 400]}, time=t,
+                                                sample_rate=fs, trigger_time=trig, block=3)}
+    return t
+
+
+def test_waveform_field_and_burst_tab(slip_app):
+    from labquake_explorer.data.channels import channel_array
+    from labquake_explorer.ui.views.slip_distribution_view import slip_sources, waveform_slip_array
+    run = slip_app.data_manager.get_data("runs/[0]")
+    event = run["events"][1]
+    te = float(event["event_time"])
+    x = np.array([31, 93, 155, 217, 279, 341, 403, 465], float)
+    um_per_v = -95.58
+    expected = [12.0 * np.exp(-((xj - 250.0) / 120.0) ** 2) for xj in x]
+    block_2mhz(event, te, x, um_per_v)
+    assert slip_fields(event, run) == ["slip"]                       # the run has no slip array: no source channels
+    run["slip"] = channel_array(np.zeros((8, 10)), [f"slip_{j}" for j in range(1, 9)], unit="um",
+                                positions={"x": list(x)}, source=[f"eddy_{j}" for j in range(1, 9)],
+                                slope_mm_per_v=um_per_v / 1e3)
+    assert set(slip_sources(run)) == {f"eddy_{j}" for j in range(1, 9)} and slip_sources(run)["eddy_3"][1:] == ("slip_3", 155.0, um_per_v)
+    assert slip_fields(event, run) == ["slip", "waveform/elsys"]
+    arr = waveform_slip_array(event, run, "waveform/elsys")
+    assert arr["data"].shape == (8, 600000) and arr["channels"][0] == "slip_1" and arr["positions"]["x"] == list(x)
+    assert arr["pzt"].shape == (4, 600000) and arr["unit"] == "um"
+    assert abs(float(np.mean(arr["data"][0][:1000]))) < 0.05          # zeroed on its first samples
+    with pytest.raises(ValueError):
+        waveform_slip_array(event, run, "waveform/nope")
+    view = SlipDistributionView(slip_app, 0, 1)
+    try:
+        assert list(view.field_combobox["values"]) == ["slip", "waveform/elsys"] and view.field == "slip"
+        assert view.pzt is None
+        view.field_combobox.set("waveform/elsys")
+        view.on_field_selected()
+        assert view.field == "waveform/elsys" and view.time.size == 600000 and view.pzt is not None
+        assert view.start_s == pytest.approx(-0.12, abs=1e-3) and view.end_s == pytest.approx(0.18, abs=1e-3)
+        assert view.result is not None and view.result.window_mode == "lines"
+        view.select_t_i_method(cs.METHOD_BURST)
+        r = view.result
+        assert r.window_mode == "levels" and set(view.methods) == {cs.METHOD_BURST}
+        assert r.t_burst - te == pytest.approx(2.5e-4, abs=2e-5) and r.burst_source == "pzt_envelope"
+        assert [s.coseismic_slip for s in r.sensors] == pytest.approx(expected, abs=0.1)
+        assert view.profile_fit is not None and view.profile_fit.valid and view.profile_fit.peak == pytest.approx(12.0, rel=0.05)
+        # the burst entries reach the analysis; bad ones are reported
+        view.burst_halfwidth_var.set("2")
+        view.on_settings_edited()
+        view.flush_pending()
+        assert view.result.burst_halfwidth_s == 2e-3 and view.result.sensors[0].fit_after_s[0] == pytest.approx(view.result.sensors[0].t_shift_s + 2e-3)
+        view.level_width_var.set("0")
+        view.on_settings_edited()
+        view.flush_pending()
+        assert "level width" in view.status_var.get()
+        view.level_width_var.set("0.1")
+        view.on_settings_edited()
+        view.flush_pending()
+        view.burst_source_var.set("peak_rate")
+        view.on_burst_source()
+        assert view.result.burst_source == "peak_rate" and view.result.t_burst == pytest.approx(view.result.t_ref)
+        view.burst_source_var.set("pzt_envelope")
+        view.on_burst_source()
+        assert view.result.t_burst - te == pytest.approx(2.5e-4, abs=2e-5)
+        assert view.save()
+        rec = event["slip_analysis"]
+        assert rec["field"] == "waveform/elsys" and rec["window_mode"] == "levels" and rec["time_method"][0] == "burst"
+        assert rec["t_burst_shift_s"] == pytest.approx(2.5e-4, abs=2e-5) and rec["burst_halfwidth_s"] == 2e-3
+        assert rec["coseismic_slip_um"] == pytest.approx(expected, abs=0.1)
+        view.on_close()
+        v2 = SlipDistributionView(slip_app, 0, 1)
+        try:
+            assert v2.field == "waveform/elsys" and v2.t_i_method() == cs.METHOD_BURST
+            assert v2.burst_halfwidth_var.get() == "2" and v2.burst_source_var.get() == "pzt_envelope"
+            assert v2.result.window_mode == "levels" and "matches the save" in v2.status_var.get()
+            v2.field_combobox.set("slip")                         # back to the 2 kHz field: lines, no PZT
+            v2.on_field_selected()
+            assert v2.field == "slip" and v2.pzt is None
+            v2.select_t_i_method(cs.METHOD_MAX_RATE)
+            assert v2.result.window_mode == "lines"
+        finally:
+            v2.on_close()
+    finally:
+        if view in slip_app.child_windows:
+            view.on_close()

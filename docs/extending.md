@@ -134,8 +134,11 @@ What the Pick Events form last saved, and what it starts from when reopened:
 `event_indices` (the picks, sample indices on the run's time axis), `start_s` and
 `end_s` (the window around each pick, seconds, start negative), `x_field` and
 `y_field` (the series shown), `n_events` (how many events the last Extract
-wrote). Save picks updates `event_indices` only; Extract writes the whole
-record. Older files that kept `event_indices` at the run's top level (and the
+wrote) and `waveform_fields`, the "Waveform channels" choice: `reference`
+(each recorder's `event_fields`, as before), `all` (every channel of the
+recorder, the eddy probes at the full rate too) or a list of names
+(`EventProcessor.extract_events(..., fields=)`). Save picks updates
+`event_indices` only; Extract writes the whole record. Older files that kept `event_indices` at the run's top level (and the
 window under `event_window`) are read; saving moves both into the record.
 `labquake_explorer/data/picks.py` gives readers `picked_indices(run)` for
 either layout.
@@ -175,9 +178,10 @@ entry per sensor, in the order of `channels`, except `patch_x_mm`
 | key | meaning |
 |---|---|
 | `version` | 2 (version 1 gave the fit windows relative to `t_i`; they are moved to the event time when read) |
-| `field`, `unit`, `channels`, `x_mm` | the channel array analysed, its unit (um), its rows and the sensor positions along the fault |
+| `field`, `unit`, `channels`, `x_mm` | the channel array analysed, its unit (um), its rows and the sensor positions along the fault. A `field` of the form `waveform/<recorder>` is the full-rate record's eddy channels (those named in the run's `slip.source`), converted with `slip.slope_mm_per_v` to micrometres on the record's own time axis (2 MHz for an Elsys block, extracted with "Waveform channels: all"), each zeroed on its first 1 % of samples, with the run's sensor positions; the record's PZT channels give the burst pick. The view offers it next to `slip` when the record holds those channels |
 | `event_time`, `start_s`, `end_s` | the event time and the extraction window the default fit windows came from |
-| `time_method` | per sensor: `max_rate` (largest filtered slip rate), `onset` (where the rate, followed back from that peak, last rose through `onset_fraction` of it, default 0.2), `step` (where the slip crosses `step_fraction`, default 0.5, of the way from the before to the after line, between the windows), `shared` (one t_i for all: `event_time + shared_shift_s`, or the reference time when that is NaN) or `manual` (set by hand); `onset` and `step` interpolate between samples, and keep the max-rate pick, flagged, when they find no crossing |
+| `time_method` | per sensor: `max_rate` (largest filtered slip rate), `onset` (where the rate, followed back from that peak, last rose through `onset_fraction` of it, default 0.2), `step` (where the slip crosses `step_fraction`, default 0.5, of the way from the before to the after line, between the windows), `shared` (one t_i for all: `event_time + shared_shift_s`, or the reference time when that is NaN), `burst` (one t_i for all at the AE burst, below) or `manual` (set by hand); `onset` and `step` interpolate between samples, and keep the max-rate pick, flagged, when they find no crossing |
+| `window_mode`, `burst_halfwidth_s`, `level_width_s`, `burst_search_s`, `burst_source`, `t_burst_shift_s`, `before_level_um`, `after_level_um` | the Burst tab (`window_mode = levels`): every sensor's t_i is the burst, the peak of the PZT envelope (`burst_source = pzt_envelope`, the record's PZT traces, |pzt| averaged over 20 us, within `t_ref +- burst_search_s`, default 3 ms; falls back to the peak of the mean slip rate, flagged `no PZT trace`) or that peak itself (`peak_rate`); the fit windows are `[t_i - w - d, t_i - w]` and `[t_i + w, t_i + w + d]` with `w = burst_halfwidth_s` (default 1 ms) and `d = level_width_s` (0.1 ms), and the coseismic slip is `after_level_um - before_level_um`, the mean slip in those windows (no line extrapolation); `t_burst_shift_s` is the burst relative to the event time. Records without these keys are `lines` mode, the slip from the lines at t_i |
 | `onset_fraction`, `step_fraction`, `shared_shift_s`, `shared_set_s` | the settings of those methods; `shared_set_s` is the value typed in the view's Shared tab, kept while the reference is used |
 | `t_shift_s` | `t_i - event_time` |
 | `rate_filter`, `rate_cutoff_hz`, `rate_lowpass_type`, `rate_lowpass_order`, `rate_savgol_order`, `rate_smoothing_s`, `search_halfwidth_s`, `rate_snr`, `reference_halfwidth_s` | `max_rate` settings: the slip-rate filter (the view's filter tab shown), `lowpass` (the default: the slip through a `butterworth` (default) or `bessel` low-pass of order `rate_lowpass_order` (4) at `rate_cutoff_hz` (50), run forwards and backwards for zero phase, then the derivative), `savgol` (Savitzky-Golay derivative of polynomial order `rate_savgol_order` (2) over the window `rate_smoothing_s`; the view's default 0.02) or `boxcar` (the derivative averaged over `rate_smoothing_s`, default 0.01; records without `rate_filter` were made with it); `rate_smoothing_s` is the window of the filter used; NaN gaps are bridged for the filter and blanked again; search half-width around the reference time (0.05), flag threshold in units of the rate noise (5), half-width around the event time in which the reference time is found (0.5) |
@@ -283,7 +287,16 @@ older files is read as the `default` set and moves likewise.
 A record stores every control (trigger source and time, pre/post window and
 noise window in ms, taper, baseline mode, step removal, calibration path/unit/dB,
 `calibration_divisor` (a constant the CSV gain is divided by, None for 1),
-t*, fit band, bins per decade, SNR threshold, n fixed, `n_max`, loss), the calibration
+t* or a per-sensor Q table (`q_csv_path`, `q_travel_time_s`, `q_hold_ends`
+and the table itself, `attenuation`: `Attenuation.as_dict()` with the travel
+time and the hold-ends flag, so the stored table is reused with each
+sensor's travel time; the correction `exp(pi f T Q^-1(f))` applies inside
+the table's band, outside it only with `q_hold_ends`; a Q table and a t*
+together are refused), fit band, bins per decade, SNR threshold, n fixed, `n_max`, loss, `estimator`
+(the per-log-bin statistic, `rms` (default) / `logmean` / `median`, also in
+`spectrum.meta.estimator`), the uncertainty-ensemble inputs (`ensemble_on`,
+`ensemble_fmins_hz`, `ensemble_fmaxs_hz`, `ensemble_calibration_paths`)
+and, once run, `ensemble` (below)), the calibration
 table itself (`calibration`: `Calibration.as_dict()` plus `gain_db` and
 `gain_divisor`, how the CSV was read, the gains already divided; None when
 uncalibrated), the source entries as typed
@@ -297,6 +310,24 @@ used, `converged`, `at_bounds`, `band_limited`, `valid`, `reason`,
 constants, distance, radiation coefficient, free-surface factor,
 `seismic_moment_nm`, `mw`, `source_radius_m`, `rupture_area_m2`,
 `stress_drop_pa`, `kR`, warnings).
+
+`ensemble` (`labquake_explorer/analysis/spectrum_ensemble.py`, version 1)
+is the record's fit repeated over a grid of fit bands (`bands_hz`, every
+`fmin < fmax` of the `fmin` and `fmax` grids typed in the view, default
+{1, 1.5, 2, 3} kHz x {15, 22, 36, 50} kHz) and over the record's own
+calibration table plus the alternative CSVs listed (`calibrations`, read
+with the same unit, dB flag and divisor): `members` (per member `fmin_hz`,
+`fmax_hz`, `calibration` index, `omega0`, `fc`, `n`, `valid`,
+`band_limited`, and `seismic_moment_nm` when the source was computed, the
+moment following the plateau by the record's own M0 / Omega0), `stats`
+(`min`, `max`, `p16`, `p84`, `median`, `n` of each over the valid members)
+and `stats_resolved` (the same over the valid members that are not
+band-limited: a band whose fmin sits at fc pins the fit at the edge), with
+`n_members` / `n_valid` / `n_resolved`. It is run by "Run ensemble now", or
+by Save when "run on Save" is ticked; a recompute clears it unless the
+recompute reproduces the saved record from the same ensemble inputs. The
+view's ensemble row and Source Scaling's error bars (the 16-84 % of M0 and
+fc) use `stats_resolved` when any member is resolved, else `stats`.
 
 Calibration units are `V/m`, `V/(m/s)`, `V/(m/s^2)` (a displacement spectrum
 in `m*s`), `V/V` (uncalibrated, `V*s`) and `V/(N m)`: an in-situ response
@@ -356,6 +387,29 @@ warned about) and `result_set`, the spectrum result set the records were
 taken from (the view's "Result set" box lists the sets saved in the run and
 opens on the one the PZT Spectrum view last saved; results written before
 result sets read as `default`).
+
+Rows also carry `fc_p16`, `fc_p84`, `m0_p16`, `m0_p84` from the records'
+uncertainty ensembles (geometric medians over the channels for `all`, NaN
+without an ensemble), drawn as error bars.
+
+The view's "Shared t*" frame grid-searches one constant attenuation `t*`
+per sensor over the shown set's records
+(`labquake_explorer/analysis/t_star_scan.py`): each record's binned
+spectrum is corrected by `exp(pi f t*)` and refitted with its own settings
+(band, n fixed or free with its `n_max`, loss, SNR gate), the cost being
+the summed weighted ln residual squared (`rms^2 * n_bins`) over the records
+that fit; the plot box switches the figure to cost against t*. The scan is
+kept with the run as `t_star_scan` (version 1: `result_set`,
+`t_star_grid_us` as typed, and per sensor `t_star_grid_s`, `cost`,
+`n_valid`, `best_t_star_s`, `best_index`, `n_records`, `at_grid_end`) and
+comes back when the set is shown again. "Save refits" writes every record of
+the set refitted at its sensor's best t* into a new result set: `t_star_s`
+increased by it, the binned `spectrum` corrected, `fit` redone, `source`
+recomputed from the record's own constants (None when it had none),
+`ensemble` dropped and `t_star_refit` (`from_set`, `shared_t_star_s`) added;
+the set's controls are copied with the sensors' `t_star_s` updated. The PZT
+Spectrum view, which applies t* to the raw FFT, reproduces such a record to
+about a percent.
 
 The channel and Y variable used, quality-gating choice, OLS exponent with
 standard error and bootstrap 16-84 range, reduced-major-axis exponent,

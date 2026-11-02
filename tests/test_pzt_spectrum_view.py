@@ -8,6 +8,7 @@ import pytest
 
 from labquake_explorer.analysis import source as src
 from labquake_explorer.analysis import spectrum as sp
+from labquake_explorer.analysis import spectrum_ensemble as se
 from labquake_explorer.ui.views.pzt_spectrum_view import (
     HANDLES, PZTSpectrumView, RESULT_VERSION, TIE_AFTER, TRIGGER_PICKED, TRIGGER_EVENT_TIME, TRIGGER_RECORD,
     TUKEY_ALPHA, channel_key, parse_channel_key,
@@ -1397,5 +1398,137 @@ def test_moment_unit_greys_the_medium_entries_and_takes_m0_from_the_plateau(brun
         assert v2.unit_combobox.get() == "V/(N m)" and v2.calibration_divisor_var.get() == "2"
         assert v2.record["spectrum"]["amp_units"] == "N*m*s"
         assert all(entry.instate(["disabled"]) for entry in v2.medium_entries.values())
+    finally:
+        v2.on_close()
+
+
+def test_estimator_and_ensemble_in_the_view(brune_app, view, tmp_path):
+    f = np.geomspace(100.0, 100e3, 25)
+    alt = []
+    for name, gain in (("alt1.csv", 1.1 * GAIN), ("alt2.csv", 0.9 * GAIN)):
+        (tmp_path / name).write_text("frequency_hz,gain\n" + "\n".join(f"{fi:.6g},{gain}" for fi in f) + "\n")
+        alt.append(str(tmp_path / name))
+    calibrated_compute(view)
+    assert view.estimator_combobox.get() == "rms" and view.record["estimator"] == "rms"
+    assert view.record["ensemble"] is None and not view.record["ensemble_on"]
+    assert view.record["ensemble_fmins_hz"] == list(se.DEFAULT_FMINS_HZ) and view.record["ensemble_fmaxs_hz"] == list(se.DEFAULT_FMAXS_HZ)
+    assert view.result_vars["ensemble"].get() == "n/a" and view.ensemble_text_var.get() == "not run"
+    # the estimator reaches the analysis and the record
+    view.estimator_combobox.set("logmean")
+    view.schedule_compute(now=True)
+    assert view.spectrum.meta["estimator"] == "logmean" and view.record["estimator"] == "logmean"
+    assert view.record["spectrum"]["meta"]["estimator"] == "logmean"
+    fc_logmean = view.fit.fc
+    assert fc_logmean == pytest.approx(FC, rel=0.1)
+    # the ensemble: a smaller grid and two alternative tables, run by hand
+    view.ensemble_fmins_var.set("1000, 2000")
+    view.ensemble_fmaxs_var.set("20000, 50000")
+    view.ensemble_calibrations_var.set(";".join(alt))
+    view.schedule_compute(now=True)
+    set_medium(view, "P")
+    assert view.compute_source()
+    assert view.compute_ensemble(), view.status_var.get()
+    e = view.record["ensemble"]
+    assert e["n_members"] == 12 and e["n_valid"] == 12 and e["bands_hz"] == [[1000.0, 20000.0], [1000.0, 50000.0],
+                                                                             [2000.0, 20000.0], [2000.0, 50000.0]]
+    assert e["calibrations"][0] == brune_app.calibration_csv and e["calibrations"][1:] == alt
+    st = e["stats"]
+    assert st["fc"]["p16"] <= fc_logmean * 1.05 and st["fc"]["p84"] >= fc_logmean * 0.95
+    m0 = view.record["source"]["seismic_moment_nm"]
+    assert st["seismic_moment_nm"]["min"] == pytest.approx(m0 / 1.1, rel=0.1)      # the 1.1 x gain table
+    assert st["seismic_moment_nm"]["max"] == pytest.approx(m0 / 0.9, rel=0.1)
+    assert e["n_resolved"] == 6 and e["stats_resolved"]["fc"]["n"] == 6        # fmax 20 kHz < 2 fc: those 6 are band-limited
+    assert [m for m, lim in zip(e["members"]["fmax_hz"], e["members"]["band_limited"]) if lim] == [20000.0] * 6
+    assert "fc" in view.result_vars["ensemble"].get() and "6 resolved of 12 valid" in view.result_vars["ensemble"].get()
+    assert "fc 16-84 %" in view.ensemble_text_var.get() and "ensemble:" in view.status_var.get()
+    assert view.record["ensemble_calibration_paths"] == alt
+    # a recompute clears it; Save runs it again when the box is ticked, and stores the inputs with the record
+    view.post_var.set("2.5")
+    view.schedule_compute(now=True)
+    assert view.record["ensemble"] is None and view.ensemble_text_var.get() == "not run"
+    view.ensemble_var.set(True)
+    assert view.compute_source()
+    assert view.save(), view.status_var.get()
+    rec = view.event["strain"]["spectrum"]["sets"]["default"]["channels"]["ch3"]
+    assert rec["ensemble"]["n_members"] == 12 and rec["ensemble_on"] is True
+    assert rec["ensemble_fmins_hz"] == [1000.0, 2000.0] and rec["ensemble_calibration_paths"] == alt
+    sensors = brune_app.data_manager.data["analysis"]["pzt_spectrum"]["sets"]["default"]["sensors"]["ch3"]
+    assert sensors["ensemble_calibration_paths"] == alt
+    settings = brune_app.data_manager.data["analysis"]["pzt_spectrum"]["sets"]["default"]["settings"]
+    assert settings["estimator"] == "logmean" and settings["ensemble_on"] is True and settings["ensemble_fmaxs_hz"] == [20000.0, 50000.0]
+    # a bad grid or table is reported, not raised; Save then refuses
+    view.ensemble_fmins_var.set("abc")
+    view.schedule_compute(now=True)
+    assert view.record is None and "ensemble fmin grid" in view.status_var.get()
+    view.ensemble_fmins_var.set("1000, 2000")
+    view.ensemble_calibrations_var.set(str(tmp_path / "missing.csv"))
+    view.schedule_compute(now=True)
+    assert view.record is not None and not view.compute_ensemble() and "alternative calibration" in view.status_var.get()
+    assert not view.save() and "nothing saved" in view.status_var.get()
+    # reopening restores the controls and shows the stored ensemble
+    view.ensemble_calibrations_var.set(";".join(alt))
+    view.on_close()
+    v2 = PZTSpectrumView(brune_app, 0, EVENT)
+    try:
+        assert v2.estimator_combobox.get() == "logmean" and v2.ensemble_var.get()
+        assert v2.ensemble_fmins_var.get() == "1000, 2000" and v2.ensemble_calibrations_var.get() == ";".join(alt)
+        assert "6 resolved of 12 valid" in v2.result_vars["ensemble"].get()
+        from labquake_explorer.ui.views.pzt_spectrum_view import ensemble_stats
+        stored = v2.record["ensemble"]
+        assert ensemble_stats(stored)[1] == "resolved"
+        assert ensemble_stats({"stats": stored["stats"], "stats_resolved": {"fc": {"n": 0}}})[1] == "valid"
+        assert ensemble_stats({"stats": stored["stats"]})[1] == "valid"           # written before the resolved set existed
+    finally:
+        v2.on_close()
+
+
+def test_q_table_per_sensor(brune_app, view, tmp_path):
+    q = tmp_path / "q.csv"
+    q.write_text("freq_kHz,Qp_inv_median\n1,0.05\n100,0.05\n")
+    calibrated_compute(view)
+    f_plain, amp_plain = view.spectrum.f_binned.copy(), view.spectrum.amp_binned.copy()
+    assert view.record["attenuation"] is None and view.record["q_csv_path"] == ""
+    assert "no Q" in view.q_note_var.get()
+    # the table needs a travel time, and excludes t*
+    view.q_path_var.set(str(q))
+    view.schedule_compute(now=True)
+    assert view.record is None and "travel time" in view.status_var.get()
+    view.q_travel_var.set("5e-5")
+    view.t_star_var.set("1e-6")
+    view.schedule_compute(now=True)
+    assert view.record is None and "not both" in view.status_var.get()
+    view.t_star_var.set("")
+    view.schedule_compute(now=True)
+    assert view.record is not None, view.status_var.get()
+    meta = view.spectrum.meta["attenuation"]
+    assert meta["travel_time_s"] == 5e-5 and meta["hold_ends"] is False and meta["n_rows"] == 2
+    assert view.record["q_travel_time_s"] == 5e-5 and view.record["attenuation"]["source"] == str(q)
+    lifted = view.spectrum.amp_binned / amp_plain             # the correction lifts the spectrum by exp(pi f T Q^-1)
+    np.testing.assert_allclose(lifted, np.exp(np.pi * f_plain * 5e-5 * 0.05), rtol=1e-2)   # applied before binning
+    assert "Q loaded: q.csv" in view.q_note_var.get() and "T = 5e-05" in view.q_note_var.get()
+    # hold ends and the travel time are re-applied from the stored table, no CSV needed
+    view.q_hold_var.set(True)
+    view.q_travel_var.set("1e-4")
+    q.unlink()
+    view.schedule_compute(now=True)
+    assert view.record is not None, view.status_var.get()
+    assert view.spectrum.meta["attenuation"]["hold_ends"] is True and view.spectrum.meta["attenuation"]["travel_time_s"] == 1e-4
+    assert "end values held" in view.q_note_var.get()
+    set_medium(view, "P")
+    assert view.compute_source() and view.save()
+    sensor = brune_app.data_manager.data["analysis"]["pzt_spectrum"]["sets"]["default"]["sensors"]["ch3"]
+    assert sensor["q_travel_time_s"] == 1e-4 and sensor["q_hold_ends"] is True and sensor["attenuation"]["n_rows"] == 2
+    # cleared: no correction
+    view.clear_attenuation()
+    assert view.record is not None and view.spectrum.meta["attenuation"] is None and view.attenuation_table is None
+    # reopening restores the table, travel time and flag from the record; another channel of the sensor set too
+    view.on_close()
+    v2 = PZTSpectrumView(brune_app, 0, EVENT)
+    try:
+        assert v2.current_channel() == BRUNE_CH
+        assert v2.q_travel_var.get() == "0.0001" and v2.q_hold_var.get() and v2.attenuation_table["n_rows"] == 2
+        assert v2.spectrum.meta["attenuation"]["travel_time_s"] == 1e-4 and "matches the saved record" in v2.status_var.get()
+        v2.set_channel(TANH_CH)                           # no record, no sensor entry: the loaded table carries over
+        assert v2.attenuation_table["n_rows"] == 2 and v2.spectrum.meta["attenuation"]["travel_time_s"] == 1e-4
     finally:
         v2.on_close()

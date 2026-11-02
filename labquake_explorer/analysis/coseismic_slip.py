@@ -68,8 +68,16 @@ METHOD_MANUAL = "manual"
 METHOD_ONSET = "onset"
 METHOD_STEP = "step"
 METHOD_SHARED = "shared"
+METHOD_BURST = "burst"                # one t_i for all: the PZT envelope peak (or the peak slip rate)
 PICK_METHODS = (METHOD_MAX_RATE, METHOD_ONSET, METHOD_STEP)    # each sensor from its own record
-METHODS = PICK_METHODS + (METHOD_SHARED, METHOD_MANUAL)
+METHODS = PICK_METHODS + (METHOD_SHARED, METHOD_BURST, METHOD_MANUAL)
+WINDOW_MODES = ("lines", "levels")   # slip from the lines at t_i, or from mean levels in narrow windows
+BURST_SOURCES = ("pzt_envelope", "peak_rate")
+DEFAULT_BURST_SOURCE = "pzt_envelope"
+DEFAULT_BURST_HALFWIDTH_S = 1e-3      # levels: the windows sit this far on either side of t_i ...
+DEFAULT_LEVEL_WIDTH_S = 1e-4          # ... and are this wide
+DEFAULT_BURST_SEARCH_S = 3e-3         # the envelope peak is searched within t_ref +- this
+BURST_ENVELOPE_S = 2e-5               # the PZT envelope: |pzt| averaged over this
 DEFAULT_ONSET_FRACTION = 0.2          # onset: the rate rises through this fraction of its peak
 DEFAULT_STEP_FRACTION = 0.5           # step: the slip crosses this fraction of the step
 
@@ -101,6 +109,7 @@ FLAG_AFTER_INVALID = "after fit invalid"
 FLAG_BEFORE_GAPS = "before window has gaps"
 FLAG_AFTER_GAPS = "after window has gaps"
 FLAG_BEFORE_OVERLAP = "before window reaches t_i"
+FLAG_NO_PZT = "no PZT trace: burst at the peak slip rate"
 FLAG_AFTER_OVERLAP = "after window reaches t_i"
 GAP_FRACTION = 0.5                    # flag a window whose finite samples are fewer than this share
 
@@ -256,6 +265,31 @@ def reference_time(time, rate, event_time: float,
     return float(t[idx[int(np.argmax(mean[idx]))]])
 
 
+def burst_time(time, pzt, t_ref: float, search_s: float = DEFAULT_BURST_SEARCH_S,
+               envelope_s: float = BURST_ENVELOPE_S) -> Optional[float]:
+    """The peak of the PZT envelope within ``t_ref +- search_s``: the largest
+    ``|pzt|`` over the channels, averaged over ``envelope_s``.  None without
+    PZT samples there (``pzt`` None, empty, or all NaN in the search)."""
+    if pzt is None:
+        return None
+    t = np.asarray(time, dtype=float).ravel()
+    p = np.asarray(pzt, dtype=float)
+    if p.ndim == 1:
+        p = p[None, :]
+    if p.ndim != 2 or p.shape[1] != t.size or p.shape[0] == 0:
+        return None
+    with np.errstate(invalid="ignore"):
+        env = np.nanmax(np.abs(p), axis=0) if p.shape[0] > 1 else np.abs(p[0])
+    env = np.where(np.isfinite(env), env, 0.0)
+    n = smoothing_samples(float(envelope_s), sampling_interval(t))
+    if n > 1:
+        env = uniform_filter1d(env, n, mode="nearest")
+    inside = (t >= t_ref - search_s) & (t <= t_ref + search_s) & (env > 0)
+    if not np.any(inside):
+        return None
+    return float(t[np.flatnonzero(inside)[np.argmax(env[inside])]])
+
+
 @dataclass(frozen=True)
 class RatePick:
     time: float          # absolute time of the peak
@@ -394,9 +428,16 @@ class SensorSlip:
     peak_rate: float                 # smoothed rate at t_i (unit/s)
     rate_noise: float                # std of the smoothed rate in the before window
     flags: list = field(default_factory=list)
+    window_mode: str = "lines"       # 'levels': the slip is after_level - before_level
+    before_level: float = float("nan")   # mean slip in the before window ('levels' only)
+    after_level: float = float("nan")
 
     @property
     def coseismic_slip(self) -> float:
+        if self.window_mode == "levels":
+            if math.isfinite(self.before_level) and math.isfinite(self.after_level):
+                return float(self.after_level - self.before_level)
+            return float("nan")
         if self.before.valid and self.after.valid:
             return float(self.after.value - self.before.value)
         return float("nan")
@@ -435,6 +476,12 @@ class SlipAnalysis:
     onset_fraction: float = DEFAULT_ONSET_FRACTION
     step_fraction: float = DEFAULT_STEP_FRACTION
     shared_shift_s: float = float("nan")      # NaN: the shared t_i is t_ref
+    window_mode: str = "lines"
+    burst_halfwidth_s: float = DEFAULT_BURST_HALFWIDTH_S
+    level_width_s: float = DEFAULT_LEVEL_WIDTH_S
+    burst_search_s: float = DEFAULT_BURST_SEARCH_S
+    burst_source: str = DEFAULT_BURST_SOURCE
+    t_burst: float = float("nan")             # absolute; NaN when no sensor used the burst
 
     @property
     def t_i(self) -> np.ndarray:
@@ -463,6 +510,14 @@ class SlipAnalysis:
             "step_fraction": float(self.step_fraction),
             "shared_shift_s": float(self.shared_shift_s),
             "t_ref_shift_s": float(self.t_ref - self.event_time),
+            "window_mode": self.window_mode,
+            "burst_halfwidth_s": float(self.burst_halfwidth_s),
+            "level_width_s": float(self.level_width_s),
+            "burst_search_s": float(self.burst_search_s),
+            "burst_source": self.burst_source,
+            "t_burst_shift_s": float(self.t_burst - self.event_time) if math.isfinite(self.t_burst) else float("nan"),
+            "before_level_um": [float(x.before_level) for x in s],
+            "after_level_um": [float(x.after_level) for x in s],
             "rate_noise_um_s": [float(x.rate_noise) for x in s],
             "time_method": [x.method for x in s],
             "t_shift_s": [float(x.t_shift_s) for x in s],
@@ -514,8 +569,23 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
                  reference_halfwidth_s: float = DEFAULT_REFERENCE_HALFWIDTH_S,
                  onset_fraction: float = DEFAULT_ONSET_FRACTION,
                  step_fraction: float = DEFAULT_STEP_FRACTION,
-                 shared_shift_s: float = float("nan")) -> SlipAnalysis:
+                 shared_shift_s: float = float("nan"),
+                 pzt=None, window_mode: str = "lines",
+                 burst_halfwidth_s: float = DEFAULT_BURST_HALFWIDTH_S,
+                 level_width_s: float = DEFAULT_LEVEL_WIDTH_S,
+                 burst_search_s: float = DEFAULT_BURST_SEARCH_S,
+                 burst_source: str = DEFAULT_BURST_SOURCE) -> SlipAnalysis:
     """Event time, line fits and coseismic slip of every sensor.
+
+    A ``burst`` sensor takes one t_i for all: the peak of the PZT envelope
+    (``pzt``, ``(n_pzt, n)`` on ``time``) within ``t_ref +- burst_search_s``
+    when ``burst_source`` is ``'pzt_envelope'`` and PZT traces are given,
+    else the peak of the mean slip rate ``t_ref`` (flagged when PZT traces
+    were asked for).  ``window_mode='levels'`` replaces the fit windows by
+    ``[t_i - w - d, t_i - w]`` and ``[t_i + w, t_i + w + d]`` with
+    ``w = burst_halfwidth_s`` and ``d = level_width_s``, and the coseismic slip
+    is the difference of the mean slip in them (no line extrapolation): the
+    slip accrued on the time scale of the burst, for a full-rate record.
 
     ``data`` is ``(n_sensors, n)`` on ``time``.  ``methods`` (one per sensor or
     one for all, default ``max_rate``; see :data:`METHODS`) chooses how each
@@ -560,6 +630,18 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
         raise ValueError("the step level must be between 0 and 100 % of the step")
     if math.isinf(shared_shift_s):
         raise ValueError("the shared t_i must be finite")
+    window_mode, burst_source = str(window_mode), str(burst_source)
+    if window_mode not in WINDOW_MODES:
+        raise ValueError(f"window_mode must be one of {WINDOW_MODES}, got {window_mode!r}")
+    if burst_source not in BURST_SOURCES:
+        raise ValueError(f"burst_source must be one of {BURST_SOURCES}, got {burst_source!r}")
+    burst_halfwidth_s, level_width_s, burst_search_s = float(burst_halfwidth_s), float(level_width_s), float(burst_search_s)
+    if not (math.isfinite(burst_halfwidth_s) and burst_halfwidth_s >= 0):
+        raise ValueError("the burst half-width must be >= 0")
+    if not (math.isfinite(level_width_s) and level_width_s > 0):
+        raise ValueError("the level width must be > 0")
+    if not (math.isfinite(burst_search_s) and burst_search_s > 0):
+        raise ValueError("the burst search half-width must be > 0")
     default_before, default_after = default_fit_windows(start_s, end_s)
     channels = list(channels) if channels is not None else [str(i) for i in range(n_ch)]
     x_mm = [float(v) for v in x_mm] if x_mm is not None else [float("nan")] * n_ch
@@ -576,6 +658,11 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
     rate = slip_rate(t, d, rate_smoothing_s, rate_filter, rate_cutoff_hz, rate_lowpass_order, rate_lowpass_type,
                      rate_savgol_order)
     t_ref = reference_time(t, rate, event_time, reference_halfwidth_s)
+    t_burst, burst_flag = float("nan"), False
+    if METHOD_BURST in methods:
+        found = burst_time(t, pzt, t_ref, burst_search_s) if burst_source == "pzt_envelope" else None
+        burst_flag = burst_source == "pzt_envelope" and found is None
+        t_burst = t_ref if found is None else found
     sensors = []
     for i in range(n_ch):
         flags: list[str] = []
@@ -589,6 +676,10 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
             t_i = event_time + shift
         elif method == METHOD_SHARED:
             t_i = event_time + shared_shift_s if math.isfinite(shared_shift_s) else t_ref
+        elif method == METHOD_BURST:
+            t_i = t_burst
+            if burst_flag:
+                flags.append(FLAG_NO_PZT)
         else:
             if method == METHOD_MANUAL:
                 method = METHOD_MAX_RATE
@@ -611,6 +702,19 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
                     t_i = crossing
                 elif method != METHOD_MAX_RATE:
                     flags.append(FLAG_NO_CROSSING)
+        before_level = after_level = float("nan")
+        if window_mode == "levels":                   # narrow windows on either side of t_i, from t_i itself
+            rel = t_i - event_time
+            befores[i] = (rel - burst_halfwidth_s - level_width_s, rel - burst_halfwidth_s)
+            afters[i] = (rel + burst_halfwidth_s, rel + burst_halfwidth_s + level_width_s)
+            for window, side in ((befores[i], "before"), (afters[i], "after")):
+                values = d[i][window_mask(t, event_time, window)]
+                values = values[np.isfinite(values)]
+                level = float(np.mean(values)) if values.size else float("nan")
+                if side == "before":
+                    before_level = level
+                else:
+                    after_level = level
         before = fit_line(t, d[i], t_i, befores[i], event_time)
         after = fit_line(t, d[i], t_i, afters[i], event_time)
         in_before = window_mask(t, event_time, befores[i]) & np.isfinite(rate[i])
@@ -636,13 +740,16 @@ def analyze_slip(time, data, event_time: float, start_s: float, end_s: float, *,
         if not after.valid:
             flags.append(FLAG_AFTER_INVALID)
         sensors.append(SensorSlip(str(channels[i]), float(x_mm[i]), method, float(t_i - event_time),
-                                  before, after, peak_rate, rate_noise, flags))
+                                  before, after, peak_rate, rate_noise, flags, window_mode,
+                                  before_level, after_level))
     return SlipAnalysis(event_time, float(start_s), float(end_s), rate_smoothing_s, search_halfwidth_s,
                         rate_snr, reference_halfwidth_s, float(t_ref), sensors, time=t, rate=rate,
                         rate_filter=rate_filter, rate_cutoff_hz=rate_cutoff_hz,
                         rate_lowpass_order=int(rate_lowpass_order), rate_lowpass_type=str(rate_lowpass_type),
                         rate_savgol_order=int(rate_savgol_order), onset_fraction=onset_fraction,
-                        step_fraction=step_fraction, shared_shift_s=shared_shift_s)
+                        step_fraction=step_fraction, shared_shift_s=shared_shift_s,
+                        window_mode=window_mode, burst_halfwidth_s=burst_halfwidth_s, level_width_s=level_width_s,
+                        burst_search_s=burst_search_s, burst_source=burst_source, t_burst=t_burst)
 
 
 # --------------------------------------------------------------- saved records
@@ -697,10 +804,17 @@ def restore_inputs(record, channels: Sequence[str]) -> Optional[dict]:
             "onset_fraction": float(record.get("onset_fraction", DEFAULT_ONSET_FRACTION)),
             "step_fraction": float(record.get("step_fraction", DEFAULT_STEP_FRACTION)),
             "shared_shift_s": float(record.get("shared_shift_s", float("nan"))),
+            "window_mode": _text_value(record.get("window_mode", "lines")),
+            "burst_halfwidth_s": float(record.get("burst_halfwidth_s", DEFAULT_BURST_HALFWIDTH_S)),
+            "level_width_s": float(record.get("level_width_s", DEFAULT_LEVEL_WIDTH_S)),
+            "burst_search_s": float(record.get("burst_search_s", DEFAULT_BURST_SEARCH_S)),
+            "burst_source": _text_value(record.get("burst_source", DEFAULT_BURST_SOURCE)),
         }
         for w in out["fit_before_s"] + out["fit_after_s"]:
             check_window(w)
         if out["rate_filter"] not in RATE_FILTERS or out["rate_lowpass_type"] not in LOWPASS_TYPES:
+            return None
+        if out["window_mode"] not in WINDOW_MODES or out["burst_source"] not in BURST_SOURCES:
             return None
         return out
     except (KeyError, TypeError, ValueError, AttributeError):
@@ -709,6 +823,8 @@ def restore_inputs(record, channels: Sequence[str]) -> Optional[dict]:
 
 __all__ = [
     "RESULT_VERSION", "METHODS", "PICK_METHODS", "METHOD_MAX_RATE", "METHOD_ONSET", "METHOD_STEP", "METHOD_SHARED",
+    "METHOD_BURST", "WINDOW_MODES", "BURST_SOURCES", "DEFAULT_BURST_SOURCE", "DEFAULT_BURST_HALFWIDTH_S",
+    "DEFAULT_LEVEL_WIDTH_S", "DEFAULT_BURST_SEARCH_S", "FLAG_NO_PZT", "burst_time",
     "METHOD_MANUAL", "DEFAULT_ONSET_FRACTION", "DEFAULT_STEP_FRACTION", "onset_time", "step_time",
     "RATE_FILTERS", "DEFAULT_RATE_FILTER", "DEFAULT_RATE_CUTOFF_HZ", "LOWPASS_TYPES", "DEFAULT_LOWPASS_TYPE",
     "DEFAULT_LOWPASS_ORDER", "DEFAULT_SAVGOL_ORDER", "MAX_FILTER_ORDER",

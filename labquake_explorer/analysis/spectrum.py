@@ -38,10 +38,14 @@ Conventions (documented once here, echoed in the result ``meta``):
   medium), to a MOMENT spectrum in N*m*s whose plateau is the seismic moment
   itself.  Outside the calibration table the spectrum is NaN (masked), never
   extrapolated.
-* Log-binned amplitudes are ``sqrt(mean(power))`` per bin; noise adds in
-  quadrature, so bins near the SNR cut read high (+5% at SNR = 3).
-  ``noise_subtract=True`` removes the mean noise power per bin before the
-  square root (off by default).
+* Log-binned amplitudes are ``sqrt(mean(power))`` per bin (``estimator =
+  'rms'``, the default); noise adds in quadrature, so bins near the SNR cut
+  read high (+5% at SNR = 3).  ``noise_subtract=True`` removes the mean
+  noise power per bin before the square root (off by default).  The
+  ``'logmean'`` estimator takes the geometric mean of the raw amplitudes per
+  bin and ``'median'`` their median: both sit below the rms on a noisy
+  spectrum (a log-interpolation chain without averaging is closer to them),
+  and neither subtracts noise.
 * The fit is ``ln A(f) = ln Omega0 - ln(1 + (f/fc)**n)`` in the parameters
   ``(ln Omega0, ln fc, n)`` with ``n`` fixed at 2 by default (a free ``n``
   stays inside ``n_bounds``, ``N_BOUNDS = (1, 4)`` unless given), weighted by
@@ -69,6 +73,7 @@ RESULT_VERSION = 1
 BASELINE_MODES = ("pre_linear", "none", "highpass")
 TAPER_KINDS = ("tukey", "bh4")
 LOSSES = ("linear", "soft_l1")
+BIN_ESTIMATORS = ("rms", "logmean", "median")   # per log bin: sqrt(mean(power)), geometric mean, median of |X|
 
 # Calibration units the caller may declare and the derivative order k that
 # turns the calibrated spectrum into a displacement spectral density.
@@ -658,11 +663,13 @@ def csv_gain_is_db(path: Union[str, Path]) -> bool:
 class Attenuation:
     """A ``Q^-1(f)`` table with a travel time: the spectrum is multiplied by
     ``exp(pi * f * travel_time * Q^-1(f))`` inside the table's band and left
-    unchanged outside it."""
+    unchanged outside it, or, with ``hold_ends``, corrected outside the band
+    with the end values of the table held (a clamped interpolation)."""
     frequency_hz: np.ndarray
     q_inv: np.ndarray
     travel_time_s: float
     source: str = ""
+    hold_ends: bool = False
 
     @property
     def fmin(self) -> float:
@@ -673,13 +680,15 @@ class Attenuation:
         return float(self.frequency_hz[-1])
 
     def q_inv_at(self, f) -> np.ndarray:
-        """Log-log interpolated ``Q^-1``; NaN outside the table."""
+        """Log-log interpolated ``Q^-1``; NaN outside the table (the end values
+        held there with ``hold_ends``)."""
         f = np.asarray(f, dtype=float)
         out = np.full(f.shape, np.nan)
-        inside = np.isfinite(f) & (f >= self.fmin) & (f <= self.fmax) & (f > 0)
+        positive = np.isfinite(f) & (f > 0)
+        inside = positive & (f >= self.fmin) & (f <= self.fmax) if not self.hold_ends else positive
         if np.any(inside):
-            out[inside] = 10.0 ** np.interp(np.log10(f[inside]), np.log10(self.frequency_hz),
-                                            np.log10(self.q_inv))
+            fq = np.clip(f[inside], self.fmin, self.fmax)
+            out[inside] = 10.0 ** np.interp(np.log10(fq), np.log10(self.frequency_hz), np.log10(self.q_inv))
         return out
 
     def factor(self, f) -> np.ndarray:
@@ -691,7 +700,8 @@ class Attenuation:
         return out
 
     @classmethod
-    def from_arrays(cls, frequency_hz, q_inv, travel_time_s: float, source: str = "") -> "Attenuation":
+    def from_arrays(cls, frequency_hz, q_inv, travel_time_s: float, source: str = "",
+                    hold_ends: bool = False) -> "Attenuation":
         f = np.asarray(frequency_hz, dtype=float).ravel()
         q = np.asarray(q_inv, dtype=float).ravel()
         if f.shape != q.shape:
@@ -706,21 +716,23 @@ class Attenuation:
         q = q[idx]
         if f.size < 2:
             raise ValueError("attenuation table needs at least two rows with positive frequency and Q^-1")
-        return cls(f, q, float(travel_time_s), source)
+        return cls(f, q, float(travel_time_s), source, bool(hold_ends))
 
     def as_dict(self) -> dict:
         return {"travel_time_s": self.travel_time_s, "fmin_hz": self.fmin, "fmax_hz": self.fmax,
-                "n_rows": int(self.frequency_hz.size), "source": self.source,
+                "n_rows": int(self.frequency_hz.size), "source": self.source, "hold_ends": bool(self.hold_ends),
                 "frequency_hz": self.frequency_hz.tolist(), "q_inv": self.q_inv.tolist()}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Attenuation":
-        return cls.from_arrays(d["frequency_hz"], d["q_inv"], d["travel_time_s"], str(d.get("source", "")))
+        return cls.from_arrays(d["frequency_hz"], d["q_inv"], d["travel_time_s"], str(d.get("source", "")),
+                               bool(d.get("hold_ends", False)))
 
 
-def load_q_csv(path: Union[str, Path], travel_time_s: float) -> Attenuation:
+def load_q_csv(path: Union[str, Path], travel_time_s: float, hold_ends: bool = False) -> Attenuation:
     """Read a ``Q^-1(f)`` CSV (frequency column as in :func:`load_calibration_csv`,
-    kHz converted; the other column is ``Q^-1``) with the travel time it applies to."""
+    kHz converted; the other column is ``Q^-1``) with the travel time it applies
+    to; ``hold_ends`` extends the table's end values outside its band."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Q CSV not found: {path}")
@@ -735,7 +747,7 @@ def load_q_csv(path: Union[str, Path], travel_time_s: float) -> Attenuation:
         raise ValueError("Q CSV needs one Q^-1 column")
     return Attenuation.from_arrays(pd.to_numeric(df[f_col], errors="coerce").to_numpy() * f_scale,
                                    pd.to_numeric(df[q_col], errors="coerce").to_numpy(),
-                                   travel_time_s, source=str(path))
+                                   travel_time_s, source=str(path), hold_ends=hold_ends)
 
 
 def t_star_from_q(distance_m: float, q: float, c: float) -> float:
@@ -788,13 +800,14 @@ def compute_spectrum(window: WindowResult, taper: str = "tukey", alpha: float = 
                      t_star_s: Optional[float] = None, fmin: Optional[float] = None,
                      fmax: Optional[float] = None, bins_per_decade: int = 30,
                      attenuation: Optional[Attenuation] = None,
-                     noise_subtract: bool = False) -> SpectrumResult:
+                     noise_subtract: bool = False, estimator: str = "rms") -> SpectrumResult:
     """Amplitude spectra of the signal and noise windows plus log-binned averages.
 
     ``nfft >= n`` zero-pads (a smaller value is ignored).  ``calibration``
     converts to displacement (see module docstring); ``t_star_s`` applies
     ``exp(+pi*f*t*)`` to both signal and noise.  ``fmin``/``fmax`` default to
-    the fundamental ``fs/nfft`` and Nyquist; ``noise_subtract`` is passed to
+    the fundamental ``fs/nfft`` and Nyquist; ``noise_subtract`` and
+    ``estimator`` (the per-bin statistic, ``BIN_ESTIMATORS``) are passed to
     ``bin_spectrum``.
 
     ``meta['taper_energy_fraction'] = sum(w * x**2) / sum(x**2)`` measures how
@@ -879,12 +892,36 @@ def compute_spectrum(window: WindowResult, taper: str = "tukey", alpha: float = 
                           noise_binned=np.array([]), snr=np.array([]),
                           counts=np.array([], dtype=int), calibrated=calibrated,
                           t_star_s=None if t_star_s is None else float(t_star_s), meta=meta)
-    return bin_spectrum(spec, fmin, fmax, bins_per_decade, noise_subtract)
+    return bin_spectrum(spec, fmin, fmax, bins_per_decade, noise_subtract, estimator)
+
+
+def _bin_estimate(idx: np.ndarray, values: np.ndarray, nb: int, estimator: str) -> np.ndarray:
+    """Per-bin ``'logmean'`` (geometric mean) or ``'median'`` of positive finite
+    ``values`` whose bins are ``idx``; NaN for a bin without any."""
+    ok = np.isfinite(values) & (values > 0)
+    idx, values = idx[ok], values[ok]
+    out = np.full(nb, np.nan)
+    if idx.size == 0:
+        return out
+    if estimator == "logmean":
+        n = np.bincount(idx, minlength=nb)[:nb]
+        s = np.bincount(idx, weights=np.log(values), minlength=nb)[:nb]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out = np.where(n > 0, np.exp(s / np.maximum(n, 1)), np.nan)
+        return out
+    order = np.argsort(idx, kind="stable")
+    sorted_idx, sorted_values = idx[order], values[order]
+    bounds = np.searchsorted(sorted_idx, np.arange(nb + 1))
+    for b in range(nb):
+        seg = sorted_values[bounds[b]:bounds[b + 1]]
+        if seg.size:
+            out[b] = float(np.median(seg))
+    return out
 
 
 def bin_spectrum(spectrum: SpectrumResult, fmin: Optional[float] = None,
                  fmax: Optional[float] = None, bins_per_decade: int = 30,
-                 noise_subtract: bool = False) -> SpectrumResult:
+                 noise_subtract: bool = False, estimator: str = "rms") -> SpectrumResult:
     """Average power in log-spaced bins over ``[fmin, fmax]``.
 
     Per bin: ``amp = sqrt(mean(amp_signal**2))`` over finite raw bins, likewise
@@ -893,8 +930,14 @@ def bin_spectrum(spectrum: SpectrumResult, fmin: Optional[float] = None,
     ``amp = sqrt(max(mean(signal power) - mean(noise power), 0))`` instead,
     removing the quadrature bias of additive noise (bins with no noise
     estimate are left as they are; ``meta['noise_subtracted']`` says whether
-    it was applied).  Returns a new SpectrumResult with the binned fields.
+    it was applied).  ``estimator`` (``BIN_ESTIMATORS``): ``'rms'`` is the
+    above; ``'logmean'`` takes the geometric mean of the raw amplitudes per
+    bin and ``'median'`` their median, for the signal and the noise alike,
+    with no noise subtraction (``meta['estimator']`` records the choice).
+    Returns a new SpectrumResult with the binned fields.
     """
+    if estimator not in BIN_ESTIMATORS:
+        raise ValueError(f"estimator must be one of {BIN_ESTIMATORS}, got {estimator!r}")
     f = spectrum.f
     positive = f[f > 0]
     if positive.size == 0:
@@ -926,19 +969,25 @@ def bin_spectrum(spectrum: SpectrumResult, fmin: Optional[float] = None,
 
     keep = counts > 0
     with np.errstate(divide="ignore", invalid="ignore"):
-        mean_power = power[keep] / counts[keep]
-        has_noise = n_counts[keep] > 0
-        noise_power = np.where(has_noise, n_power[keep] / np.maximum(n_counts[keep], 1), np.nan)
-        subtracted = bool(noise_subtract) and bool(np.any(has_noise))
-        if subtracted:
-            mean_power = np.where(has_noise, np.maximum(mean_power - noise_power, 0.0), mean_power)
-        amp_b = np.sqrt(mean_power)
         f_b = np.exp(logf[keep] / counts[keep])
-        noise_b = np.sqrt(noise_power)
+        if estimator == "rms":
+            mean_power = power[keep] / counts[keep]
+            has_noise = n_counts[keep] > 0
+            noise_power = np.where(has_noise, n_power[keep] / np.maximum(n_counts[keep], 1), np.nan)
+            subtracted = bool(noise_subtract) and bool(np.any(has_noise))
+            if subtracted:
+                mean_power = np.where(has_noise, np.maximum(mean_power - noise_power, 0.0), mean_power)
+            amp_b = np.sqrt(mean_power)
+            noise_b = np.sqrt(noise_power)
+        else:
+            amp_b = _bin_estimate(idx[sig_ok], spectrum.amp_signal[sig_ok], nb, estimator)[keep]
+            noise_b = _bin_estimate(idx[noise_ok], spectrum.amp_noise[noise_ok], nb, estimator)[keep]
+            subtracted = False
         snr = amp_b / noise_b
     meta = dict(spectrum.meta)
     meta.update({"fmin": fmin, "fmax": fmax, "bins_per_decade": bpd,
-                 "noise_subtract": bool(noise_subtract), "noise_subtracted": subtracted})
+                 "noise_subtract": bool(noise_subtract), "noise_subtracted": subtracted,
+                 "estimator": estimator})
     return replace(spectrum, f_binned=f_b, amp_binned=amp_b, noise_binned=noise_b, snr=snr,
                    counts=counts[keep].astype(int), meta=meta)
 
@@ -1038,7 +1087,8 @@ def fit_omega_n(spectrum: SpectrumResult, fmin: Optional[float] = None, fmax: Op
     try:
         if bins_per_decade is not None:
             spectrum = bin_spectrum(spectrum, fmin, fmax, bins_per_decade,
-                                    bool(spectrum.meta.get("noise_subtract", False)))
+                                    bool(spectrum.meta.get("noise_subtract", False)),
+                                    str(spectrum.meta.get("estimator", "rms")))
         fb, ab, snr, counts = spectrum.f_binned, spectrum.amp_binned, spectrum.snr, spectrum.counts
         if fb.size == 0:
             return _invalid_fit("spectrum has no binned data", 0, n_fixed, loss, snr_min, units, bounds)
@@ -1168,7 +1218,7 @@ def brune_pulse(fs: float, n: int, omega0: float, fc: float, t0: float,
 
 
 __all__ = [
-    "RESULT_VERSION", "BASELINE_MODES", "TAPER_KINDS", "LOSSES", "CALIBRATION_UNITS",
+    "RESULT_VERSION", "BASELINE_MODES", "TAPER_KINDS", "LOSSES", "BIN_ESTIMATORS", "CALIBRATION_UNITS",
     "STEP_CENTRE_METHODS", "STEP_MIN_SCALE", "TAPER_FLAT_FRACTION", "N_BOUNDS", "NOISE_REGIONS",
     "CONVERGED_REL_OPTIMALITY", "CONVERGED_ABS_OPTIMALITY",
     "WindowResult", "Calibration", "SpectrumResult", "SpectralFit",

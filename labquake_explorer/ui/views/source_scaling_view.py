@@ -57,6 +57,7 @@ result is restored (selections and summary) when the view is reopened.
 """
 from __future__ import annotations
 
+import copy
 import json
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -67,19 +68,27 @@ import numpy as np
 from labquake_explorer.analysis.scaling import (
     PowerLawFit, bootstrap_exponent, fit_power_law, reference_line,
 )
+from labquake_explorer.analysis import source as src
+from labquake_explorer.analysis import t_star_scan as ts
 from labquake_explorer.analysis.source import moment_magnitude, stress_drop_eshelby
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import RUN
 from labquake_explorer.ui.views.base import RunView, event_list
 from labquake_explorer.data.sources import waveform_blocks
-from labquake_explorer.data.settings import get_setting
-from labquake_explorer.data.spectrum_store import DEFAULT_SET, set_channels, set_names
-from labquake_explorer.ui.views.pzt_spectrum_view import SETTING as PZT_SETTING, CURRENT_SET_SETTING, parse_channel_key
+from labquake_explorer.data.settings import get_setting, set_setting
+from labquake_explorer.data.spectrum_store import DEFAULT_SET, ensure_set, set_channels, set_name, set_names
+from labquake_explorer.ui.views.pzt_spectrum_view import (
+    SETTING as PZT_SETTING, CURRENT_SET_SETTING, ensemble_stats, parse_channel_key,
+)
 
 RESULT_VERSION = 2
 PZT_KEY = "pzt_spectrum"               # the older event-level map
 SPECTRUM_KEY = "spectrum"              # per waveform record (or the strain block)
 MECH_KEY = "event_analysis"
+T_STAR_KEY = "t_star_scan"             # run-level record of the shared-t* scan
+PLOT_SCALING = "scaling"
+PLOT_T_STAR = "t* scan"
+DEFAULT_T_STAR_GRID_US = "-20, 150, 5"  # from, to, step in microseconds
 ALL_CHANNELS = "all"
 REFERENCE_EXPONENT = -1.0 / 3.0
 REFERENCE_LABEL = "fc ~ M0^-1/3"
@@ -99,7 +108,9 @@ Y_VARIABLES: dict[str, str] = {
     Y_MECH_STRESS_DROP: "mech_stress_drop",
     Y_SLIP: "mech_slip",
 }
-PZT_FIELDS = ("seismic_moment_nm", "mw", "fc_hz", "stress_drop_pa", "source_radius_m", "kR")
+#: The 16th / 84th percentiles of the record's uncertainty ensemble (``record['ensemble']``), NaN without one.
+ERROR_FIELDS = ("fc_p16", "fc_p84", "m0_p16", "m0_p84")
+PZT_FIELDS = ("seismic_moment_nm", "mw", "fc_hz", "stress_drop_pa", "source_radius_m", "kR") + ERROR_FIELDS
 MECH_FIELDS = ("mech_stress_drop", "mech_slip")
 FIELDS = PZT_FIELDS + MECH_FIELDS
 
@@ -260,6 +271,24 @@ def channel_flags(record: dict, source: dict) -> list[str]:
     return flags
 
 
+def _ensemble_bounds(record: dict) -> dict:
+    """``fc_p16``, ``fc_p84``, ``m0_p16``, ``m0_p84`` of a record's uncertainty
+    ensemble (NaN without one, or without the moment in it): from the members
+    whose corner is resolved inside the band (``stats_resolved``) when there
+    are any, else from every valid member (``stats``)."""
+    out = {field: float("nan") for field in ERROR_FIELDS}
+    ensemble = record.get("ensemble") if isinstance(record, dict) else None
+    stats, _ = ensemble_stats(ensemble) if isinstance(ensemble, dict) else ({}, "")
+    if not isinstance(stats, dict) or not stats:
+        return out
+    for prefix, key in (("fc", "fc"), ("m0", "seismic_moment_nm")):
+        entry = stats.get(key)
+        if isinstance(entry, dict):
+            out[f"{prefix}_p16"] = _finite(entry.get("p16"))
+            out[f"{prefix}_p84"] = _finite(entry.get("p84"))
+    return out
+
+
 def _record_constants(source: dict) -> dict:
     """The medium/model constants (``CONSTANT_KEYS``) of one source record."""
     consts = source.get("constants") if isinstance(source.get("constants"), dict) else {}
@@ -321,6 +350,7 @@ def pzt_channel_records(event: dict, exclude_near_field: bool = False,
             "flagged": bool(gating),
             "phase": constants.get("phase"),
             "constants": constants,
+            **_ensemble_bounds(record),
         }
     return out
 
@@ -401,6 +431,8 @@ def combine_channels(records: list[dict]) -> dict:
     out["fc_hz"] = fc
     out["kvs_m_s"] = kvs
     out["kR"] = _nanmedian([r["kR"] for r in records])
+    for field in ERROR_FIELDS:                      # the ensembles' percentiles, combined like the values
+        out[field] = _log_median([r.get(field, float("nan")) for r in records])
     if np.isfinite(m0) and m0 > 0:
         out["mw"] = float(moment_magnitude(m0))
     if np.isfinite(kvs) and kvs > 0 and np.isfinite(fc) and fc > 0:
@@ -484,6 +516,87 @@ def gather_records(run: dict, channel: str = ALL_CHANNELS, trend: bool = False,
         row.update(mechanical_values(event, trend))
         rows.append(row)
     return rows
+
+
+def channel_records(run: dict, result_set: str = DEFAULT_SET) -> dict[str, list]:
+    """``{channel key: [(event index, store, record), ...]}`` of every saved PZT
+    record of the run in ``result_set`` (records with a binned spectrum only)."""
+    out: dict[str, list] = {}
+    for j, event in enumerate(event_list(run)):
+        if not isinstance(event, dict):
+            continue
+        stores = [block.get(SPECTRUM_KEY) for block in waveform_blocks(event).values() if isinstance(block, dict)]
+        stores.append(event.get(PZT_KEY))
+        for store in stores:
+            if not isinstance(store, dict):
+                continue
+            for name, record in _channel_items(set_channels(store, result_set)):
+                if isinstance(record.get("spectrum"), dict):
+                    out.setdefault(name, []).append((j, store, record))
+    return out
+
+
+def parse_t_star_grid(text) -> np.ndarray:
+    """``'from, to, step'`` in microseconds -> the grid in seconds (ValueError when unusable)."""
+    parts = [p.strip() for p in str(text or "").replace(";", ",").split(",") if p.strip()]
+    if len(parts) != 3:
+        raise ValueError("t* grid: give from, to, step in microseconds")
+    try:
+        lo, hi, step = (float(p) for p in parts)
+    except ValueError:
+        raise ValueError("t* grid: from, to and step must be numbers") from None
+    if not (np.isfinite([lo, hi, step]).all() and step > 0 and hi >= lo):
+        raise ValueError("t* grid: need step > 0 and to >= from")
+    n = int(round((hi - lo) / step)) + 1
+    if n > 2000:
+        raise ValueError("t* grid: more than 2000 points")
+    return (lo + step * np.arange(n)) * 1e-6
+
+
+def scan_run(run: dict, result_set: str, grid_s) -> dict[str, ts.TStarScan]:
+    """One shared-t* scan per sensor (channel key) over the run's records in ``result_set``."""
+    out = {}
+    for name, items in channel_records(run, result_set).items():
+        inputs = []
+        for j, _, record in items:
+            try:
+                inputs.append(ts.record_input(record, label=f"event {j}"))
+            except ValueError:
+                continue
+        if inputs:
+            out[name] = ts.scan_t_star(inputs, grid_s)
+    return out
+
+
+def refit_record(record: dict, t_star_s: float) -> dict:
+    """A copy of a saved record refitted with ``t*`` added to its own: the
+    binned spectrum corrected, the fit redone with the record's settings, the
+    source recomputed from the record's own constants (None when it had none
+    or the fit failed), the ensemble dropped."""
+    inp = ts.record_input(record)
+    fit = inp.fit(t_star_s)
+    spec = ts.corrected(inp.spectrum, t_star_s)
+    new = copy.deepcopy(record)
+    old = record.get("t_star_s")
+    new["t_star_s"] = (0.0 if old is None else float(old)) + float(t_star_s)
+    new["spectrum"] = spec.as_dict()
+    new["fit"] = fit.as_dict()
+    new["ensemble"] = None
+    new["t_star_refit"] = {"version": 1, "from_set": record.get("result_set"), "shared_t_star_s": float(t_star_s)}
+    source = record.get("source")
+    new["source"] = None
+    if isinstance(source, dict) and source.get("valid") and fit.valid:
+        c = source.get("constants") if isinstance(source.get("constants"), dict) else {}
+        moment = bool(c.get("moment_spectrum", False))
+        try:
+            new["source"] = src.source_parameters(
+                fit.omega0, fit.fc, c.get("phase") or source.get("phase") or "P", c.get("rho_kg_m3"), c.get("vp_m_s"),
+                c.get("vs_m_s"), c.get("distance_m"), radiation_coefficient=c.get("radiation_coefficient"),
+                free_surface_factor=1.0 if c.get("free_surface_factor") is None else c.get("free_surface_factor"),
+                k=c.get("k"), f_plateau_hz=None if moment else fit.band_used[0], moment_spectrum=moment).as_dict()
+        except (ValueError, KeyError, TypeError):
+            new["source"] = None
+    return new
 
 
 def available_sets(run: dict) -> list[str]:
@@ -592,6 +705,9 @@ class SourceScalingView(RunView):
         self.reference_line_artist = None
         self.saved_result: Optional[dict] = None
         self.saved_agrees: Optional[bool] = None
+        self.t_star_scans: dict[str, ts.TStarScan] = {}
+        self.t_star_grid_s: Optional[np.ndarray] = None
+        self.error_bar_artist = None
         super().__init__(app, run_idx)
 
     # ------------------------------------------------------------------ ui
@@ -675,6 +791,164 @@ class SourceScalingView(RunView):
 
         self.make_figure(figsize=(8, 6), row=0, column=1, padx=5, pady=5, sticky="nsew")
         self.ax = self.figure.add_subplot(111)
+        self._build_t_star_frame()
+
+    def _build_t_star_frame(self) -> None:
+        frame = ttk.LabelFrame(self, text="Shared t* per sensor (grid search over this set's records)")
+        frame.grid(row=1, column=1, padx=5, pady=(0, 5), sticky="ew")
+        ttk.Label(frame, text="t* grid (us) from, to, step:").grid(row=0, column=0, padx=4, pady=2, sticky="e")
+        self.t_star_grid_var = tk.StringVar(master=self, value=DEFAULT_T_STAR_GRID_US)
+        ttk.Entry(frame, textvariable=self.t_star_grid_var, width=14).grid(row=0, column=1, padx=4, pady=2, sticky="w")
+        self.scan_button = ttk.Button(frame, text="Scan t*", command=self.scan_t_star)
+        self.scan_button.grid(row=0, column=2, padx=4, pady=2, sticky="w")
+        ttk.Label(frame, text="Plot:").grid(row=0, column=3, padx=(12, 4), pady=2, sticky="e")
+        self.plot_combo = ttk.Combobox(frame, state="readonly", width=9, values=[PLOT_SCALING, PLOT_T_STAR])
+        self.plot_combo.set(PLOT_SCALING)
+        self.plot_combo.grid(row=0, column=4, padx=4, pady=2, sticky="w")
+        self.plot_combo.bind("<<ComboboxSelected>>", lambda e: self.plot())
+        ttk.Label(frame, text="Save refits as set:").grid(row=1, column=0, padx=4, pady=2, sticky="e")
+        self.refit_set_var = tk.StringVar(master=self, value="")
+        ttk.Entry(frame, textvariable=self.refit_set_var, width=14).grid(row=1, column=1, padx=4, pady=2, sticky="w")
+        self.refit_button = ttk.Button(frame, text="Save refits", command=self.save_refits)
+        self.refit_button.grid(row=1, column=2, padx=4, pady=2, sticky="w")
+        self.t_star_text = tk.StringVar(master=self, value="no scan yet")
+        ttk.Label(frame, textvariable=self.t_star_text, wraplength=640, justify="left").grid(
+            row=2, column=0, columnspan=5, padx=4, pady=(2, 4), sticky="w")
+
+    # ------------------------------------------------------------- shared t*
+    def saved_t_star_scan(self) -> Optional[dict]:
+        value = self.run.get(T_STAR_KEY) if isinstance(self.run, dict) else None
+        return value if isinstance(value, dict) else None
+
+    def restore_t_star_scan(self) -> None:
+        """A scan saved with the run, when it was made on the set shown."""
+        self.t_star_scans, self.t_star_grid_s = {}, None
+        saved = self.saved_t_star_scan()
+        if not saved or str(saved.get("result_set", DEFAULT_SET)) != self.result_set:
+            self.t_star_text.set("no scan yet" if not saved else f"the saved scan is for set '{saved.get('result_set')}'")
+            return
+        grid_text = saved.get("t_star_grid_us")
+        if grid_text:
+            self.t_star_grid_var.set(str(grid_text))
+        sensors = saved.get("sensors") if isinstance(saved.get("sensors"), dict) else {}
+        for name, entry in sensors.items():
+            try:
+                grid = np.asarray(entry["t_star_grid_s"], dtype=float)
+                self.t_star_scans[str(name)] = ts.TStarScan(
+                    grid, np.asarray(entry["cost"], dtype=float), np.asarray(entry["n_valid"], dtype=int),
+                    float(entry["best_t_star_s"]), int(entry["best_index"]), int(entry.get("n_records", 0)))
+                self.t_star_grid_s = grid
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.show_t_star_scan()
+
+    def show_t_star_scan(self) -> None:
+        if not self.t_star_scans:
+            self.t_star_text.set("no scan yet")
+            return
+        parts = []
+        for name in sorted(self.t_star_scans, key=lambda n: (parse_channel_key(n) is None, parse_channel_key(n) or 0, n)):
+            scan = self.t_star_scans[name]
+            best = f"{scan.best_t_star_s * 1e6:.0f} us" if np.isfinite(scan.best_t_star_s) else "n/a"
+            parts.append(f"{name}: t* = {best} ({scan.n_records} records)" + (" at grid end" if scan.at_grid_end else ""))
+        self.t_star_text.set(f"best shared t* (set '{self.result_set}'): " + "; ".join(parts))
+
+    def scan_t_star(self) -> bool:
+        """Grid-search one t* per sensor over this set's records; the result
+        is kept with the run (``t_star_scan``) and plotted."""
+        try:
+            grid = parse_t_star_grid(self.t_star_grid_var.get())
+        except ValueError as e:
+            self.status_var.set(str(e))
+            return False
+        scans = scan_run(self.run, self.result_set, grid)
+        if not scans:
+            self.status_var.set(f"no PZT records with a binned spectrum in set '{self.result_set}'")
+            return False
+        self.t_star_scans, self.t_star_grid_s = scans, grid
+        record = {"version": ts.RESULT_VERSION, "result_set": self.result_set,
+                  "t_star_grid_us": self.t_star_grid_var.get().strip(),
+                  "sensors": {name: scan.as_dict() for name, scan in scans.items()}}
+        self.data_manager.set_data(f"{self.run_path}/{T_STAR_KEY}", record, add_key=True)
+        self.run[T_STAR_KEY] = record
+        self.app.refresh_tree()
+        self.show_t_star_scan()
+        self.plot_combo.set(PLOT_T_STAR)
+        self.plot()
+        self.status_var.set(f"shared t* scanned over {sum(s.n_records for s in scans.values())} records of "
+                            f"{len(scans)} sensor(s); kept with the run as {T_STAR_KEY}")
+        return True
+
+    def save_refits(self) -> bool:
+        """Every record of this set refitted at its sensor's best t*, written
+        into a new result set (with the set's controls copied and the sensors'
+        t* updated), which is then shown."""
+        if not self.t_star_scans:
+            self.status_var.set("scan t* first")
+            return False
+        try:
+            name = set_name(self.refit_set_var.get())
+        except ValueError as e:
+            self.status_var.set(str(e))
+            return False
+        if name == self.result_set:
+            self.status_var.set("give the refits a set name different from the one scanned")
+            return False
+        n_written = 0
+        for channel, items in channel_records(self.run, self.result_set).items():
+            scan = self.t_star_scans.get(channel)
+            if scan is None or not np.isfinite(scan.best_t_star_s):
+                continue
+            for _, store, record in items:
+                try:
+                    new = refit_record(record, scan.best_t_star_s)
+                except ValueError:
+                    continue
+                new["result_set"] = name
+                ensure_set(store, name)["channels"][channel] = new
+                n_written += 1
+        if not n_written:
+            self.status_var.set("no record could be refitted")
+            return False
+        data = self.data_manager.data
+        settings = copy.deepcopy(get_setting(data, PZT_SETTING, "sets", self.result_set))
+        if isinstance(settings, dict):
+            sensors = settings.get("sensors") if isinstance(settings.get("sensors"), dict) else {}
+            for channel, scan in self.t_star_scans.items():
+                for _, _, record in channel_records(self.run, self.result_set).get(channel, []):
+                    key = str(record.get("field") or channel)
+                    if key in sensors and np.isfinite(scan.best_t_star_s):
+                        old = sensors[key].get("t_star_s")
+                        sensors[key]["t_star_s"] = (0.0 if old is None else float(old)) + float(scan.best_t_star_s)
+                    break
+            set_setting(data, settings, PZT_SETTING, "sets", name)
+        self.app.refresh_tree()
+        self.refresh_sets()
+        self.set_combo.set(name)
+        self.on_set_selected()
+        self.status_var.set(f"{n_written} record(s) refitted with the shared t* into set '{name}'")
+        return True
+
+    def plot_t_star(self) -> None:
+        ax = self.ax
+        ax.clear()
+        if not self.t_star_scans:
+            ax.text(0.5, 0.5, "no t* scan: press Scan t*", transform=ax.transAxes, ha="center", va="center", color="gray")
+        for name in sorted(self.t_star_scans, key=lambda n: (parse_channel_key(n) is None, parse_channel_key(n) or 0, n)):
+            scan = self.t_star_scans[name]
+            t_us = scan.t_star_grid_s * 1e6
+            line, = ax.plot(t_us, scan.cost, marker=".", label=f"{name} ({scan.n_records} records)")
+            if np.isfinite(scan.best_t_star_s):
+                ax.axvline(scan.best_t_star_s * 1e6, color=line.get_color(), linestyle=":", linewidth=0.8)
+        ax.set_xlabel("shared t* (us)")
+        ax.set_ylabel("summed weighted ln residual^2")
+        if any(np.nanmin(s.cost) > 0 for s in self.t_star_scans.values() if np.isfinite(s.cost).any()):
+            ax.set_yscale("log")
+        ax.set_title(f"{self.experiment_name()} run{self.run_idx:02d} shared t* scan (set '{self.result_set}')".strip())
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        if self.t_star_scans:
+            ax.legend(loc="best")
+        self.canvas.draw_idle()
 
     def on_run_loaded(self) -> None:
         saved = self.load_results()
@@ -682,6 +956,7 @@ class SourceScalingView(RunView):
         self.refresh_channels()
         if saved is not None:
             self.apply_saved_selections(saved)
+        self.restore_t_star_scan()
         self.refresh()
         if saved is not None:
             self.show_saved(saved)
@@ -702,6 +977,7 @@ class SourceScalingView(RunView):
 
     def on_set_selected(self) -> None:
         self.refresh_channels()
+        self.restore_t_star_scan()
         self.refresh()
 
     def refresh_channels(self) -> None:
@@ -899,6 +1175,12 @@ class SourceScalingView(RunView):
 
     # ----------------------------------------------------------------- plot
     def plot(self) -> None:
+        if getattr(self, "plot_combo", None) is not None and self.plot_combo.get() == PLOT_T_STAR:
+            self.plot_t_star()
+            return
+        self.plot_scaling()
+
+    def plot_scaling(self) -> None:
         ax = self.ax
         ax.clear()
         self.scatter_artist = None
@@ -909,6 +1191,7 @@ class SourceScalingView(RunView):
         x_all, y_all, idx_all, flagged = split_pairs(self.rows, self.y_field)
         x, y, idx = self.pairs()
         if x_all.size:
+            self.draw_error_bars(ax, idx_all)
             if x.size:
                 self.scatter_artist = ax.scatter(x, y, s=30, zorder=3,
                                                  label=f"events (channel {self.channel})")
@@ -942,6 +1225,30 @@ class SourceScalingView(RunView):
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         self.canvas.draw_idle()
+
+    def draw_error_bars(self, ax, events) -> None:
+        """16-84 % bars from the records' uncertainty ensembles: M0 along x,
+        and fc along y when fc is the Y variable (the other variables carry no
+        ensemble); rows without an ensemble get none."""
+        by_event = {r["event"]: r for r in self.rows}
+        xs, ys, xlo, xhi, ylo, yhi = [], [], [], [], [], []
+        for j in events:
+            r = by_event.get(int(j))
+            if r is None:
+                continue
+            x0, y0 = r["seismic_moment_nm"], r[self.y_field]
+            dx = (max(x0 - r["m0_p16"], 0.0), max(r["m0_p84"] - x0, 0.0))
+            dy = (max(y0 - r["fc_p16"], 0.0), max(r["fc_p84"] - y0, 0.0)) if self.y_field == "fc_hz" else (0.0, 0.0)
+            if not (np.isfinite(dx).all() or np.isfinite(dy).all()):
+                continue
+            xs.append(x0); ys.append(y0)
+            xlo.append(dx[0] if np.isfinite(dx[0]) else 0.0); xhi.append(dx[1] if np.isfinite(dx[1]) else 0.0)
+            ylo.append(dy[0] if np.isfinite(dy[0]) else 0.0); yhi.append(dy[1] if np.isfinite(dy[1]) else 0.0)
+        self.error_bar_artist = None
+        if xs:
+            self.error_bar_artist = ax.errorbar(xs, ys, xerr=[xlo, xhi], yerr=[ylo, yhi], fmt="none",
+                                                ecolor="0.6", elinewidth=0.8, capsize=2, zorder=2,
+                                                label="ensemble 16-84 %")
 
     # ----------------------------------------------------------------- save
     def results(self) -> Optional[dict]:

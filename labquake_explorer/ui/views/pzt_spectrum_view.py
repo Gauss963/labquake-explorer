@@ -80,6 +80,7 @@ import numpy as np
 from labquake_explorer.analysis import source as src
 from labquake_explorer.analysis import spectrum as sp
 from labquake_explorer.analysis.spectrum import N_BOUNDS
+from labquake_explorer.analysis import spectrum_ensemble as se
 from labquake_explorer.data.spectrum_store import DEFAULT_SET, ensure_set, set_channels, set_name, set_names
 from labquake_explorer.data.settings import delete_setting, get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
@@ -114,10 +115,12 @@ CURRENT_SET_SETTING = "current_set"    # analysis['pzt_spectrum']['current_set']
 #: Controls kept at the experiment level (the last saved), so a new window opens with them.
 SETTINGS_KEYS = ("trigger", "pre_ms", "post_ms", "noise_start_ms", "noise_end_ms", "taper", "baseline",
                  "highpass_hz", "remove_step", "fmin_hz", "fmax_hz", "bins_per_decade", "snr_min", "n_fixed",
-                 "n_max", "loss", "phase", "radiation_coefficient")
+                 "n_max", "loss", "estimator", "ensemble_on", "ensemble_fmins_hz", "ensemble_fmaxs_hz",
+                 "phase", "radiation_coefficient")
 #: Per-sensor values kept at the experiment level, keyed by the channel's field name (``pzt_1``) or ``ch<k>``.
 SENSOR_KEYS = ("calibration", "calibration_path", "calibration_unit", "calibration_db", "calibration_divisor",
-               "t_star_s", "distance_m", "free_surface_factor")
+               "t_star_s", "q_csv_path", "q_travel_time_s", "q_hold_ends", "attenuation",
+               "distance_m", "free_surface_factor", "ensemble_calibration_paths")
 LEGACY_SPECTRUM_KEY = "pzt_spectrum"   # the event-level map written before 2026-10-12, read only
 #: Prefix of the per-channel keys in a ``spectrum['channels']`` map.
 CHANNEL_KEY_PREFIX = "ch"
@@ -130,10 +133,13 @@ DEFAULTS = {
     "pre_ms": "0.5", "post_ms": "2.0", "taper": "tukey", "baseline": "pre_linear",
     "highpass_hz": "", "remove_step": False,
     "calibration_path": "", "calibration_unit": "V/V", "calibration_db": False, "calibration_divisor": "",
-    "t_star_s": "",
+    "t_star_s": "", "q_csv_path": "", "q_travel_time_s": "", "q_hold_ends": False,
     "fmin_hz": "1000", "fmax_hz": "", "bins_per_decade": "30", "snr_min": "3",
-    "n_fixed": True, "n_max": f"{N_BOUNDS[1]:g}", "loss": "linear",
+    "n_fixed": True, "n_max": f"{N_BOUNDS[1]:g}", "loss": "linear", "estimator": "rms",
+    "ensemble_on": False, "ensemble_fmins_hz": ", ".join(f"{v:g}" for v in se.DEFAULT_FMINS_HZ),
+    "ensemble_fmaxs_hz": ", ".join(f"{v:g}" for v in se.DEFAULT_FMAXS_HZ), "ensemble_calibration_paths": "",
 }
+PATH_SEPARATOR = ";"                   # between the alternative calibration CSVs typed into one entry
 FMAX_FRACTION_OF_FS = 0.4
 
 _NA = "n/a"
@@ -233,6 +239,53 @@ def _warning_texts(value) -> list[str]:
     return [str(w) for w in _as_list(value) if str(w).strip()]
 
 
+def ensemble_stats(ensemble: dict) -> tuple:
+    """``(stats, which)`` of a stored ensemble: its ``stats_resolved`` (the
+    valid members whose corner is resolved inside the band) when any member
+    is, else its ``stats`` over every valid member; ``which`` says which."""
+    resolved = ensemble.get("stats_resolved") if isinstance(ensemble, dict) else None
+    fc = resolved.get("fc") if isinstance(resolved, dict) else None
+    try:
+        n = int(fc.get("n", 0)) if isinstance(fc, dict) else 0
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return resolved, "resolved"
+    return (ensemble.get("stats") if isinstance(ensemble, dict) else {}) or {}, "valid"
+
+
+def _parse_frequencies(text, name: str, default) -> list:
+    """The grid entries: numbers in Hz (blank = the default grid)."""
+    try:
+        return list(se.parse_frequency_list(text, default))
+    except ValueError as e:
+        raise ValueError(f"{name}: {e}") from None
+
+
+def _frequency_text(value) -> str:
+    """Entry text for a stored frequency list (a list, or the text itself)."""
+    if isinstance(value, str):
+        return value
+    try:
+        return ", ".join(f"{float(v):g}" for v in _as_list(value))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_paths(text) -> list:
+    """The alternative CSVs typed into one entry, ``PATH_SEPARATOR`` between them."""
+    return [p.strip() for p in str(text or "").split(PATH_SEPARATOR) if p.strip()]
+
+
+def _paths_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return PATH_SEPARATOR.join(str(_text_value(v)) for v in _as_list(value))
+    except TypeError:
+        return ""
+
+
 def _table_divisor(table) -> float:
     """The divisor the stored gains carry (1 when none was recorded)."""
     try:
@@ -296,6 +349,7 @@ class PZTSpectrumView(EventView):
         self._build_window_frame(left)
         self._build_calibration_frame(left)
         self._build_fit_frame(left)
+        self._build_ensemble_frame(left)
         self._build_buttons(left)
         self._build_results_frame(middle)
         self._build_source_frame(middle)
@@ -409,6 +463,11 @@ class PZTSpectrumView(EventView):
         self.calibration_db_var = tk.BooleanVar(master=self, value=DEFAULTS["calibration_db"])
         self.t_star_var = tk.StringVar(master=self, value=DEFAULTS["t_star_s"])
         self.calibration_divisor_var = tk.StringVar(master=self, value=DEFAULTS["calibration_divisor"])
+        self.q_path_var = tk.StringVar(master=self, value=DEFAULTS["q_csv_path"])
+        self.q_travel_var = tk.StringVar(master=self, value=DEFAULTS["q_travel_time_s"])
+        self.q_hold_var = tk.BooleanVar(master=self, value=DEFAULTS["q_hold_ends"])
+        self.q_note_var = tk.StringVar(master=self, value="")
+        self.attenuation_table: Optional[dict] = None
         ttk.Label(frame, text="CSV:").grid(row=0, column=0, padx=4, pady=2, sticky="e")
         self.calibration_entry = ttk.Entry(frame, textvariable=self.calibration_path_var, width=18)
         self.calibration_entry.grid(row=0, column=1, padx=4, pady=2, sticky="w")
@@ -433,7 +492,21 @@ class PZTSpectrumView(EventView):
         ttk.Label(frame, text=f"{sp.MOMENT_UNIT}: a moment response (EGF route); e.g. divide\n"
                               "a Psi table by C_FM = Vp + Vs to use it as stored",
                   foreground="#606060", justify="left").grid(row=6, column=0, columnspan=3, padx=4, pady=(0, 2), sticky="w")
+        ttk.Label(frame, text="Q^-1(f) CSV:").grid(row=7, column=0, padx=4, pady=2, sticky="e")
+        self.q_entry = ttk.Entry(frame, textvariable=self.q_path_var, width=18)
+        self.q_entry.grid(row=7, column=1, padx=4, pady=2, sticky="w")
+        self._live(self.q_entry)
+        ttk.Button(frame, text="Browse", width=7, command=self.browse_q).grid(row=7, column=2, padx=2, pady=2, sticky="w")
+        self._entry(frame, "travel time (s):", self.q_travel_var, 8)
+        ttk.Checkbutton(frame, text="hold end values outside the table", variable=self.q_hold_var,
+                        command=lambda: self.schedule_compute(now=True)).grid(
+            row=9, column=0, columnspan=3, padx=4, pady=2, sticky="w")
+        ttk.Label(frame, textvariable=self.q_note_var, wraplength=250, justify="left",
+                  foreground="#606060").grid(row=10, column=0, columnspan=3, padx=4, pady=(0, 2), sticky="w")
+        ttk.Button(frame, text="Clear Q", command=self.clear_attenuation).grid(
+            row=11, column=0, columnspan=2, padx=4, pady=2, sticky="w")
         self.show_calibration_note()
+        self.show_q_note()
 
     def _build_fit_frame(self, master) -> None:
         frame = ttk.LabelFrame(master, text="Fit band / omega-n fit")
@@ -457,6 +530,45 @@ class PZTSpectrumView(EventView):
         self.loss_combobox.set(DEFAULTS["loss"])
         self.loss_combobox.grid(row=6, column=1, padx=4, pady=2, sticky="w")
         self._live(self.loss_combobox)
+        ttk.Label(frame, text="Bin estimator:").grid(row=7, column=0, padx=4, pady=2, sticky="e")
+        self.estimator_combobox = ttk.Combobox(frame, width=10, state="readonly", values=list(sp.BIN_ESTIMATORS))
+        self.estimator_combobox.set(DEFAULTS["estimator"])
+        self.estimator_combobox.grid(row=7, column=1, padx=4, pady=2, sticky="w")
+        self._live(self.estimator_combobox)
+        ttk.Label(frame, text="per log bin: rms = sqrt(mean power), logmean = geometric\nmean, median",
+                  foreground="#606060", justify="left").grid(row=8, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w")
+
+    def _build_ensemble_frame(self, master) -> None:
+        frame = ttk.LabelFrame(master, text="Uncertainty ensemble")
+        frame.pack(fill="x", pady=4)
+        self.ensemble_var = tk.BooleanVar(master=self, value=DEFAULTS["ensemble_on"])
+        self.ensemble_fmins_var = tk.StringVar(master=self, value=DEFAULTS["ensemble_fmins_hz"])
+        self.ensemble_fmaxs_var = tk.StringVar(master=self, value=DEFAULTS["ensemble_fmaxs_hz"])
+        self.ensemble_calibrations_var = tk.StringVar(master=self, value=DEFAULTS["ensemble_calibration_paths"])
+        self.ensemble_text_var = tk.StringVar(master=self, value="")
+        ttk.Checkbutton(frame, text="run on Save (refit over the band grid and the alternative tables)",
+                        variable=self.ensemble_var).grid(row=0, column=0, columnspan=3, padx=4, pady=2, sticky="w")
+        for row, (label, var) in enumerate((("fmin grid (Hz):", self.ensemble_fmins_var),
+                                            ("fmax grid (Hz):", self.ensemble_fmaxs_var)), start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, padx=4, pady=2, sticky="e")
+            entry = ttk.Entry(frame, textvariable=var, width=24)
+            entry.grid(row=row, column=1, columnspan=2, padx=4, pady=2, sticky="w")
+            self._live(entry)                               # validated with the other entries; the ensemble itself waits
+            self.entries[label] = entry
+        ttk.Label(frame, text="alt. CSVs (; separated):").grid(row=3, column=0, padx=4, pady=2, sticky="e")
+        self.ensemble_calibrations_entry = ttk.Entry(frame, textvariable=self.ensemble_calibrations_var, width=18)
+        self.ensemble_calibrations_entry.grid(row=3, column=1, padx=4, pady=2, sticky="w")
+        self._live(self.ensemble_calibrations_entry)
+        self.entries["alt. CSVs (; separated):"] = self.ensemble_calibrations_entry
+        ttk.Button(frame, text="Browse", width=7, command=self.browse_ensemble_calibrations).grid(
+            row=3, column=2, padx=2, pady=2, sticky="w")
+        ttk.Label(frame, text="the same unit, dB flag and divisor as the calibration above;\n"
+                              "the record's own table is always the first member",
+                  foreground="#606060", justify="left").grid(row=4, column=0, columnspan=3, padx=4, pady=(0, 2), sticky="w")
+        self.ensemble_button = ttk.Button(frame, text="Run ensemble now", command=self.compute_ensemble)
+        self.ensemble_button.grid(row=5, column=0, columnspan=2, padx=4, pady=4, sticky="ew")
+        ttk.Label(frame, textvariable=self.ensemble_text_var, wraplength=250, justify="left").grid(
+            row=6, column=0, columnspan=3, padx=4, pady=2, sticky="w")
 
     def _build_buttons(self, master) -> None:
         frame = ttk.Frame(master)
@@ -475,7 +587,7 @@ class PZTSpectrumView(EventView):
         self.result_vars: dict[str, tk.StringVar] = {}
         rows = [("omega0", "Omega0:"), ("fc", "fc:"), ("n", "n:"), ("rms", "rms (ln):"),
                 ("n_bins", "bins used:"), ("band", "band:"), ("taper", "taper energy:"),
-                ("flags", "flags:")]
+                ("flags", "flags:"), ("ensemble", "ensemble 16-84 %:")]
         for i, (key, label) in enumerate(rows):
             ttk.Label(frame, text=label).grid(row=i, column=0, padx=4, pady=2, sticky="ne")
             var = tk.StringVar(master=self, value=_NA)
@@ -834,8 +946,24 @@ class PZTSpectrumView(EventView):
             self.status_var.set(reason)
             return
         if isinstance(saved, dict):
-            self.status_var.set(self.status_var.get().replace("- not saved", "- " + self.compare_with_saved(saved)))
+            comparison = self.compare_with_saved(saved)
+            self.status_var.set(self.status_var.get().replace("- not saved", "- " + comparison))
+            if comparison == "matches the saved record" and self._same_ensemble_inputs(saved):
+                # the same fit from the same inputs: the saved ensemble still holds
+                self.record["ensemble"] = copy.deepcopy(saved["ensemble"])
+                self.show_ensemble(self.record["ensemble"])
         self.auto_source()
+
+    def _same_ensemble_inputs(self, saved: dict) -> bool:
+        if not (isinstance(self.record, dict) and isinstance(saved.get("ensemble"), dict)):
+            return False
+        try:
+            return all(list(_as_list(self.record.get(key)) or []) == list(_as_list(saved.get(key)) or [])
+                       for key in ("ensemble_fmins_hz", "ensemble_fmaxs_hz")) and \
+                _parse_paths(_paths_text(self.record.get("ensemble_calibration_paths"))) == \
+                _parse_paths(_paths_text(saved.get("ensemble_calibration_paths")))
+        except (TypeError, ValueError):
+            return False
 
     def compare_with_saved(self, saved: dict) -> str:
         """'matches the saved record' when the fresh fit has the saved
@@ -886,6 +1014,10 @@ class PZTSpectrumView(EventView):
         self.calibration_divisor_var.set(_text(g("calibration_divisor")))
         self.set_calibration_table(self._record_table(rec))
         self.t_star_var.set(_text(g("t_star_s")))
+        self.q_path_var.set(str(g("q_csv_path") or ""))
+        self.q_travel_var.set(_text(g("q_travel_time_s")))
+        self.q_hold_var.set(bool(g("q_hold_ends", False)))
+        self.set_attenuation_table(self._record_q_table(rec))
         self.fmin_var.set(_text(g("fmin_hz", DEFAULTS["fmin_hz"])))
         self.fmax_var.set(_text(g("fmax_hz")))
         self.bins_var.set(_text(g("bins_per_decade", DEFAULTS["bins_per_decade"])))
@@ -893,6 +1025,14 @@ class PZTSpectrumView(EventView):
         self.n_fixed_var.set(bool(g("n_fixed", True)))
         self.n_max_var.set(_text(g("n_max", DEFAULTS["n_max"])) or DEFAULTS["n_max"])   # absent before 2026-11
         self.loss_combobox.set(g("loss") if g("loss") in sp.LOSSES else DEFAULTS["loss"])
+        self.estimator_combobox.set(g("estimator") if g("estimator") in sp.BIN_ESTIMATORS else DEFAULTS["estimator"])
+        self.ensemble_var.set(bool(g("ensemble_on", DEFAULTS["ensemble_on"])))
+        for key, var in (("ensemble_fmins_hz", self.ensemble_fmins_var), ("ensemble_fmaxs_hz", self.ensemble_fmaxs_var)):
+            value = g(key)
+            if value is not None:
+                var.set(_frequency_text(value) or DEFAULTS[key])
+        if "ensemble_calibration_paths" in rec:
+            self.ensemble_calibrations_var.set(_paths_text(g("ensemble_calibration_paths")))
         inputs = g("source_inputs")
         if not isinstance(inputs, dict):                 # records written before the inputs were kept
             source = g("source")
@@ -964,7 +1104,10 @@ class PZTSpectrumView(EventView):
         inputs = {k: rec.pop(k) for k in ("phase", "radiation_coefficient") if k in rec}
         keep = {"calibration_path": self.calibration_path_var.get(), "calibration_unit": self.unit_combobox.get(),
                 "calibration_db": bool(self.calibration_db_var.get()), "t_star_s": self.t_star_var.get(),
-                "calibration_divisor": self.calibration_divisor_var.get(), "calibration": self.calibration_table}
+                "calibration_divisor": self.calibration_divisor_var.get(), "calibration": self.calibration_table,
+                "ensemble_calibration_paths": self.ensemble_calibrations_var.get(),
+                "q_csv_path": self.q_path_var.get(), "q_travel_time_s": self.q_travel_var.get(),
+                "q_hold_ends": bool(self.q_hold_var.get()), "attenuation": self.attenuation_table}
         self.apply_record({**keep, **rec, "source_inputs": inputs})
 
     def apply_medium(self, medium: dict) -> None:
@@ -984,8 +1127,18 @@ class PZTSpectrumView(EventView):
             self.calibration_db_var.set(bool(entry.get("calibration_db")))
         if "calibration_divisor" in entry:
             self.calibration_divisor_var.set(_text(entry.get("calibration_divisor")))
+        if "ensemble_calibration_paths" in entry:
+            self.ensemble_calibrations_var.set(_paths_text(entry.get("ensemble_calibration_paths")))
         if "t_star_s" in entry:
             self.t_star_var.set(_text(entry.get("t_star_s")))
+        if "attenuation" in entry:
+            table = entry.get("attenuation")
+            self.set_attenuation_table(table if isinstance(table, dict) else None)
+            self.q_path_var.set(str(_text_value(entry.get("q_csv_path") or "")))
+        if "q_travel_time_s" in entry:
+            self.q_travel_var.set(_text(entry.get("q_travel_time_s")))
+        if "q_hold_ends" in entry:
+            self.q_hold_var.set(bool(entry.get("q_hold_ends")))
         self.apply_source_inputs(entry, only=("distance_m", "free_surface_factor"))
 
     def store_experiment_settings(self) -> None:
@@ -1007,7 +1160,11 @@ class PZTSpectrumView(EventView):
                      "calibration_unit": rec["calibration_unit"], "calibration_db": bool(rec["calibration_db"]),
                      "calibration_divisor": rec.get("calibration_divisor"),
                      "t_star_s": rec["t_star_s"], "distance_m": inputs["distance_m"],
-                     "free_surface_factor": inputs["free_surface_factor"]}
+                     "free_surface_factor": inputs["free_surface_factor"],
+                     "ensemble_calibration_paths": list(rec.get("ensemble_calibration_paths") or []),
+                     "q_csv_path": rec.get("q_csv_path"), "q_travel_time_s": rec.get("q_travel_time_s"),
+                     "q_hold_ends": bool(rec.get("q_hold_ends", False)),
+                     "attenuation": copy.deepcopy(self.attenuation_table)}
             set_setting(data, entry, SETTING, SETS_SETTING, name, "sensors", key)
         set_setting(data, name, SETTING, CURRENT_SET_SETTING)
         self._move_flat_settings()
@@ -1060,6 +1217,9 @@ class PZTSpectrumView(EventView):
             "calibration_divisor": _parse_float(self.calibration_divisor_var.get(), "divide gain by",
                                                 required=False, lo=0.0, strict_lo=True),
             "t_star_s": _parse_float(self.t_star_var.get(), "t* (s)", required=False, lo=0.0),
+            "q_csv_path": self.q_path_var.get().strip(),
+            "q_travel_time_s": _parse_float(self.q_travel_var.get(), "travel time (s)", required=False, lo=0.0),
+            "q_hold_ends": bool(self.q_hold_var.get()),
             "fmin_hz": _parse_float(self.fmin_var.get(), "fmin (Hz)", lo=0.0, strict_lo=True),
             "fmax_hz": _parse_float(self.fmax_var.get(), "fmax (Hz)", lo=0.0, strict_lo=True),
             "bins_per_decade": _parse_int(self.bins_var.get(), "bins per decade"),
@@ -1067,6 +1227,11 @@ class PZTSpectrumView(EventView):
             "n_fixed": bool(self.n_fixed_var.get()),
             "n_max": _parse_float(self.n_max_var.get(), "n max", lo=N_BOUNDS[0], strict_lo=True),
             "loss": self.loss_combobox.get(),
+            "estimator": self.estimator_combobox.get(),
+            "ensemble_on": bool(self.ensemble_var.get()),
+            "ensemble_fmins_hz": _parse_frequencies(self.ensemble_fmins_var.get(), "ensemble fmin grid", se.DEFAULT_FMINS_HZ),
+            "ensemble_fmaxs_hz": _parse_frequencies(self.ensemble_fmaxs_var.get(), "ensemble fmax grid", se.DEFAULT_FMAXS_HZ),
+            "ensemble_calibration_paths": _parse_paths(self.ensemble_calibrations_var.get()),
         }
         if p["pre_ms"] + p["post_ms"] <= 0:
             raise ValueError("pre + post window must be > 0")
@@ -1093,6 +1258,15 @@ class PZTSpectrumView(EventView):
             raise ValueError("fmax must be larger than fmin")
         if p["loss"] not in sp.LOSSES:
             raise ValueError("select a loss")
+        if p["estimator"] not in sp.BIN_ESTIMATORS:
+            raise ValueError("select a bin estimator")
+        if p["q_csv_path"] or self.attenuation_table is not None:
+            if p["t_star_s"] is not None:
+                raise ValueError("give either t* or a Q^-1(f) table, not both (clear one of them)")
+            if p["q_travel_time_s"] is None:
+                raise ValueError("the Q^-1(f) table needs the travel time (s) of this sensor")
+        if not se.band_grid(p["ensemble_fmins_hz"], p["ensemble_fmaxs_hz"]):
+            raise ValueError("the ensemble grid needs an fmin below an fmax")
         return p
 
     @staticmethod
@@ -1182,6 +1356,79 @@ class PZTSpectrumView(EventView):
             self.set_calibration_table(dict(cal.as_dict(), gain_db=db, gain_divisor=divisor))
         return cal
 
+    def load_attenuation(self, p: dict) -> Optional[sp.Attenuation]:
+        """The Q^-1(f) correction for ``p``: the CSV in the Q entry is read (and
+        its table kept) when it is not the table loaded; otherwise the stored
+        table is used with the travel time and hold-ends choice as entered (the
+        travel time differs per sensor, the table does not).  None when no
+        table is loaded."""
+        path, travel, hold = p["q_csv_path"], p["q_travel_time_s"], bool(p["q_hold_ends"])
+        table = self.attenuation_table
+        same_file = table is not None and str(table.get("source") or "") == path
+        if path and not same_file:
+            try:
+                att = sp.load_q_csv(path, travel, hold)
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                raise ValueError(f"Q^-1(f) CSV: {e}") from None
+            except Exception as e:
+                raise ValueError(f"Q^-1(f) CSV could not be read: {type(e).__name__}: {e}") from None
+            self.set_attenuation_table(att.as_dict())
+            return att
+        if table is None:
+            return None
+        try:
+            att = sp.Attenuation.from_arrays(table["frequency_hz"], table["q_inv"], travel,
+                                             source=str(table.get("source") or ""), hold_ends=hold)
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"the stored Q^-1(f) table is unusable ({e}): load a CSV") from None
+        if float(table.get("travel_time_s", float("nan")) or float("nan")) != att.travel_time_s or bool(table.get("hold_ends", False)) != hold:
+            self.set_attenuation_table(att.as_dict())
+        return att
+
+    def set_attenuation_table(self, table: Optional[dict]) -> None:
+        self.attenuation_table = None if not isinstance(table, dict) else {
+            k: (_as_list(v) if k in ("frequency_hz", "q_inv") else v) for k, v in table.items()}
+        self.show_q_note()
+
+    def show_q_note(self) -> None:
+        table = self.attenuation_table
+        if table is None:
+            self.q_note_var.set("no Q^-1(f) table: constant t* only (blank = no attenuation)")
+            return
+        source = str(table.get("source") or "")
+        name = Path(source).name if source else "stored table"
+        try:
+            n = len(_as_list(table.get("frequency_hz")))
+            span = f"{_fmt(table.get('fmin_hz'), '.3g')} - {_fmt(table.get('fmax_hz'), '.3g')} Hz"
+        except TypeError:
+            n, span = 0, _NA
+        hold = ", end values held outside" if table.get("hold_ends") else ", no correction outside"
+        self.q_note_var.set(f"Q loaded: {name}: {n} rows, {span}, T = {_fmt(table.get('travel_time_s'), '.3g')} s{hold}")
+
+    def clear_attenuation(self) -> None:
+        self.q_path_var.set("")
+        self.set_attenuation_table(None)
+        self.schedule_compute(now=True)
+
+    def browse_q(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="Q^-1(f) CSV",
+                                          filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if path:
+            self.q_path_var.set(path)
+            self.schedule_compute(now=True)
+
+    @staticmethod
+    def _record_q_table(rec: dict) -> Optional[dict]:
+        """The Q^-1(f) table a record carries: its own, else the spectrum meta's."""
+        table = rec.get("attenuation")
+        if not isinstance(table, dict):
+            spec = rec.get("spectrum")
+            meta = spec.get("meta") if isinstance(spec, dict) else None
+            table = meta.get("attenuation") if isinstance(meta, dict) else None
+        if isinstance(table, dict) and len(_as_list(table.get("frequency_hz"))) >= 2:
+            return dict(table)
+        return None
+
     def set_calibration_table(self, table: Optional[dict]) -> None:
         """Make ``table`` (``Calibration.as_dict()`` plus ``gain_db``, or None) the
         loaded calibration and say so under the entries."""
@@ -1237,6 +1484,7 @@ class PZTSpectrumView(EventView):
             p = self.read_parameters()
             trigger = self.trigger_time(p)
             calibration = self.load_calibration(p)
+            attenuation = self.load_attenuation(p)
             noise_window = (None if p["noise_start_ms"] is None
                             else (p["noise_start_ms"] * 1e-3, p["noise_end_ms"] * 1e-3))
             window = sp.extract_window(self.strain_time, self.strain_raw[p["channel"]], trigger,
@@ -1244,9 +1492,9 @@ class PZTSpectrumView(EventView):
                                        highpass_hz=p["highpass_hz"], remove_step=p["remove_step"],
                                        noise_window=noise_window)
             spectrum = sp.compute_spectrum(window, taper=p["taper"], alpha=TUKEY_ALPHA,
-                                           calibration=calibration, t_star_s=p["t_star_s"],
+                                           calibration=calibration, t_star_s=p["t_star_s"], attenuation=attenuation,
                                            fmin=p["fmin_hz"], fmax=p["fmax_hz"],
-                                           bins_per_decade=p["bins_per_decade"])
+                                           bins_per_decade=p["bins_per_decade"], estimator=p["estimator"])
         except ValueError as e:
             self.status_var.set(str(e))
             return False
@@ -1255,6 +1503,7 @@ class PZTSpectrumView(EventView):
         self.window, self.spectrum, self.fit = window, spectrum, fit
         self.record = self.build_record(p, trigger, spectrum, fit)
         self.show_record(self.record)
+        self.show_ensemble(None)
         self.show_source(None)
         self.plot()
         # automatic noise that had to move after the signal (no room before it) is said in the status
@@ -1278,7 +1527,10 @@ class PZTSpectrumView(EventView):
         taper, baseline, highpass_hz, remove_step, calibration_path,
         calibration_unit, calibration_db, calibration_divisor, t_star_s, fmin_hz, fmax_hz,
         bins_per_decade, snr_min, n_fixed, n_max (the ceiling of a free n;
-        the bounds used are ``fit['n_bounds']``), loss, parameter_warnings
+        the bounds used are ``fit['n_bounds']``), loss, estimator (the per-bin
+        statistic), ensemble_on / ensemble_fmins_hz / ensemble_fmaxs_hz /
+        ensemble_calibration_paths (the uncertainty ensemble's inputs) and
+        ensemble (``Ensemble.as_dict()`` once run, else None), parameter_warnings
         (:meth:`parameter_warnings` of the entries), spectrum
         (``SpectrumResult.as_dict()``: binned arrays and the window/taper
         meta incl. ``taper_energy_fraction``), fit (``SpectralFit.as_dict()``
@@ -1306,6 +1558,10 @@ class PZTSpectrumView(EventView):
             "calibration_divisor": p["calibration_divisor"],
             "calibration": copy.deepcopy(self.calibration_table) if spectrum.meta.get("calibration") else None,
             "t_star_s": p["t_star_s"],
+            "q_csv_path": p["q_csv_path"],
+            "q_travel_time_s": p["q_travel_time_s"],
+            "q_hold_ends": bool(p["q_hold_ends"]),
+            "attenuation": copy.deepcopy(self.attenuation_table) if spectrum.meta.get("attenuation") else None,
             "fmin_hz": float(p["fmin_hz"]),
             "fmax_hz": float(p["fmax_hz"]),
             "bins_per_decade": int(p["bins_per_decade"]),
@@ -1313,6 +1569,12 @@ class PZTSpectrumView(EventView):
             "n_fixed": bool(p["n_fixed"]),
             "n_max": float(p["n_max"]),
             "loss": p["loss"],
+            "estimator": p["estimator"],
+            "ensemble_on": bool(p["ensemble_on"]),
+            "ensemble_fmins_hz": list(p["ensemble_fmins_hz"]),
+            "ensemble_fmaxs_hz": list(p["ensemble_fmaxs_hz"]),
+            "ensemble_calibration_paths": list(p["ensemble_calibration_paths"]),
+            "ensemble": None,
             "parameter_warnings": self.parameter_warnings(p),
             "source_inputs": self.source_inputs(),
             "result_set": self.result_set,
@@ -1452,6 +1714,94 @@ class PZTSpectrumView(EventView):
             self.status_var.set(f"source parameters invalid - {result.reason}")
         return bool(result.valid)
 
+    # ------------------------------------------------------------ ensemble
+    def ensemble_spectra(self, p: dict) -> list:
+        """``(label, spectrum)`` per calibration table for the ensemble: the
+        record's own table first, then each alternative CSV read with the same
+        unit, dB flag and divisor; every spectrum binned over the whole grid."""
+        lo, hi = min(p["ensemble_fmins_hz"]), max(p["ensemble_fmaxs_hz"])
+        unit, db = p["calibration_unit"], bool(p["calibration_db"])
+        divisor = 1.0 if p.get("calibration_divisor") is None else float(p["calibration_divisor"])
+        tables = [(self.calibration_path_var.get().strip() or ("stored table" if self.calibration_table else "uncalibrated"),
+                   self.load_calibration(p))]
+        for path in p["ensemble_calibration_paths"]:
+            try:
+                tables.append((path, sp.load_calibration_csv(path, unit, db, gain_divisor=divisor)))
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                raise ValueError(f"alternative calibration {Path(path).name}: {e}") from None
+        attenuation = self.load_attenuation(p)
+        return [(label, sp.compute_spectrum(self.window, taper=p["taper"], alpha=TUKEY_ALPHA, calibration=cal,
+                                            t_star_s=p["t_star_s"], attenuation=attenuation,
+                                            fmin=min(lo, p["fmin_hz"]), fmax=max(hi, p["fmax_hz"]),
+                                            bins_per_decade=p["bins_per_decade"], estimator=p["estimator"]))
+                for label, cal in tables]
+
+    def compute_ensemble(self) -> bool:
+        """Refit the current window over the band grid and the alternative
+        calibration tables; the summary goes into ``record['ensemble']`` and
+        the results row.  Returns True when it ran."""
+        rec = self.record
+        if not isinstance(rec, dict) or self.window is None:
+            self.status_var.set("compute a spectrum first")
+            return False
+        try:
+            p = self.read_parameters()
+            spectra = self.ensemble_spectra(p)
+            ens = se.fit_ensemble(spectra, se.band_grid(p["ensemble_fmins_hz"], p["ensemble_fmaxs_hz"]),
+                                  snr_min=p["snr_min"], n_fixed=p["n_fixed"], loss=p["loss"],
+                                  n_bounds=(N_BOUNDS[0], p["n_max"]))
+        except ValueError as e:
+            self.status_var.set(f"ensemble: {e}")
+            return False
+        ens = ens.with_moment(self._moment_per_omega0(rec))
+        rec["ensemble"] = ens.as_dict()
+        rec.update({"ensemble_fmins_hz": list(p["ensemble_fmins_hz"]), "ensemble_fmaxs_hz": list(p["ensemble_fmaxs_hz"]),
+                    "ensemble_calibration_paths": list(p["ensemble_calibration_paths"]), "ensemble_on": bool(p["ensemble_on"])})
+        self.show_ensemble(rec["ensemble"])
+        self.status_var.set(f"ensemble: {ens.n_valid} of {ens.n_members} fits valid over {len(ens.bands_hz)} bands x "
+                            f"{len(ens.calibrations)} table(s); {self.ensemble_text_var.get()} - not saved")
+        return True
+
+    @staticmethod
+    def _moment_per_omega0(rec: dict) -> float:
+        """``M0 / Omega0`` of the record's source (NaN when none): the moment of
+        every ensemble member follows its plateau by this factor."""
+        source = rec.get("source") if isinstance(rec, dict) else None
+        fitd = rec.get("fit") if isinstance(rec, dict) else None
+        if not (isinstance(source, dict) and source.get("valid") and isinstance(fitd, dict)):
+            return float("nan")
+        try:
+            return float(source["seismic_moment_nm"]) / float(fitd["omega0"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return float("nan")
+
+    def show_ensemble(self, ensemble) -> None:
+        """The ensemble row and the frame's own text, from a stored ensemble dict."""
+        if not isinstance(ensemble, dict) or not isinstance(ensemble.get("stats"), dict):
+            self.result_vars["ensemble"].set(_NA)
+            self.ensemble_text_var.set("not run")
+            return
+        st, which = ensemble_stats(ensemble)
+
+        def span(field, fmt):
+            s = st.get(field) if isinstance(st.get(field), dict) else {}
+            return f"{_fmt(s.get('p16'), fmt)} - {_fmt(s.get('p84'), fmt)}"
+
+        n_valid, n_members = ensemble.get("n_valid", _NA), ensemble.get("n_members", _NA)
+        count = (f"{ensemble.get('n_resolved', _NA)} resolved of {n_valid} valid, {n_members} members" if which == "resolved"
+                 else f"{n_valid}/{n_members} valid, none resolved")
+        self.result_vars["ensemble"].set(f"fc {span('fc', '.4g')} Hz; Omega0 {span('omega0', '.3g')}; n {span('n', '.2f')}"
+                                         + (f"; M0 {span('seismic_moment_nm', '.3g')} N m" if "seismic_moment_nm" in st else "")
+                                         + f" ({count})")
+        self.ensemble_text_var.set(f"fc 16-84 %: {span('fc', '.4g')} Hz, range {_fmt((st.get('fc') or {}).get('min'), '.4g')} - "
+                                   f"{_fmt((st.get('fc') or {}).get('max'), '.4g')} Hz ({count})")
+
+    def browse_ensemble_calibrations(self) -> None:
+        paths = filedialog.askopenfilenames(parent=self, title="Alternative calibration CSVs",
+                                            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if paths:
+            self.ensemble_calibrations_var.set(PATH_SEPARATOR.join(str(p) for p in paths))
+
     # ---------------------------------------------------------------- save
     def save(self) -> bool:
         """Merge the current channel's record into the selected record's
@@ -1477,6 +1827,9 @@ class PZTSpectrumView(EventView):
         self.record["channel"] = channel
         self.record.setdefault("record", self.record_key)
         self.record["result_set"] = self.result_set
+        if self.ensemble_var.get() and self.record.get("ensemble") is None and not self.compute_ensemble():
+            self.status_var.set(f"nothing saved - {self.status_var.get()}")
+            return False
         self.record["source_inputs"] = self.source_inputs()      # as the entries are now, computed or not
         store = block.get(SPECTRUM_KEY)
         if not isinstance(store, dict):
@@ -1530,6 +1883,7 @@ class PZTSpectrumView(EventView):
         meta = spec.get("meta") if isinstance(spec, dict) else None
         self.show_fit(rec.get("fit"), meta=meta if isinstance(meta, dict) else None,
                       extra_warnings=_warning_texts(rec.get("parameter_warnings")))
+        self.show_ensemble(rec.get("ensemble"))
 
     def show_fit(self, fitd: Optional[dict], meta: Optional[dict] = None, extra_warnings=()) -> None:
         """Fill the 'Spectral fit' rows.  ``meta`` (the spectrum meta) feeds
