@@ -1,6 +1,9 @@
+import h5py
 import numpy as np
 import pytest
 
+from labquake_explorer.data import sources as S
+from labquake_explorer.data.channels import channel_array
 from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data.event_processor import EventProcessor
 from labquake_explorer.preprocessing import Calibration, EddySlip, pressure_transducers, run_from_tpc5, run_from_tpc5_ni
@@ -131,3 +134,62 @@ def test_legacy_strain_layout(tmp_path):
     assert abs(st["original"]["raw"][0, 0]) < 1e-3 and st["original"]["raw"][0, -1] == pytest.approx(0.2, abs=2e-3)
     assert st["time"][0] == pytest.approx(10.9) and st["raw"].shape == (2, st["time"].size)
     assert e["shear_stress"].shape == e["time"].shape
+
+
+def sample_aligned_run(tmp_path, aligned=True):
+    """The layout of a run stored without a time axis or offsets: the NI is the
+    time base (raw_data + sample_rate), the Elsys a continuous 20 kHz tpc5 whose
+    sample 14 000 (0.7 s) is the NI's sample 12 000 (1.2 s)."""
+    tpc5 = tmp_path / "run1.tpc5"
+    write_tpc5(tpc5, {"A1 (0.A1)": pulse(0.7)}, fs_continuous=20_000.0, trigger_times=())
+    ni = tmp_path / "run1.npz"
+    v = write_ni_npz(ni, {"n": lambda t: 1.0 + 0 * t}, fs=10_000.0, duration=3.0)
+    run = {"name": "run1",
+           "normal_stress": v["ai0"] * 2.0,
+           "ni": S.NINpzSource.open(ni, {"ai0": "pressure_1"}).to_reference(tmp_path)
+                 | {"raw_data": channel_array(v["ai0"][None, :], ["pressure_1"], unit="V")},
+           "elsys": S.Tpc5Source.open(tpc5, {"A1": "pzt_1"}).to_reference(tmp_path) | {"sample_rate": 20_000.0}}
+    for key in ("ni", "elsys"):
+        del run[key]["time_offset"]
+    if aligned:
+        run["ni"]["aligned_sample"], run["elsys"]["aligned_sample"] = 12_000, 14_000
+    return run
+
+
+def test_sample_aligned_run_time_and_offsets(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    assert S.time_base(run) == "ni"
+    t = S.run_time(run)
+    assert t.size == 30_000 and t[0] == 0.0 and t[1] == pytest.approx(1e-4)
+    assert S.aligned_offset(run, "ni") == 0.0 and S.aligned_offset(run, "elsys") == pytest.approx(0.5)
+    assert S.open_source(run["elsys"], tmp_path, run).time_offset == pytest.approx(0.5)
+    del run["elsys"]["aligned_sample"]
+    assert S.aligned_offset(run, "elsys") is None
+    with pytest.raises(ValueError, match="not aligned"):
+        S.open_source(run["elsys"], tmp_path, run)
+
+
+def test_sample_aligned_run_load_extract_and_save(tmp_path):
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [sample_aligned_run(tmp_path)]}
+    dm.save_file(tmp_path / "t0001.h5")
+    back = DataManager()
+    back.load_file(tmp_path / "t0001.h5")
+    rrun = back.get_data("runs/[0]")
+    assert rrun["time"].size == 30_000 and rrun["time"][-1] == pytest.approx(2.9999)   # filled in on load
+    e = back.event_processor.extract_events(rrun, [index_at(rrun, 1.2)], window=0.01)[0]
+    st = e["waveform"]["elsys"]
+    assert st["sample_rate"] == 20_000.0 and st["time"][np.argmax(st["data"][0])] == pytest.approx(1.2, abs=1e-4)
+    # the derived time axis is not written back, and stays in memory after the save
+    back.save_file(tmp_path / "again.h5")
+    with h5py.File(tmp_path / "again.h5") as f:
+        assert "time" not in f["runs"]["0"]
+    assert "time" in rrun
+
+
+def test_unaligned_recorder_is_skipped(tmp_path, capsys):
+    run = sample_aligned_run(tmp_path, aligned=False)
+    run["time"] = S.run_time(run)
+    e = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [12_000], window=0.01)[0]
+    assert set(e["waveform"]) == {"ni"}
+    assert "not aligned" in capsys.readouterr().out

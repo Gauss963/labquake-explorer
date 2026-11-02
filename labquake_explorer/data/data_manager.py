@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 import h5py
 from labquake_explorer.data.event_processor import EventProcessor
+from labquake_explorer.data.sources import run_time
 
 # HDF5 group attribute recording whether a group was written from a dict or a
 # list, so digit-keyed dicts and lists round-trip as what they were.  Files
@@ -19,6 +20,8 @@ class DataManager:
         self.data_path: Optional[Path] = None
         self.data: Optional[Dict[str, Any]] = None
         self.event_processor = EventProcessor()
+        self._derived_time: List[Dict[str, Any]] = []   # runs whose 'time' was filled in on load
+
 
     def load_file(self, path: Path) -> None:
         """Load data from a file"""
@@ -31,6 +34,20 @@ class DataManager:
             self._load_hdf5(path)
         else:
             raise ValueError(f"Unsupported file type: {path.suffix}")
+        self._fill_run_times()
+
+    def _fill_run_times(self) -> None:
+        """Give every run stored without ``time`` the axis its time base implies
+        (see :func:`~labquake_explorer.data.sources.run_time`), so the views see
+        seconds; :meth:`save_file` leaves these out again."""
+        self._derived_time = []
+        runs = self.data.get("runs") if isinstance(self.data, dict) else None
+        for run in runs if isinstance(runs, list) else []:
+            if isinstance(run, dict) and "time" not in run:
+                time = run_time(run)
+                if time is not None:
+                    run["time"] = time
+                    self._derived_time.append(run)
 
     def _load_npz(self, path: Path) -> None:
         """Load data from NPZ file"""
@@ -119,6 +136,7 @@ class DataManager:
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=suffix)
         os.close(fd)
         tmp = Path(tmp_name)
+        derived = [(run, run.pop("time")) for run in self._derived_time if "time" in run]
         try:
             if suffix == '.npz':
                 with open(tmp, 'wb') as f:  # a file object keeps numpy from appending '.npz'
@@ -135,6 +153,9 @@ class DataManager:
             except OSError:
                 pass
             raise
+        finally:
+            for run, time in derived:
+                run["time"] = time
 
     @classmethod
     def _save_h5_item(cls, group, key, value) -> None:

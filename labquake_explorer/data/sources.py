@@ -10,7 +10,14 @@ JSON-like dict with a ``format`` key::
 
 ``time_offset`` puts the file's clock on the run's clock
 (``t_run = t_file + time_offset``); ``fields`` names the run field each file
-channel feeds.  :func:`open_source` turns a pointer back into the matching
+channel feeds.
+
+A run may instead be stored without ``time`` and without offsets: the
+recorder carrying ``raw_data`` and a ``sample_rate`` (the *time base*, see
+:func:`time_base`) gives the run's samples, and every other recorder carries
+``aligned_sample``, the sample of the same moment as the time base's own
+``aligned_sample``.  :func:`run_time` and :func:`aligned_offset` turn these
+into seconds when the run is used; nothing derived is written back.  :func:`open_source` turns a pointer back into the matching
 :class:`Source`, which reads windows by run time.  A new recorder is added by
 subclassing :class:`Source` and decorating it with :func:`register_source`.
 
@@ -469,10 +476,69 @@ def run_sources(run: Mapping) -> dict:
 
 
 def open_source(ref: Mapping, base_dir, run: Optional[Mapping] = None) -> Source:
+    """The :class:`Source` a reference points at.  A reference stored without
+    ``time_offset`` in a run with a time base gets its offset from the
+    ``aligned_sample`` pair; one that has none cannot be placed on the run clock
+    and raises ``ValueError``."""
     fmt = reference_format(ref)
     if fmt is None:
         raise ValueError(f"not a raw-data reference: {list(ref)[:8]}")
-    return SOURCE_FORMATS[fmt].from_reference(ref, base_dir, run)
+    source = SOURCE_FORMATS[fmt].from_reference(ref, base_dir, run)
+    if run is not None and "time_offset" not in ref and fmt != LegacyTpc5Source.format and time_base(run) is not None:
+        key = next((k for k, v in run.items() if v is ref), None)
+        offset = aligned_offset(run, key) if key is not None else None
+        if offset is None:
+            raise ValueError(f"'{key}' is not aligned with '{time_base(run)}' (no aligned_sample)")
+        source.time_offset = offset
+    return source
+
+
+def reference_sample_rate(ref: Mapping) -> Optional[float]:
+    """A recorder's own sample rate: ``sample_rate``, or its continuous record's."""
+    if "sample_rate" in ref:
+        return float(ref["sample_rate"])
+    cont = ref.get("continuous")
+    return float(cont["sample_rate"]) if isinstance(cont, Mapping) and "sample_rate" in cont else None
+
+
+def time_base(run: Mapping) -> Optional[str]:
+    """The recorder the run's series are sampled on: the first reference that
+    carries a ``raw_data`` channel array and a ``sample_rate``."""
+    for key, ref in run_sources(run).items():
+        if is_channel_array(ref.get("raw_data")) and "sample_rate" in ref:
+            return key
+    return None
+
+
+def run_time(run: Mapping) -> Optional[np.ndarray]:
+    """The run's time axis (s): ``run['time']`` when stored, otherwise the time
+    base's sample index over its sample rate (0 at its first sample); None when
+    the run has neither."""
+    if "time" in run:
+        return np.asarray(run["time"], dtype=np.float64)
+    key = time_base(run)
+    if key is None:
+        return None
+    ref = run[key]
+    return np.arange(np.asarray(ref["raw_data"]["data"]).shape[1]) / float(ref["sample_rate"])
+
+
+def aligned_offset(run: Mapping, key: str) -> Optional[float]:
+    """``time_offset`` of recorder ``key`` on the clock of :func:`run_time`, from
+    its ``aligned_sample`` and the time base's (0 for the time base itself);
+    None when either is missing."""
+    base = time_base(run)
+    if base is None:
+        return None
+    if key == base:
+        return 0.0
+    ref, base_ref = run[key], run[base]
+    if "aligned_sample" not in ref or "aligned_sample" not in base_ref:
+        return None
+    rate = reference_sample_rate(ref)
+    if rate is None:
+        return None
+    return float(base_ref["aligned_sample"]) / float(base_ref["sample_rate"]) - float(ref["aligned_sample"]) / rate
 
 
 # ---------------------------------------------------------------------------
