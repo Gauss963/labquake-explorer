@@ -193,3 +193,30 @@ def test_unaligned_recorder_is_skipped(tmp_path, capsys):
     e = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [12_000], window=0.01)[0]
     assert set(e["waveform"]) == {"ni"}
     assert "not aligned" in capsys.readouterr().out
+
+
+def test_conversion_reads_elsys_in_output_units(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy", "twice"], "inputs": ["pzt_1"],
+                                  "matrix": np.array([[-3.0], [2.0]]), "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    assert isinstance(src, S.ConvertedSource) and src.fields == ["sigma_xy", "twice"]
+    assert src.time_offset == pytest.approx(0.5) and src.base.time_offset == pytest.approx(0.5)
+    volts = src.base.read_window(1.19, 1.21)
+    win = src.read_window(1.19, 1.21, ["twice"])
+    assert win.unit == "MPa" and win.fields == ["twice"] and win.sample_rate == 20_000.0
+    np.testing.assert_allclose(win.data[0], 2.0 * volts.data[0], rtol=1e-6)
+    # extracted events carry the converted channels and their unit
+    run["time"] = S.run_time(run)
+    e = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [12_000], window=0.01)[0]
+    st = e["waveform"]["elsys"]
+    assert st["unit"] == "MPa" and list(st["channels"]) == ["sigma_xy", "twice"]
+    assert st["time"][np.argmin(st["data"][0])] == pytest.approx(1.2, abs=1e-4)      # -3 x the pulse
+    np.testing.assert_allclose(st["data"][1], -2.0 / 3.0 * st["data"][0], rtol=1e-5)
+
+
+def test_conversion_needs_known_inputs(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["s"], "inputs": ["nope"], "matrix": [[1.0]], "unit": "MPa"}
+    with pytest.raises(KeyError):
+        S.open_source(run["elsys"], tmp_path, run)

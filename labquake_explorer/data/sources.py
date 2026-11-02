@@ -17,7 +17,12 @@ recorder carrying ``raw_data`` and a ``sample_rate`` (the *time base*, see
 :func:`time_base`) gives the run's samples, and every other recorder carries
 ``aligned_sample``, the sample of the same moment as the time base's own
 ``aligned_sample``.  :func:`run_time` and :func:`aligned_offset` turn these
-into seconds when the run is used; nothing derived is written back.  :func:`open_source` turns a pointer back into the matching
+into seconds when the run is used; nothing derived is written back.
+
+A reference may also carry ``conversion``: output ``channels``, the
+``inputs`` (fields of the file) and an (outputs x inputs) ``matrix``, with a
+``unit``; :class:`ConvertedSource` then reads every window in those output
+channels (strain-gauge volts as stress in MPa, say) instead of in volts.  :func:`open_source` turns a pointer back into the matching
 :class:`Source`, which reads windows by run time.  A new recorder is added by
 subclassing :class:`Source` and decorating it with :func:`register_source`.
 
@@ -69,6 +74,7 @@ class Window:
     sample_rate: float
     block: Optional[int] = None  # tpc5 block number, when applicable
     trigger_time: Optional[float] = None  # the record's own trigger on the run clock (recorders with trigger blocks)
+    unit: Optional[str] = None   # set when the samples are not the recorder's volts (see ConvertedSource)
 
     def as_dict(self, dtype=np.float32) -> dict:
         return {"time": np.asarray(self.time, dtype=np.float64), "raw": np.asarray(self.data, dtype=dtype),
@@ -451,6 +457,69 @@ class LegacyTpc5Source(Source):
 
 
 # ---------------------------------------------------------------------------
+# linear conversion of another source's fields, applied when read
+# ---------------------------------------------------------------------------
+class ConvertedSource(Source):
+    """Another source read through a linear map: each output channel is
+    ``matrix @ inputs`` of the base source's samples (e.g. strain-gauge volts to
+    stress in MPa), computed for every window, so nothing converted is stored.
+    Clock, records and everything else come from the base source."""
+
+    def __init__(self, base: Source, conversion: Mapping):
+        self.base = base
+        self.inputs = [str(f) for f in conversion["inputs"]]
+        self.matrix = np.asarray(conversion["matrix"], dtype=np.float64).reshape(-1, len(self.inputs))
+        self.unit = str(conversion.get("unit", ""))
+        channels = [str(c) for c in conversion["channels"]]
+        if len(channels) != self.matrix.shape[0]:
+            raise ValueError("conversion: one matrix row per output channel")
+        base.field_indices(self.inputs)                    # every input must be a field of the file
+        super().__init__(base.path, channels, time_offset=base.time_offset,
+                         event_window_s=base.event_window_s, meta=base.meta)
+        self.format = base.format
+
+    @property
+    def time_offset(self) -> float:
+        return self.base.time_offset
+
+    @time_offset.setter
+    def time_offset(self, value: float) -> None:
+        if hasattr(self, "base"):
+            self.base.time_offset = float(value)
+
+    def __getattr__(self, name):                          # blocks, continuous, start_time, ...
+        if name == "base":
+            raise AttributeError(name)
+        return getattr(self.base, name)
+
+    def _convert(self, win: Optional[Window], fields: Optional[Sequence[str]]) -> Optional[Window]:
+        if win is None:
+            return None
+        rows = self.field_indices(fields)
+        data = self.matrix[rows] @ np.asarray(win.data, dtype=np.float64)
+        return Window(win.time, data.astype(win.data.dtype, copy=False), [self.fields[i] for i in rows],
+                      win.sample_rate, win.block, win.trigger_time, self.unit)
+
+    def time_history(self, decimation: int = 1, dtype=np.float32):
+        t, data = self.base.time_history(decimation, dtype=dtype)
+        data = np.asarray(data, dtype=np.float64)[self.base.field_indices(self.inputs)]
+        return t, (self.matrix @ data).astype(dtype)
+
+    def trigger_times(self) -> list:
+        return self.base.trigger_times()
+
+    def read_window(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
+        return self._convert(self.base.read_window(t_from, t_to, self.inputs, dtype), fields)
+
+    def waveform(self, event_time, pre, post, fields=None, dtype=np.float32) -> Optional[Window]:
+        win = self.base.waveform(event_time, pre, post, self.inputs, dtype)
+        return self._convert(win, self.event_fields if fields is None else fields)
+
+    def to_reference(self, base_dir) -> dict:
+        return self.base.to_reference(base_dir)
+
+
+# ---------------------------------------------------------------------------
 # discovery
 # ---------------------------------------------------------------------------
 def is_legacy_strain(value) -> bool:
@@ -490,6 +559,8 @@ def open_source(ref: Mapping, base_dir, run: Optional[Mapping] = None) -> Source
         if offset is None:
             raise ValueError(f"'{key}' is not aligned with '{time_base(run)}' (no aligned_sample)")
         source.time_offset = offset
+    if isinstance(ref.get("conversion"), Mapping):
+        source = ConvertedSource(source, ref["conversion"])
     return source
 
 

@@ -117,7 +117,7 @@ class EventProcessor:
                 notes.append(f"{key}: no raw record covers {event_time:.4f} s")
                 continue
             raw = refs.get(key, {}).get("raw_data")
-            unit = str(raw.get("unit", "V")) if is_channel_array(raw) else "V"
+            unit = win.unit or (str(raw.get("unit", "V")) if is_channel_array(raw) else "V")
             positions = positions_for(raw, win.fields) if is_channel_array(raw) else None
             high[key] = win.as_channel_array(dtype, unit=unit, positions=positions,
                                              filename=str(run_data[key].get("filename", source.path.name)))
