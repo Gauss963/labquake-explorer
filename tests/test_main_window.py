@@ -39,7 +39,8 @@ def test_right_click_destroys_previous_menu(app, monkeypatch):
     monkeypatch.setattr(tk.Menu, "post", lambda self, x, y: posted.append((x, y)))  # a real post blocks
     item = app.find_item("runs/[0]/events/[1]")
     app.data_tree.selection_set(item)
-    event = SimpleNamespace(x_root=0, y_root=0)
+    monkeypatch.setattr(app.data_tree, "identify_row", lambda y: "")      # no row under the pointer
+    event = SimpleNamespace(x_root=0, y_root=0, y=0)
     before = sum(isinstance(w, tk.Menu) for w in app.root.winfo_children())
     app.on_right_click(event)
     first = app.active_context_menu
@@ -50,6 +51,19 @@ def test_right_click_destroys_previous_menu(app, monkeypatch):
     assert app.active_context_menu is not None and app.active_context_menu is not first
     after = sum(isinstance(w, tk.Menu) for w in app.root.winfo_children())
     assert after == before + 1
+    app.on_left_click(None)
+
+
+def test_right_click_acts_on_the_row_under_the_pointer(app, monkeypatch):
+    """The menu is for the row right-clicked, not the row selected before."""
+    monkeypatch.setattr(tk.Menu, "post", lambda self, x, y: None)
+    run = app.find_item("runs/[0]")
+    app.data_tree.selection_set(app.find_item("runs/[0]/name"))             # a string row selected
+    monkeypatch.setattr(app.data_tree, "identify_row", lambda y: run)
+    app.on_right_click(SimpleNamespace(x_root=0, y_root=0, y=0))
+    menu = app.active_context_menu
+    assert app.data_tree.selection() == (run,)
+    assert "Plot Run Signals" in [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
     app.on_left_click(None)
 
 
