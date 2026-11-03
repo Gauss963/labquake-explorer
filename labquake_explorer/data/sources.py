@@ -492,11 +492,17 @@ class ConvertedSource(Source):
             raise AttributeError(name)
         return getattr(self.base, name)
 
+    def _inputs_for(self, fields: Optional[Sequence[str]]) -> list:
+        """The inputs the requested output channels use (nonzero matrix entries)."""
+        used = np.any(self.matrix[self.field_indices(fields)] != 0, axis=0)
+        return [f for f, u in zip(self.inputs, used) if u] or self.inputs[:1]
+
     def _convert(self, win: Optional[Window], fields: Optional[Sequence[str]]) -> Optional[Window]:
         if win is None:
             return None
         rows = self.field_indices(fields)
-        data = self.matrix[rows] @ np.asarray(win.data, dtype=np.float64)
+        cols = [self.inputs.index(f) for f in win.fields]
+        data = self.matrix[np.ix_(rows, cols)] @ np.asarray(win.data, dtype=np.float64)
         return Window(win.time, data.astype(win.data.dtype, copy=False), [self.fields[i] for i in rows],
                       win.sample_rate, win.block, win.trigger_time, self.unit)
 
@@ -509,14 +515,44 @@ class ConvertedSource(Source):
         return self.base.trigger_times()
 
     def read_window(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
-        return self._convert(self.base.read_window(t_from, t_to, self.inputs, dtype), fields)
+        return self._convert(self.base.read_window(t_from, t_to, self._inputs_for(fields), dtype), fields)
 
     def waveform(self, event_time, pre, post, fields=None, dtype=np.float32) -> Optional[Window]:
-        win = self.base.waveform(event_time, pre, post, self.inputs, dtype)
-        return self._convert(win, self.event_fields if fields is None else fields)
+        fields = self.event_fields if fields is None else fields
+        win = self.base.waveform(event_time, pre, post, self._inputs_for(fields), dtype)
+        return self._convert(win, fields)
 
     def to_reference(self, base_dir) -> dict:
         return self.base.to_reference(base_dir)
+
+
+def mean_on_samples(source: Source, field: str, time: np.ndarray, chunk_s: float = 5.0) -> np.ndarray:
+    """One field of ``source`` averaged onto the run samples ``time`` (run clock):
+    each value is the mean of the source's samples within half a run sample of
+    it, NaN where the source has none.  Read ``chunk_s`` of the run at a time,
+    so a whole 2 MHz record fits in memory as the run's resolution."""
+    time = np.asarray(time, dtype=np.float64).ravel()
+    out = np.full(time.size, np.nan)
+    if time.size < 2:
+        return out
+    half = 0.5 * float(np.median(np.diff(time)))
+    lo, hi = 0, time.size
+    cont = getattr(source, "continuous", None)
+    if cont is not None:                                   # only the stretch the record covers
+        lo = int(np.searchsorted(time, source.to_run_time(cont.start) - half))
+        hi = int(np.searchsorted(time, source.to_run_time(cont.end) + half))
+    step = max(int(round(chunk_s / (2 * half))), 1)
+    for i0 in range(lo, hi, step):
+        i1 = min(i0 + step, hi)
+        win = source.read_window(time[i0] - half, time[i1 - 1] + half, [field], dtype=np.float64)
+        if win is None or win.time.size == 0:
+            continue
+        edges = np.searchsorted(win.time, np.append(time[i0:i1] - half, time[i1 - 1] + half))
+        counts = np.diff(edges)
+        filled = counts > 0
+        sums = np.add.reduceat(np.append(win.data[0], 0.0), edges)[:-1]
+        out[i0:i1][filled] = sums[filled] / counts[filled]
+    return out
 
 
 # ---------------------------------------------------------------------------

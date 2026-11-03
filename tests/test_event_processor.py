@@ -220,3 +220,27 @@ def test_conversion_needs_known_inputs(tmp_path):
     run["elsys"]["conversion"] = {"channels": ["s"], "inputs": ["nope"], "matrix": [[1.0]], "unit": "MPa"}
     with pytest.raises(KeyError):
         S.open_source(run["elsys"], tmp_path, run)
+
+
+def test_conversion_reads_only_the_inputs_a_channel_uses(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["pzt_1"], "matrix": [[2.0]], "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    src.inputs, src.matrix = ["pzt_1", "spare"], np.array([[2.0, 0.0]])   # a second input this row ignores
+    win = src.read_window(1.19, 1.21, ["sigma_xy"])                       # "spare" is not a field: never read
+    assert win.fields == ["sigma_xy"] and win.unit == "MPa"
+
+
+def test_mean_on_samples_puts_a_converted_channel_on_the_run_samples(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["pzt_1"], "matrix": [[-3.0]], "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    t = S.run_time(run)
+    y = S.mean_on_samples(src, "sigma_xy", t, chunk_s=0.3)
+    assert y.shape == t.shape
+    covered = (t >= 0.5 + 0.5e-4) & (t <= 2.5 - 0.5e-4)            # the 2 s Elsys record starts at run 0.5 s
+    assert np.isnan(y[t < 0.5 - 1e-4]).all() and np.isnan(y[t > 2.5 + 1e-4]).all() and np.isfinite(y[covered]).all()
+    i = int(np.nanargmin(y))
+    assert t[i] == pytest.approx(1.2, abs=1e-4)                     # the pulse, at the run's samples
+    win = src.read_window(t[i] - 0.5e-4, t[i] + 0.5e-4, ["sigma_xy"], dtype=np.float64)
+    assert win.data[0].min() <= y[i] <= win.data[0].max() and y[i] < -0.2   # the mean of the Elsys samples there

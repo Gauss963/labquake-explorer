@@ -8,6 +8,9 @@ highlighted.  "Save picks" writes the picks; "Extract Events" writes the
 picks and then the events.  Everything the form needs to reopen as it was is
 kept in ``runs/[r]['event_extraction']``: the picks (``event_indices``), start
 and end, the series shown and how many events the last extraction wrote.
+Y can also be a channel of a converted raw-data source (``elsys/<channel>``,
+e.g. the on-fault stresses read from the 2 MHz Elsys file in MPa), averaged
+onto the run's samples when chosen; nothing of it is stored.
 Older files with the picks at the run's top level are read, and saving moves
 them into the record.
 """
@@ -21,6 +24,7 @@ import numpy as np
 
 from labquake_explorer.data.channels import aligned_fields, get_field
 from labquake_explorer.data.picks import LEGACY_INDICES_KEY, picked_indices
+from labquake_explorer.data.sources import ConvertedSource, mean_on_samples
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT_EXTRACTION, RUN, RUN_ARRAY, TreeContext
 from labquake_explorer.ui.views.base import RunView, event_list
@@ -34,6 +38,7 @@ STEP_S = 0.5                     # one tick of the start/end spinboxes
 HELP_TEXT = ("Left double-click on the curve: add a pick at the nearest sample.   "
              "Right double-click on a pick: remove it.   Drag a pick to move it.   "
              "Save picks stores the picks; Extract Events stores the picks and then the events.")
+_SOURCE_SERIES: dict = {}        # (file, channel, offset, run samples) -> source channel on the run's samples
 
 
 @register_view("Pick Events", kinds=[RUN, RUN_ARRAY, EVENT_EXTRACTION], order=0)
@@ -45,6 +50,7 @@ class EventPickerView(RunView):
     def __init__(self, app, run_idx, y_field: Optional[str] = None):
         self.y_field_hint = y_field
         self.candidates: list[str] = []
+        self.source_series: dict = {}    # 'elsys/<channel>' -> (source, channel)
         self.time: np.ndarray = np.array([])
         self.picker: Optional[PointPicker] = None
         self.spans: list = []
@@ -110,7 +116,7 @@ class EventPickerView(RunView):
         ttk.Label(box, textvariable=self.status_var).grid(row=3, column=0, columnspan=9, padx=4, pady=(0, 3), sticky="w")
 
         self.x_combo.bind("<<ComboboxSelected>>", lambda e: self.plot())
-        self.y_combo.bind("<<ComboboxSelected>>", lambda e: self.plot())
+        self.y_combo.bind("<<ComboboxSelected>>", lambda e: (self.plot(), self.update_status()))
         self.event_combo.bind("<<ComboboxSelected>>", lambda e: self.on_event_selected())
         for entry in (self.start_entry, self.end_entry):
             entry.bind("<Return>", self.on_window_edited)
@@ -126,7 +132,8 @@ class EventPickerView(RunView):
         self.time = np.asarray(self.run.get("time", []), dtype=float).ravel()
         n = self.time.size
         self.candidates = list(aligned_fields(self.run, n, recurse=False)) if n else []
-        y_candidates = [c for c in self.candidates if c != "time"]
+        self.source_series = self.converted_channels() if n else {}
+        y_candidates = [c for c in self.candidates if c != "time"] + list(self.source_series)
         self.x_combo.config(values=[X_INDEX] + self.candidates)
         self.y_combo.config(values=y_candidates)
         saved = self.load_results() or self.legacy_results()
@@ -181,8 +188,37 @@ class EventPickerView(RunView):
                 return np.asarray(arr, dtype=float), choice
         return np.arange(self.time.size, dtype=float), "sample index"
 
+    def converted_channels(self) -> dict:
+        """``{'<recorder>/<channel>': (source, channel)}`` for every raw-data
+        source read through a conversion and placed on the run clock."""
+        sources = self.data_manager.event_processor.open_sources(self.run)
+        return {f"{key}/{ch}": (src, ch) for key, src in sources.items()
+                if isinstance(src, ConvertedSource) for ch in src.fields}
+
+    def y_label(self, y_field: str) -> str:
+        if y_field in self.source_series:
+            unit = self.source_series[y_field][0].unit
+            return f"{y_field} ({unit})" if unit else y_field
+        return y_field
+
+    def source_values(self, y_field: str) -> np.ndarray:
+        """A converted source channel on the run's samples (read once, then cached)."""
+        src, ch = self.source_series[y_field]
+        key = (str(src.path), ch, src.time_offset, self.time.size)
+        if key not in _SOURCE_SERIES:
+            self.status_var.set(f"reading {y_field} from {src.path.name} ...")
+            self.config(cursor="watch")
+            self.update_idletasks()
+            try:
+                _SOURCE_SERIES[key] = mean_on_samples(src, ch, self.time)
+            finally:
+                self.config(cursor="")
+        return _SOURCE_SERIES[key]
+
     def y_values(self) -> Optional[np.ndarray]:
         y_field = self.y_combo.get()
+        if y_field in self.source_series:
+            return self.source_values(y_field)
         y = get_field(self.run, y_field) if y_field else None
         if y is None or np.asarray(y).shape != self.time.shape:
             return None
@@ -281,7 +317,7 @@ class EventPickerView(RunView):
                 self.spans.append(self.ax.axvspan(x[beg], x[stop], color="#33CC66" if is_sel else "0.5",
                                                   alpha=0.35 if is_sel else 0.12, zorder=0))
         self.ax.set_xlabel(x_label)
-        self.ax.set_ylabel(y_field)
+        self.ax.set_ylabel(self.y_label(y_field))
         self.ax.set_title(self.figure_title())
         if keep_x:
             self.ax.set_xlim(xlim)
