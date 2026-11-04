@@ -3,6 +3,7 @@ import pytest
 
 from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data import sources as S
+from labquake_explorer.utils import tpc5
 from tests.synthetic import write_ni_npz, write_tpc5
 
 
@@ -145,11 +146,14 @@ def test_tpc5_waveform_picks_the_block_overlapping_the_window_most(tmp_path):
     assert src.block_for_window(0.504, pre=0.01, post=0.0).block == 2
     assert src.block_for_window(0.504, pre=0.0, post=0.01).block == 3
     assert src.block_for_window(0.504, pre=0.05, post=0.05).block == 2      # equal overlap: the earlier block
-    assert src.block_for_window(0.6, pre=0.1, post=0.1) is None
+    # 0.6 s lies in neither block: the block in the window nearest to it (block 3 ends later), none without overlap
+    assert src.block_for_window(0.6, pre=0.1, post=0.1).block == 3
+    assert src.block_for_window(0.6, pre=0.05, post=0.05) is None
     win = src.waveform(0.504, 0.0, 0.01, fields=["pzt_1"])
     assert win.block == 3 and win.fields == ["pzt_1"] and win.data.shape == (1, win.time.size)
     assert win.time[0] == pytest.approx(0.503, abs=1e-5) and win.time[-1] == pytest.approx(0.513, abs=1e-5)
-    assert src.waveform(0.6, 0.1, 0.1) is None
+    assert src.waveform(0.6, 0.05, 0.05) is None
+    assert src.waveform(0.6, 0.1, 0.1).block == 3
     assert win.trigger_time == pytest.approx(0.505)
     block = win.as_channel_array(unit="V", filename="overlap.tpc5")
     assert block["channels"] == ["pzt_1"] and block["block"] == 3 and block["sample_rate"] == 200_000.0
@@ -164,6 +168,107 @@ def test_tpc5_waveform_picks_the_block_overlapping_the_window_most(tmp_path):
     assert "block" not in S.NINpzSource.__dict__ or True
     win = S.Tpc5Source.open(single, ELSYS_MAP, event_window_s=(0.01, 0.02)).waveform(1.0, 0.1, 0.2)
     assert win.time[0] == pytest.approx(0.99, abs=1e-3) and win.time[-1] == pytest.approx(1.02, abs=1e-3)
+
+
+def span(block, start, end, trigger=None):
+    """A trigger block spanning [start, end] s at 1 kHz with its trigger at ``trigger`` (default: start)."""
+    fs = 1000.0
+    trigger = start if trigger is None else trigger
+    return tpc5.BlockInfo(block, fs, int(round((end - start) * fs)) + 1, int(round((trigger - start) * fs)), trigger)
+
+
+def test_select_trigger_block_rule():
+    b2, b3 = span(2, 1.00, 1.10), span(3, 1.05, 1.15)                   # overlap each other
+    b4, b5 = span(4, 2.00, 2.10), span(5, 2.40, 2.50)
+    b6, b7 = span(6, 3.00, 3.10, 3.05), span(7, 3.30, 3.40, 3.35)
+    blocks = [b2, b3, b4, b5, b6, b7]
+    pick = S.select_trigger_block
+    # (a) blocks containing the event: the one overlapping the window most, the lower number on a tie
+    assert pick(blocks, 1.02, 0.1, 0.1) is b2                                # only b2 contains it
+    assert pick(blocks, 1.07, 0.1, 0.0) is b2                                # window [0.97, 1.07]: b2 overlaps more
+    assert pick(blocks, 1.07, 0.0, 0.1) is b3                                # window [1.07, 1.17]: b3 overlaps more
+    assert pick(blocks, 1.07, 0.5, 0.5) is b2                                # both inside the window: tie
+    assert pick([b3, b2], 1.07, 0.5, 0.5) is b2                              # whatever the order
+    # (a) wins over a nearer-looking block that does not contain the event
+    assert pick(blocks, 1.12, 1.0, 1.0) is b3
+    # (b) outside every block: the block in the window nearest to the event
+    assert pick(blocks, 2.22, 0.3, 0.3) is b4                                # gaps 0.12 (b4) and 0.18 (b5)
+    assert pick(blocks, 2.28, 0.3, 0.3) is b5                                # gaps 0.18 and 0.12
+    assert pick(blocks, 2.25, 0.3, 0.3) is b5                                # equal gaps: b5's trigger is nearer
+    assert pick(blocks, 3.20, 0.3, 0.3) is b6                                # equal gaps and trigger distances
+    assert pick(blocks, 1.30, 0.18, 0.18) is b3                              # b2 ends before the window
+    assert pick(blocks, 2.25, 0.1, 0.1) is None                              # (c) nothing overlaps the window
+    assert pick([], 1.0, 1.0, 1.0) is None
+
+
+def test_only_blocks_overlapping_the_window_are_candidates():
+    b2, b3, b4 = span(2, 1.00, 1.10), span(3, 1.05, 1.15), span(4, 2.00, 2.10)
+    blocks = [b2, b3, b4]
+    assert S.overlapping_trigger_blocks(blocks, 1.07, 0.1, 0.1) == [b2, b3]
+    assert S.overlapping_trigger_blocks([b4, b3, b2], 1.07, 0.1, 0.1) == [b3, b2]     # in their order
+    assert S.overlapping_trigger_blocks(blocks, 1.5, 0.1, 0.1) == []
+    # a block that only touches the window counts (one sample at 2.25 s, window edges exact in binary)
+    edge = tpc5.BlockInfo(8, 1000.0, 1, 0, 2.25)
+    assert S.overlapping_trigger_blocks([edge], 2.5, 0.25, 0.25) == [edge]           # touches the window start
+    assert S.overlapping_trigger_blocks([edge], 2.0, 0.25, 0.25) == [edge]           # touches the window end
+    assert S.overlapping_trigger_blocks([edge], 2.5, 0.25 - 2 ** -20, 0.25) == []
+    # a window that leaves out the event time: a block containing the event but not overlapping the window loses
+    assert S.select_trigger_block(blocks, 1.02, -0.1, 0.2) is b3                     # window [1.12, 1.22]: b2 ends before it
+    assert S.select_trigger_block(blocks, 1.02, -0.5, 0.6) is None                   # window [1.52, 1.62]: no block
+
+
+def test_tpc5_waveform_keeps_the_whole_block(tmp_path):
+    path = tmp_path / "whole.tpc5"
+    write_tpc5(path, ELSYS_SIGNALS, trigger_times=(0.5, 1.4), volt_range=12.0)   # blocks [0.498, 0.508], [1.398, 1.408]
+    src = S.Tpc5Source.open(path, ELSYS_MAP, time_offset=10.0)
+    block = src.trigger_blocks[0]
+    for t, pre, post in ((10.505, 0.001, 0.001),      # in the post-trigger part, a window shorter than the block
+                         (10.52, 0.05, 0.05),         # after the block, which is the one in the window
+                         (10.47, 0.05, 0.05)):        # before it
+        win = src.waveform(t, pre, post)
+        assert win.block == 2 and win.time.size == block.n_samples == 2000
+        assert win.time[0] == pytest.approx(10.498, abs=1e-9)                 # the first pre-trigger sample
+        assert win.time[-1] == pytest.approx(10.498 + 1999 / 200_000, abs=1e-9)
+        assert win.trigger_time == pytest.approx(10.5)
+    assert src.waveform(10.9, 0.05, 0.05) is None
+    # read_record: by number or BlockInfo, event fields by default
+    narrow = S.Tpc5Source.open(path, ELSYS_MAP, event_fields=["pzt_1"])
+    rec = narrow.read_record(3)
+    assert rec.block == 3 and rec.fields == ["pzt_1"] and rec.data.shape == (1, 2000)
+    np.testing.assert_array_equal(rec.data, narrow.read_record(narrow.trigger_blocks[1]).data)
+    with pytest.raises(KeyError):
+        narrow.read_record(9)
+
+
+def test_tpc5_open_refuses_layouts_it_cannot_read(tmp_path):
+    import h5py
+
+    def fresh(name):
+        path = tmp_path / name
+        write_tpc5(path, ELSYS_SIGNALS, trigger_times=(0.5, 1.4), volt_range=12.0)
+        return path
+
+    clean = fresh("clean.tpc5")
+    with h5py.File(clean, "r") as f:
+        assert tpc5.layout_problems(f) == []
+    two_groups = fresh("two_groups.tpc5")
+    with h5py.File(two_groups, "a") as f:
+        f.copy("/measurements/00000001", "/measurements/00000002")
+    with pytest.raises(ValueError, match="2 measurement groups"):
+        S.Tpc5Source.open(two_groups, ELSYS_MAP)
+    uneven = fresh("uneven.tpc5")
+    with h5py.File(uneven, "a") as f:
+        del f["/measurements/00000001/channels/00000002/blocks/00000003"]
+    with pytest.raises(ValueError, match=r"block numbers differ between channels: channel 1, 3: blocks 1-3; channel 2: blocks 1-2"):
+        S.Tpc5Source.open(uneven, ELSYS_MAP)
+    assert S.Tpc5Source.open(uneven, ELSYS_MAP, channels=[1, 3]).fields == ["pzt_1", "lvdt"]   # channel 2 not selected
+    shifted = fresh("shifted.tpc5")
+    with h5py.File(shifted, "a") as f:
+        f["/measurements/00000001/channels/00000003/blocks/00000002"].attrs["triggerTimeSeconds"] = np.float64(0.5001)
+    with pytest.raises(ValueError, match=r"block 2: triggerTimeSeconds differs between channels \(0.5 on 1-2; 0.5001 on 3\)"):
+        S.Tpc5Source.open(shifted, ELSYS_MAP)
+    with h5py.File(shifted, "r") as f:
+        assert tpc5.layout_problems(f, channels=[1, 2]) == []
 
 
 def test_waveform_helpers_cover_both_layouts():

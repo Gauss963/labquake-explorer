@@ -123,7 +123,7 @@ def test_extract_saves_picks_and_uses_the_window(app, view):
     assert e["shear_stress"].shape == e["time"].shape
     saved = app.data_manager.get_data("runs/[0]/event_extraction")
     assert saved == {"version": 1, "event_indices": view.picks, "start_s": -2.0, "end_s": 3.0, "x_field": "time",
-                     "y_field": "shear_stress", "n_events": n}
+                     "y_field": "shear_stress", "n_events": n, "waveform_fields": "reference"}
     assert saved["event_indices"] is not view.picks
     assert f"{n} events extracted" in view.status_var.get()
     v2 = EventPickerView(app, 0)                        # reopening restores the window
@@ -219,7 +219,9 @@ def test_double_click_adds_and_right_double_click_removes(app, view):
         widget.event_generate("<Button-1>", x=x0, y=y0)
         widget.event_generate("<ButtonRelease-1>", x=x0, y=y0)
     widget.update()
-    assert len(view.picks) == n + 1 and abs(view.picks[0] - k) < 5
+    xlim = view.ax.get_xlim()
+    per_px = (xlim[1] - xlim[0]) / float(view.ax.bbox.width) / float(t[1] - t[0])   # samples per screen pixel
+    assert len(view.picks) == n + 1 and abs(view.picks[0] - k) <= max(5.0, per_px)
     view.after(600)                                   # outside the double-click interval
     view.update()
     x0, y0 = tk_xy(view, t[view.picks[0]], y[view.picks[0]])
@@ -272,3 +274,26 @@ def test_form_starts_from_the_extraction_record(app):
     v = EventPickerView(app, 0)
     assert v.start_var.get() == "-5" and v.end_var.get() == "5" and v.picks == []
     v.on_close()
+
+
+def test_waveform_channels_box_reaches_the_extraction_and_is_restored(app, view):
+    from labquake_explorer.ui.views.event_picker_view import FIELDS_ALL, FIELDS_REFERENCE
+    assert view.fields_combo.get() == FIELDS_REFERENCE and view.waveform_fields() is None
+    view.fields_combo.set(FIELDS_ALL)
+    assert view.waveform_fields() == "all"
+    view.fields_combo.set("pzt_1, pzt_2")
+    assert view.waveform_fields() == ["pzt_1", "pzt_2"]
+    n = view.extract(confirm=False)                     # the synthetic run has no raw recorder: no waveform, no error
+    assert n == len(view.picks) and "extracted" in view.status_var.get()
+    saved = app.data_manager.get_data("runs/[0]/event_extraction")
+    assert saved["waveform_fields"] == ["pzt_1", "pzt_2"]
+    view.fields_combo.set(FIELDS_ALL)
+    view.extract(confirm=False)
+    assert app.data_manager.get_data("runs/[0]/event_extraction")["waveform_fields"] == "all"
+    v2 = EventPickerView(app, 0)                        # reopening restores the choice
+    try:
+        assert v2.fields_combo.get() == FIELDS_ALL
+        assert EventPickerView.fields_text(["pzt_1", b"pzt_2"]) == "pzt_1, pzt_2"
+        assert EventPickerView.fields_text("reference") == FIELDS_REFERENCE and EventPickerView.fields_text(None) == FIELDS_REFERENCE
+    finally:
+        v2.on_close()

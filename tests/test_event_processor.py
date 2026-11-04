@@ -131,3 +131,23 @@ def test_legacy_strain_layout(tmp_path):
     assert abs(st["original"]["raw"][0, 0]) < 1e-3 and st["original"]["raw"][0, -1] == pytest.approx(0.2, abs=2e-3)
     assert st["time"][0] == pytest.approx(10.9) and st["raw"].shape == (2, st["time"].size)
     assert e["shear_stress"].shape == e["time"].shape
+
+
+def test_waveform_fields_choice(elsys, tmp_path):
+    run = run_from_tpc5(elsys, ELSYS_MAP, tmp_path, event_fields=["pzt_1"])
+    ep = EventProcessor(tmp_path / "exp.h5")
+    source = ep.open_sources(run)["elsys"]
+    everything = list(source.fields)
+    assert len(everything) > 1
+    idx = [index_at(run, 0.5)]
+    assert list(ep.extract_events(run, idx, window=0.05)[0]["waveform"]["elsys"]["channels"]) == ["pzt_1"]
+    e_all = ep.extract_events(run, idx, window=0.05, fields="all")[0]
+    assert list(e_all["waveform"]["elsys"]["channels"]) == everything
+    assert e_all["waveform"]["elsys"]["data"].shape[0] == len(everything)
+    chosen = ep.extract_events(run, idx, window=0.05, fields=[everything[-1], "nope"])[0]
+    assert list(chosen["waveform"]["elsys"]["channels"]) == [everything[-1]]
+    assert list(ep.extract_events(run, idx, window=0.05, fields=f"{everything[0]}, {everything[-1]}")[0]
+                ["waveform"]["elsys"]["channels"]) == [everything[0], everything[-1]]
+    missing = ep.extract_events(run, idx, window=0.05, fields=["nope"])[0]
+    assert "waveform" not in missing and any("none of the fields" in n for n in missing["notes"])
+    assert EventProcessor.waveform_fields(source, None) is None

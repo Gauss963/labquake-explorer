@@ -113,3 +113,22 @@ def test_table_round_trip_and_read_continuous(fake):
     assert back == rec["trigger_blocks"]
     sub = tpc5.read_continuous(path, channels=[2])
     assert sub["data"].shape == (1, 4000)
+
+
+def test_scan_blocks_every_group_and_channel(fake):
+    path, _, _ = fake
+    with h5py.File(path, "a") as f:
+        f.copy("/measurements/00000001", "/measurements/00000002")
+        del f["/measurements/00000002/channels/00000002/blocks/00000003"]
+    with h5py.File(path, "r") as f:
+        assert tpc5.measurement_names(f) == ["00000001", "00000002"]
+        scan = tpc5.scan_blocks(f)
+        problems = tpc5.layout_problems(f)
+    assert list(scan) == ["00000001", "00000002"] and list(scan["00000001"]) == [1, 2]
+    assert [b.block for b in scan["00000001"][2]] == [1, 2, 3] and [b.block for b in scan["00000002"][2]] == [1, 2]
+    assert scan["00000002"][1][1].trigger_time == 0.5 and scan["00000002"][1][1].n_samples == 2000
+    assert tpc5.channel_block_problems(scan["00000001"]) == []
+    assert tpc5.channel_block_problems(scan["00000002"]) == [
+        "block numbers differ between channels: channel 1: blocks 1-3; channel 2: blocks 1-2"]
+    assert problems == ["2 measurement groups under /measurements (00000001, 00000002); only 00000001 is read"]
+    assert tpc5.number_ranges([5, 1, 2, 3, 9, 10]) == "1-3, 5, 9-10" and tpc5.number_ranges([]) == ""

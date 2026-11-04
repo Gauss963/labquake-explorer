@@ -12,18 +12,24 @@ are high-rate records around each trigger; every block's time axis is
 a time read off the continuous block locates the trigger block that holds the
 high-rate data for it (:func:`find_block`).
 
+The package reads the first measurement group only and describes every
+selected channel with one block table; :func:`layout_problems` lists what in a
+file breaks those assumptions, and :func:`scan_blocks` lists the blocks of
+every measurement group and channel (attributes and shapes only).
+
 The lower-case functions are the Elsys reference helpers kept for
 compatibility; the ones below them are the API used by the package.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 import h5py
 import numpy as np
 
 MEASUREMENT = '/measurements/00000001'
+READER_MEASUREMENT = MEASUREMENT.rsplit('/', 1)[-1]     # '00000001', the measurement group the package reads
 
 
 ''' Get Raw Dataset Block'''
@@ -189,22 +195,127 @@ class BlockInfo:
         return d
 
 
+def _block_info(name: str, bg) -> BlockInfo:
+    """A block group's attributes and sample count (the samples are not read)."""
+    return BlockInfo(
+        block=int(name),
+        sample_rate=float(_attr(bg, 'sampleRateHertz')),
+        n_samples=int(bg['raw'].shape[0]),
+        trigger_sample=int(_attr(bg, 'triggerSample', 0)),
+        trigger_time=float(_attr(bg, 'triggerTimeSeconds', 0.0)),
+        start_time=str(_attr(bg, 'startTime', '')),
+    )
+
+
 def list_blocks(f: h5py.File, channel: Optional[int] = None) -> list[BlockInfo]:
     """All blocks of a channel (default: the first channel), ascending."""
     channel = channel_numbers(f)[0] if channel is None else int(channel)
     group = f[getChannelGroupName(channel)]['blocks']
-    blocks = []
-    for name in sorted(group.keys(), key=int):
-        bg = group[name]
-        blocks.append(BlockInfo(
-            block=int(name),
-            sample_rate=float(_attr(bg, 'sampleRateHertz')),
-            n_samples=int(bg['raw'].shape[0]),
-            trigger_sample=int(_attr(bg, 'triggerSample', 0)),
-            trigger_time=float(_attr(bg, 'triggerTimeSeconds', 0.0)),
-            start_time=str(_attr(bg, 'startTime', '')),
-        ))
-    return blocks
+    return [_block_info(name, group[name]) for name in sorted(group.keys(), key=int)]
+
+
+def _name_order(name: str):
+    return (0, int(name), name) if name.isdigit() else (1, 0, name)
+
+
+def measurement_names(f: h5py.File) -> list[str]:
+    """Names of the measurement groups under ``/measurements`` ('00000001', ...), ascending."""
+    group = f.get('/measurements')
+    if not isinstance(group, h5py.Group):
+        return []
+    return sorted(group.keys(), key=_name_order)
+
+
+def scan_blocks(f: h5py.File) -> dict:
+    """``{measurement: {channel: [BlockInfo, ...]}}`` for every measurement group
+    and every channel of the file, ascending, from attributes and dataset
+    shapes only (no sample is read)."""
+    out = {}
+    for name in measurement_names(f):
+        channels = f[f'/measurements/{name}'].get('channels')
+        per_channel = {}
+        if isinstance(channels, h5py.Group):
+            for cname in sorted(channels.keys(), key=_name_order):
+                blocks = channels[cname].get('blocks')
+                per_channel[int(cname)] = ([_block_info(b, blocks[b]) for b in sorted(blocks.keys(), key=int)]
+                                           if isinstance(blocks, h5py.Group) else [])
+        out[name] = per_channel
+    return out
+
+
+def number_ranges(numbers: Iterable[int]) -> str:
+    """``[1, 2, 3, 5]`` -> ``'1-3, 5'``."""
+    values = sorted({int(n) for n in numbers})
+    parts, i = [], 0
+    while i < len(values):
+        j = i
+        while j + 1 < len(values) and values[j + 1] == values[j] + 1:
+            j += 1
+        parts.append(str(values[i]) if i == j else f'{values[i]}-{values[j]}')
+        i = j + 1
+    return ', '.join(parts)
+
+
+_SHARED_ATTRIBUTES = (('sample rate', 'sample_rate'), ('sample count', 'n_samples'),
+                      ('triggerSample', 'trigger_sample'), ('triggerTimeSeconds', 'trigger_time'))
+
+
+def channel_block_problems(blocks_by_channel: Mapping[int, Sequence[BlockInfo]], limit: int = 10) -> list[str]:
+    """What one block table cannot describe for these channels (one measurement
+    group, ``{channel: blocks}``): channels whose block numbers differ, and
+    blocks whose sample rate, sample count, triggerSample or triggerTimeSeconds
+    differ between the channels (at most ``limit`` such lines, then a count)."""
+    problems = []
+    by_numbers: dict = {}
+    for channel, blocks in blocks_by_channel.items():
+        by_numbers.setdefault(tuple(b.block for b in blocks), []).append(channel)
+    if len(by_numbers) > 1:
+        problems.append('block numbers differ between channels: ' + '; '.join(
+            f'channel {number_ranges(chs)}: blocks {number_ranges(numbers) or "none"}'
+            for numbers, chs in by_numbers.items()))
+    by_block: dict = {}
+    for channel, blocks in blocks_by_channel.items():
+        for b in blocks:
+            by_block.setdefault(b.block, {})[channel] = b
+    lines = []
+    for number in sorted(by_block):
+        infos = by_block[number]
+        for label, attr in _SHARED_ATTRIBUTES:
+            values: dict = {}
+            for channel, b in infos.items():
+                values.setdefault(getattr(b, attr), []).append(channel)
+            if len(values) > 1:
+                lines.append(f'block {number}: {label} differs between channels ('
+                             + '; '.join(f'{v!r} on {number_ranges(chs)}' for v, chs in values.items()) + ')')
+    if len(lines) > limit:
+        lines = lines[:limit] + [f'... and {len(lines) - limit} more block attribute differences']
+    return problems + lines
+
+
+def layout_problems(f: h5py.File, channels: Optional[Sequence[int]] = None) -> list[str]:
+    """Why the package's reader cannot read a file as it is, or ``[]``.
+
+    The reader takes the first measurement group only and reads every
+    selected channel (``channels``, channel numbers; default: all) with one
+    block table, so it reports: more than one measurement group under
+    ``/measurements`` (or none named ``00000001``), selected channels whose
+    block numbers differ, and blocks whose sample rate, sample count,
+    triggerSample or triggerTimeSeconds differ between the selected channels.
+    Only attributes and dataset shapes are read.
+    """
+    names = measurement_names(f)
+    if READER_MEASUREMENT not in names:
+        found = f' (found {", ".join(names)})' if names else ''
+        return [f'no measurement group {READER_MEASUREMENT} under /measurements{found}']
+    problems = []
+    if len(names) > 1:
+        problems.append(f'{len(names)} measurement groups under /measurements ({", ".join(names)}); '
+                        f'only {READER_MEASUREMENT} is read')
+    numbers = channel_numbers(f)
+    if channels is not None:
+        wanted = {int(c) for c in channels}
+        numbers = [c for c in numbers if c in wanted]
+    return problems + channel_block_problems({c: list_blocks(f, c) for c in numbers})
 
 
 def continuous_block(blocks: Sequence[BlockInfo]) -> BlockInfo:
@@ -318,8 +429,9 @@ def read_continuous(path, channels: Optional[Sequence[int]] = None, dtype=np.flo
 
 
 __all__ = [
-    'MEASUREMENT', 'BlockInfo', 'channel_numbers', 'channel_info', 'list_channels',
-    'list_blocks', 'continuous_block', 'trigger_blocks', 'find_block',
+    'MEASUREMENT', 'READER_MEASUREMENT', 'BlockInfo', 'channel_numbers', 'channel_info', 'list_channels',
+    'list_blocks', 'measurement_names', 'scan_blocks', 'number_ranges', 'channel_block_problems',
+    'layout_problems', 'continuous_block', 'trigger_blocks', 'find_block',
     'read_channel', 'read_block', 'read_window', 'block_table', 'blocks_from_table',
     'read_continuous',
     'getDataSetName', 'getChannelGroupName', 'getBlockName', 'getVoltageData',

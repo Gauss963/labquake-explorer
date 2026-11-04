@@ -141,12 +141,15 @@ class Source:
                   fields: Optional[Sequence[str]] = None, dtype=np.float32) -> Optional[Window]:
         """The full-rate record copied into an event (``event['waveform'][key]``).
 
-        A recorder that writes separate records around triggers returns the
-        whole record that contains ``event_time`` and overlaps the most of
-        ``[event_time - pre, event_time + post]`` (see :class:`Tpc5Source`); a
-        continuous recorder returns that window clipped to its record, its own
-        ``event_window_s`` taking precedence.  ``fields`` defaults to the
-        source's ``event_fields``.  None when nothing covers the event time.
+        A recorder that writes separate records around triggers returns one
+        whole record, every sample of it, chosen by :func:`select_trigger_block`
+        with the window ``[event_time - pre, event_time + post]``: the record
+        containing ``event_time`` that overlaps the window most, else the
+        record in the window nearest to ``event_time``; None when no record
+        overlaps the window (see :class:`Tpc5Source`).  A continuous recorder
+        returns the window clipped to its record, its own ``event_window_s``
+        taking precedence, or None when its record does not cover the window's
+        middle.  ``fields`` defaults to the source's ``event_fields``.
         """
         return self.event_window(event_time, pre, post, fields, dtype)
 
@@ -191,10 +194,70 @@ def short_label(name: str) -> str:
     return str(name).split()[0] if str(name).strip() else str(name)
 
 
+def _ns(seconds: float) -> float:
+    """A duration rounded to the nanosecond, so that rounding noise does not break ties."""
+    return round(float(seconds), 9)
+
+
+def _gap(block, t: float) -> float:
+    """Distance from ``t`` to a block's span ``[start, end]`` (0 inside it)."""
+    if t < block.start:
+        return block.start - t
+    if t > block.end:
+        return t - block.end
+    return 0.0
+
+
+def overlapping_trigger_blocks(blocks: Sequence, t: float, pre: float, post: float) -> list:
+    """The blocks overlapping the window ``[t - pre, t + post]`` (a block that
+    only touches it counts), in their order; the candidates of
+    :func:`select_trigger_block`.
+
+    The one overlap test: the reader and
+    :mod:`labquake_explorer.data.check_blocks` both go through it with the
+    same ``t``, ``pre`` and ``post``, so a block touching a window edge is
+    counted the same way by both, to the last bit."""
+    t = float(t)
+    lo, hi = t - float(pre), t + float(post)
+    return [b for b in blocks if b.start <= hi and b.end >= lo]
+
+
+def select_trigger_block(blocks: Sequence, t: float, pre: float, post: float):
+    """The one trigger block an event's record is copied from.
+
+    ``blocks`` are trigger records (anything with ``block``, ``start``,
+    ``end`` and ``trigger_time``, such as :class:`tpc5.BlockInfo`) and ``t``
+    the event time, all on one clock; the window is ``[t - pre, t + post]``
+    and the candidates are the blocks overlapping it
+    (:func:`overlapping_trigger_blocks`).
+
+    1. Candidates containing ``t``: the one overlapping the window most (the
+       lower block number on a tie).
+    2. Otherwise the candidate nearest to ``t``, the distance being the gap
+       between ``t`` and the block's ``[start, end]``; ties go to the smaller
+       ``|trigger_time - t|``, then to the lower block number.
+    3. None when no block overlaps the window.
+
+    Durations are compared to the nanosecond.  Used by :class:`Tpc5Source` to
+    read events and by :mod:`labquake_explorer.data.check_blocks` to check them.
+    """
+    t = float(t)
+    lo, hi = t - float(pre), t + float(post)
+    near = overlapping_trigger_blocks(blocks, t, pre, post)
+    inside = [b for b in near if b.start <= t <= b.end]
+    if inside:
+        return min(inside, key=lambda b: (-_ns(min(b.end, hi) - max(b.start, lo)), b.block))
+    if not near:
+        return None
+    return min(near, key=lambda b: (_ns(_gap(b, t)), _ns(abs(b.trigger_time - t)), b.block))
+
+
 @register_source
 class Tpc5Source(Source):
     """A tpc5 file: block 1 is the whole-run (lowest-rate) record, any further
-    blocks are high-rate records around triggers, all on one clock."""
+    blocks are high-rate records around triggers, all on one clock.  Only the
+    first measurement group is read, with one block table for every channel
+    (:meth:`open` refuses files where that does not hold)."""
 
     format = "tpc5"
 
@@ -212,8 +275,16 @@ class Tpc5Source(Source):
     @classmethod
     def open(cls, path, channel_map: Optional[Mapping[str, str] | Callable[[str], str]] = None,
              channels: Optional[Sequence[int]] = None, **kwargs) -> "Tpc5Source":
-        """Open a tpc5 file; ``channel_map`` turns a channel label ('A1') into a field name."""
+        """Open a tpc5 file; ``channel_map`` turns a channel label ('A1') into a field name.
+
+        Raises ValueError listing :func:`tpc5.layout_problems` when the file
+        has more than one measurement group or the selected channels
+        (``channels``, channel numbers; default: all) do not share one block
+        table, since such a file would be read wrongly."""
         with h5py.File(path, "r") as f:
+            problems = tpc5.layout_problems(f, channels)
+            if problems:
+                raise ValueError(f"{Path(path).name}: this tpc5 layout cannot be read:\n  - " + "\n  - ".join(problems))
             infos = tpc5.list_channels(f)
             if channels is not None:
                 wanted = {int(c) for c in channels}
@@ -247,29 +318,39 @@ class Tpc5Source(Source):
         return self.continuous if self.continuous.contains(t) else None
 
     def block_for_window(self, t_run: float, pre: float, post: float) -> Optional[tpc5.BlockInfo]:
-        """Among the trigger blocks containing ``t_run``, the one overlapping the
-        most of ``[t_run - pre, t_run + post]`` (the earlier one on a tie)."""
-        t = self.to_file_time(t_run)
-        best, best_overlap = None, -1.0
-        for b in self.trigger_blocks:
-            if not b.contains(t):
-                continue
-            overlap = min(b.end, t + float(post)) - max(b.start, t - float(pre))
-            if overlap > best_overlap:
-                best, best_overlap = b, overlap
-        return best
+        """The trigger block an event at ``t_run`` gets with the window
+        ``[t_run - pre, t_run + post]`` (:func:`select_trigger_block`): the
+        block containing ``t_run`` that overlaps the window most, else the
+        block in the window nearest to ``t_run``; None when no trigger block
+        overlaps the window."""
+        return select_trigger_block(self.trigger_blocks, self.to_file_time(t_run), pre, post)
 
     def waveform(self, event_time, pre, post, fields=None, dtype=np.float32) -> Optional[Window]:
+        """With trigger blocks: the whole block :meth:`block_for_window` picks
+        (every sample, pre-trigger part included, never trimmed to the window),
+        or None; without: the window of the continuous record (:meth:`Source.waveform`)."""
         if not self.trigger_blocks:
             return super().waveform(event_time, pre, post, fields, dtype)
         block = self.block_for_window(event_time, pre, post)
         if block is None:
             return None
+        return self.read_record(block, fields, dtype)
+
+    def read_record(self, block, fields: Optional[Sequence[str]] = None, dtype=np.float32) -> Window:
+        """Every sample of one block (a :class:`tpc5.BlockInfo` or a block
+        number), from its first pre-trigger sample to its last, on the run
+        clock; ``fields`` defaults to the source's ``event_fields``."""
         idx = self.field_indices(self.event_fields if fields is None else fields)
+        channels = [self.channel_numbers[i] for i in idx]
+        info = block if isinstance(block, tpc5.BlockInfo) else next((b for b in self.blocks if b.block == int(block)), None)
         with h5py.File(self.path, "r") as f:
-            t, data = tpc5.read_block(f, block.block, [self.channel_numbers[i] for i in idx], dtype=np.float64)
+            if info is None:
+                info = next((b for b in tpc5.list_blocks(f, channels[0]) if b.block == int(block)), None)
+                if info is None:
+                    raise KeyError(f"{self.path.name}: no block {int(block)}")
+            t, data = tpc5.read_block(f, info.block, channels, dtype=np.float64)
         return Window(self.to_run_time(t), np.asarray(data, dtype=dtype), [self.fields[i] for i in idx],
-                      block.sample_rate, block.block, trigger_time=block.trigger_time + self.time_offset)
+                      info.sample_rate, info.block, trigger_time=info.trigger_time + self.time_offset)
 
     def read_window(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
         block = self.record_for(0.5 * (float(t_from) + float(t_to)))
@@ -669,8 +750,8 @@ def block_channel_labels(block: Mapping) -> list:
     return waveform_channels(block)
 
 
-__all__ = ["SOURCE_FORMATS", "WAVEFORM", "register_source", "Source", "Window", "Tpc5Source",
-           "NINpzSource", "LegacyTpc5Source", "short_label", "block_mean", "is_legacy_strain", "reference_format",
+__all__ = ["SOURCE_FORMATS", "WAVEFORM", "register_source", "Source", "Window", "Tpc5Source", "select_trigger_block",
+           "overlapping_trigger_blocks", "NINpzSource", "LegacyTpc5Source", "short_label", "block_mean", "is_legacy_strain", "reference_format",
            "run_sources", "open_source", "is_waveform_block", "waveform_blocks", "waveform_block", "waveform_time",
            "waveform_data", "waveform_channels", "waveform_store", "waveform_trigger_time", "pick_waveform_block",
            "block_channel_labels", "ARRIVALS_KEY", "read_arrivals", "write_arrivals"]

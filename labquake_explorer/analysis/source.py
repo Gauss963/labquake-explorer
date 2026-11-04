@@ -359,8 +359,16 @@ def _invalid(phase: str, omega0: float, fc: float, constants: dict, warnings: li
 def source_parameters(omega0_ms: float, fc_hz: float, phase: str, rho: float, vp: float,
                       vs: float, distance_m: float, radiation_coefficient: Optional[float] = None,
                       free_surface_factor: float = 1.0, k: Optional[float] = None,
-                      f_plateau_hz: Optional[float] = None) -> SourceParameters:
+                      f_plateau_hz: Optional[float] = None, moment_spectrum: bool = False) -> SourceParameters:
     """Seismic moment, magnitude, radius, area and stress drop from one spectral fit.
+
+    ``moment_spectrum``: the plateau is already a seismic moment (a spectrum
+    in N*m*s from an in-situ response in V/(N m), the empirical Green's
+    function route): ``M0 = Omega0``; ``vs`` and the phase's ``k`` give the
+    radius, the stress drop follows as usual.  ``rho``, ``vp``, ``distance_m``,
+    the radiation coefficient and the free-surface factor are not used (they
+    may be None, and are None in ``constants``), ``kR`` is NaN with
+    ``far_field_ok`` None, and ``constants['moment_spectrum']`` is True.
 
     Material constants and geometry (``rho``, ``vp``, ``vs``, ``distance_m``,
     ``k``) are required and validated (``ValueError`` on non-positive values
@@ -397,39 +405,46 @@ def source_parameters(omega0_ms: float, fc_hz: float, phase: str, rho: float, vp
     the value actually received (NaN when it was not a number).
     """
     phase = _phase(phase)
-    rho = _positive("rho", rho)
-    vp = _positive("vp", vp)
-    vs = _positive("vs", vs)
-    distance = _positive("distance_m", distance_m)
     consts = PHASE_CONSTANTS[phase]
-    k_used = consts["k"] if k is None else _positive("k", k)
-    if radiation_coefficient is None:
-        rad = float(consts["radiation_rms"])
+    moment_spectrum = bool(moment_spectrum)
+    if moment_spectrum:                     # the plateau is the moment: only the radius needs the medium
+        vs = _positive("vs", vs)
+        rho = vp = distance = c = rad = None
     else:
-        rad = _finite("radiation_coefficient", radiation_coefficient)
-    c = vp if phase == "P" else vs
+        rho = _positive("rho", rho)
+        vp = _positive("vp", vp)
+        vs = _positive("vs", vs)
+        distance = _positive("distance_m", distance_m)
+        if radiation_coefficient is None:
+            rad = float(consts["radiation_rms"])
+        else:
+            rad = _finite("radiation_coefficient", radiation_coefficient)
+        c = vp if phase == "P" else vs
+    k_used = consts["k"] if k is None else _positive("k", k)
 
     # derived (never-raise) inputs
-    fsf = _as_float(free_surface_factor)
-    f_pl = None if f_plateau_hz is None else _as_float(f_plateau_hz)
+    fsf = float("nan") if moment_spectrum else _as_float(free_surface_factor)
+    f_pl = None if (f_plateau_hz is None or moment_spectrum) else _as_float(f_plateau_hz)
     plateau_usable = f_pl is not None and math.isfinite(f_pl) and f_pl > 0.0
 
     constants = {
         "phase": phase, "rho_kg_m3": rho, "vp_m_s": vp, "vs_m_s": vs,
         "wave_speed_m_s": c, "distance_m": distance, "k": k_used,
         "radiation_coefficient": rad, "radiation_rms": float(consts["radiation_rms"]),
-        "free_surface_factor": fsf,
+        "free_surface_factor": None if moment_spectrum else fsf,
         "f_plateau_hz": f_pl if plateau_usable else None,
+        "moment_spectrum": moment_spectrum,
     }
 
     # warnings that depend on the inputs only (reported for invalid results too)
     warnings: list[str] = []
-    if vp / vs < math.sqrt(2.0):
-        warnings.append(f"vp/vs = {vp / vs:.3f} < sqrt(2): unphysical for an isotropic solid")
-    if abs(rad) < NODE_THRESHOLD:
-        warnings.append(f"|radiation coefficient| = {abs(rad):.3f} < {NODE_THRESHOLD}: sensor near a node")
-    if f_plateau_hz is not None and not plateau_usable:
-        warnings.append(PLATEAU_UNAVAILABLE_WARNING)
+    if not moment_spectrum:
+        if vp / vs < math.sqrt(2.0):
+            warnings.append(f"vp/vs = {vp / vs:.3f} < sqrt(2): unphysical for an isotropic solid")
+        if abs(rad) < NODE_THRESHOLD:
+            warnings.append(f"|radiation coefficient| = {abs(rad):.3f} < {NODE_THRESHOLD}: sensor near a node")
+        if f_plateau_hz is not None and not plateau_usable:
+            warnings.append(PLATEAU_UNAVAILABLE_WARNING)
 
     try:
         omega0 = float(omega0_ms)
@@ -443,18 +458,20 @@ def source_parameters(omega0_ms: float, fc_hz: float, phase: str, rho: float, vp
         return _invalid(phase, omega0, fc, constants, warnings, "omega0 must be positive (signed fit?)")
     if fc <= 0.0:
         return _invalid(phase, omega0, fc, constants, warnings, "fc must be positive")
-    if rad == 0.0:
-        return _invalid(phase, omega0, fc, constants, warnings,
-                        "radiation coefficient is zero (sensor at a node)")
-    if not math.isfinite(fsf):
-        return _invalid(phase, omega0, fc, constants, warnings,
-                        "free-surface factor is not a finite number "
-                        "(unknown incidence? use 1.0 when the sensor is not on a free surface)")
-    if fsf <= 0.0:
-        return _invalid(phase, omega0, fc, constants, warnings,
-                        "free-surface factor <= 0 (grazing incidence or vp/vs < sqrt(2))")
-
-    m0 = seismic_moment(omega0, rho, c, distance, rad, fsf)
+    if moment_spectrum:
+        m0 = omega0
+    else:
+        if rad == 0.0:
+            return _invalid(phase, omega0, fc, constants, warnings,
+                            "radiation coefficient is zero (sensor at a node)")
+        if not math.isfinite(fsf):
+            return _invalid(phase, omega0, fc, constants, warnings,
+                            "free-surface factor is not a finite number "
+                            "(unknown incidence? use 1.0 when the sensor is not on a free surface)")
+        if fsf <= 0.0:
+            return _invalid(phase, omega0, fc, constants, warnings,
+                            "free-surface factor <= 0 (grazing incidence or vp/vs < sqrt(2))")
+        m0 = seismic_moment(omega0, rho, c, distance, rad, fsf)
     mw = moment_magnitude(m0)
     r = source_radius(fc, vs, k_used)
     area = math.pi * r ** 2

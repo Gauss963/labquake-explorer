@@ -19,6 +19,7 @@ import numpy as np
 
 from labquake_explorer.data.channels import channel_array, positions_table
 from labquake_explorer.data.sources import NINpzSource, Source, Tpc5Source
+from labquake_explorer.data.stamp import stamp
 from labquake_explorer.preprocessing.alignment import offset_from_trigger
 from labquake_explorer.preprocessing.calibration import Calibration
 
@@ -135,9 +136,11 @@ def run_from_tpc5_ni(tpc5_path, ni_path, elsys_channel_map, ni_channel_map, base
 
 
 def experiment(name: str, runs: Sequence[dict], **metadata) -> dict:
-    """The top-level experiment dict (``name``, metadata, ``runs``)."""
+    """The top-level experiment dict (``name``, metadata, ``runs``), stamped
+    with the package version that built it (``labquake_explorer``)."""
     exp = {"name": str(name)}
     exp.update(metadata)
+    stamp(exp, created=True)
     exp["runs"] = list(runs)
     return exp
 

@@ -8,16 +8,20 @@ result is one dict per event::
     event_time, time, <every run field aligned with time>,
     <channel array>: {'data': (n_channels, n_window), 'channels', 'unit', ...},   # e.g. 'slip'
     waveform: {<recorder>: {'data', 'channels', 'unit', 'positions',              # the full-rate record:
-                            'time', 'sample_rate', 'filename', 'block'}}          # whole trigger block or window
+                            'time', 'sample_rate', 'filename', 'block'}}          # one whole trigger block or window
     notes: [...]                                                                   # recorders with no record
 
 The recorders' blocks (file reference and ``raw_data`` volts) are not copied:
 an event carries the processed channels only, plus ``waveform``.  ``waveform`` comes
-from ``Source.waveform`` so the rule (the whole record that contains the
-event time and overlaps the chosen window most, or the window for a
-continuous recorder) does not depend on the file format.  The PSU-era
-``strain`` layout keeps its historical output (``time``/``raw`` downsampled
-copies plus ``original``), so older experiment files behave as before.
+from ``Source.waveform`` so the rule does not depend on the file format: a
+recorder with trigger blocks gives one whole block per event, every sample of
+it (the block containing the event time that overlaps the chosen window
+most, else the block in the window nearest to the event time; see
+``sources.select_trigger_block``), a continuous recorder gives the window.
+:meth:`EventProcessor.waveform_record` builds the stored record from what the
+source read.  The PSU-era ``strain`` layout keeps its historical output
+(``time``/``raw`` downsampled copies plus ``original``), so older experiment
+files behave as before.
 """
 from __future__ import annotations
 
@@ -27,7 +31,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from labquake_explorer.data.channels import is_channel_array, positions_for, slice_channel_array
-from labquake_explorer.data.sources import WAVEFORM, LegacyTpc5Source, Source, open_source, run_sources
+
+WAVEFORM_ALL_FIELDS = "all"            # extract_events(fields=...): every channel of each recorder
+from labquake_explorer.data.sources import WAVEFORM, LegacyTpc5Source, Source, Window, open_source, run_sources
 
 
 class EventProcessor:
@@ -63,11 +69,16 @@ class EventProcessor:
     # ------------------------------------------------------------- events
     def extract_events(self, run_data: Dict[str, Any], event_indices: List[int], window: float,
                        pre: Optional[float] = None, post: Optional[float] = None,
-                       dtype=np.float32) -> List[Dict]:
+                       dtype=np.float32, fields=None) -> List[Dict]:
         """Slice the run around each picked index.
 
         ``window`` is the half-width in seconds; ``pre``/``post`` override it on
         each side.  Sources with their own ``event_window_s`` use that instead.
+        ``fields`` chooses the channels copied into each recorder's
+        ``waveform`` record: None for the reference's ``event_fields`` (the
+        PZTs, say), ``'all'`` for every channel of the recorder (the eddy
+        probes at the full rate too), or a list of field names (channels a
+        recorder does not have are left out).
         """
         pre = float(window) if pre is None else float(pre)
         post = float(window) if post is None else float(post)
@@ -77,14 +88,14 @@ class EventProcessor:
         for i, idx in enumerate(event_indices):
             event_time = float(time[int(idx)])
             try:
-                events.append(self.extract_event(run_data, event_time, pre, post, sources, dtype))
+                events.append(self.extract_event(run_data, event_time, pre, post, sources, dtype, fields))
             except Exception as exc:
                 print(f"Warning: event {i} at {event_time:.4f} s: {exc}")
                 events.append({"event_time": event_time, "time": np.array([event_time]), "notes": [str(exc)]})
         return events
 
     def extract_event(self, run_data: Dict[str, Any], event_time: float, pre: float, post: float,
-                      sources: Optional[Dict[str, Source]] = None, dtype=np.float32) -> Dict:
+                      sources: Optional[Dict[str, Source]] = None, dtype=np.float32, fields=None) -> Dict:
         time = np.asarray(run_data["time"], dtype=np.float64)
         n = time.size
         beg = int(np.argmin(np.abs(event_time - pre - time)))
@@ -101,7 +112,6 @@ class EventProcessor:
             elif isinstance(value, np.ndarray) and value.ndim == 1 and value.shape[0] == n:
                 event[key] = value[beg:end]
         notes = []
-        refs = run_sources(run_data)
         # waveform: the full-rate record of each recorder around the event
         high: Dict[str, Any] = {}
         for key, source in sources.items():
@@ -112,20 +122,46 @@ class EventProcessor:
                 else:
                     event[key] = block
                 continue
-            win = source.waveform(event_time, pre, post, dtype=dtype)
+            win = source.waveform(event_time, pre, post, fields=self.waveform_fields(source, fields), dtype=dtype)
             if win is None:
                 notes.append(f"{key}: no raw record covers {event_time:.4f} s")
                 continue
-            raw = refs.get(key, {}).get("raw_data")
-            unit = str(raw.get("unit", "V")) if is_channel_array(raw) else "V"
-            positions = positions_for(raw, win.fields) if is_channel_array(raw) else None
-            high[key] = win.as_channel_array(dtype, unit=unit, positions=positions,
-                                             filename=str(run_data[key].get("filename", source.path.name)))
+            high[key] = self.waveform_record(run_data, key, source, win, dtype)
         if high:
             event[WAVEFORM] = high
         if notes:
             event["notes"] = notes
         return event
+
+    @staticmethod
+    def waveform_fields(source: Source, fields):
+        """The channels to copy from ``source``: None (its ``event_fields``),
+        ``'all'`` (every channel) or those of a list it has; ValueError when a
+        list names none of them."""
+        if fields is None:
+            return None
+        available = [str(f) for f in getattr(source, "fields", [])]
+        if isinstance(fields, str):
+            if fields.strip().lower() == WAVEFORM_ALL_FIELDS:
+                return available or None
+            fields = [f for f in fields.replace(";", ",").split(",")]
+        wanted = [str(f).strip() for f in fields if str(f).strip()]
+        chosen = [f for f in wanted if f in available]
+        if wanted and not chosen:
+            raise ValueError(f"none of the fields {wanted} is recorded by this source ({available})")
+        return chosen or None
+
+    @staticmethod
+    def waveform_record(run_data: Dict[str, Any], key: str, source: Source, win: Window, dtype=np.float32) -> Dict:
+        """``event['waveform'][key]``: the samples ``source`` read as a channel
+        array, with the unit and sensor positions of the run's ``raw_data``
+        for that recorder and the reference's ``filename``."""
+        ref = run_sources(run_data).get(key, {})
+        raw = ref.get("raw_data")
+        unit = str(raw.get("unit", "V")) if is_channel_array(raw) else "V"
+        positions = positions_for(raw, win.fields) if is_channel_array(raw) else None
+        return win.as_channel_array(dtype, unit=unit, positions=positions,
+                                    filename=str(ref.get("filename", source.path.name)))
 
     # ------------------------------------------------------------- legacy
     @staticmethod

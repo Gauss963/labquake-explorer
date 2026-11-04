@@ -309,3 +309,46 @@ def write_ni_npz(path, signals, fs: float = 10_000.0, duration: float = 2.0,
         meta.pop("trigger_sample_index")
     (np.savez_compressed if compressed else np.savez)(path, **arrays, **meta)
     return {"t": t, **arrays}
+
+
+# ----------------------------------------------------------------------------
+# slip sensor array along the fault (for the coseismic slip analysis)
+# ----------------------------------------------------------------------------
+SLIP_X_MM = (31.0, 93.0, 155.0, 217.0, 279.0, 341.0, 403.0, 465.0)
+
+
+def add_slip_array(event: dict, x_mm=SLIP_X_MM, x0_mm: float = 279.0, t0_s: float = 0.02,
+                   front_speed_m_s: float = 50.0, slips_um=None, rise_s: float = 0.002,
+                   creep_um_s: float = 3.0, noise_um=0.05, seed: int = 0) -> dict:
+    """Give an event a ``slip`` channel array of sensors along the fault.
+
+    The rupture starts at ``x0_mm`` at ``event_time + t0_s`` and reaches each
+    sensor at ``t_i = event_time + t0_s + |x - x0| / front_speed``; there the
+    slip steps up by ``slips_um[i]`` along a tanh of rise time ``rise_s`` on top
+    of a steady creep ``creep_um_s`` (the same rate before and after, so two
+    lines extrapolated to ``t_i`` differ by exactly the step).  Gaussian noise
+    of ``noise_um`` (one value, or one per sensor) is added.  Returns the
+    truth: ``t_i`` (absolute), ``slips_um``, ``noise_um``, ``x_mm``.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.asarray(event["time"], dtype=float)
+    te = float(event["event_time"])
+    x = np.asarray(x_mm, dtype=float)
+    if slips_um is None:
+        slips_um = np.maximum(0.0, 100.0 * (1.0 - ((x - x0_mm) / 300.0) ** 2))
+    slips = np.asarray(slips_um, dtype=float)
+    noise = np.broadcast_to(np.asarray(noise_um, dtype=float), x.shape)
+    t_i = te + t0_s + np.abs(x - x0_mm) * 1e-3 / front_speed_m_s
+    data = np.empty((x.size, t.size))
+    for i in range(x.size):
+        step = 0.5 * slips[i] * (1.0 + np.tanh((t - t_i[i]) / rise_s))
+        data[i] = creep_um_s * (t - t[0]) + step + rng.normal(0.0, noise[i], t.size)
+    names = [f"slip_{i + 1}" for i in range(x.size)]
+    event["slip"] = {
+        "data": data.astype(np.float64),
+        "channels": names,
+        "unit": "um",
+        "positions": {"x": x.tolist(), "y": [0.0] * x.size, "z": [50.0] * x.size, "unit": "mm", "frame": "test"},
+        "source": [f"eddy_{i + 1}" for i in range(x.size)],
+    }
+    return {"t_i": t_i, "slips_um": slips, "noise_um": noise.copy(), "x_mm": x}

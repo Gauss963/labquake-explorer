@@ -93,7 +93,8 @@ def test_upgrade_brings_runs_and_events_up_to_date():
     assert "picked_idx" not in e0["waveform"]["elsys"] and e0["waveform"]["elsys"]["arrivals"]["version"] == 1
     assert "pzt_spectrum" not in e0
     moved = e0["waveform"]["elsys"]["spectrum"]
-    assert moved["version"] == 1 and moved["channels"]["ch0"]["record"] == "waveform/elsys"
+    assert moved["version"] == 2 and "channels" not in moved
+    assert moved["sets"]["default"]["channels"]["ch0"]["record"] == "waveform/elsys"
     assert e1["waveform"]["ni"]["data"].shape == (1, 50) and "trigger_time" not in e1["waveform"]["ni"]
     # a second pass changes nothing
     assert M.upgrade_experiment(data) == []
@@ -170,3 +171,71 @@ def test_recalibrate_lp_displacement_from_volts(tmp_path):
     assert copy.read_bytes() == b"first original"                            # never overwritten
     again = DataManager(); again.load_file(path)
     assert again.get_data("runs/[0]/units")["LP_displacement"] == "um"
+
+
+def test_fault_geometry_moves_into_analysis():
+    data, _ = make_experiment()
+    data["patch_x_mm"] = [187.5, 312.5]
+    data["fault"] = {"ends_x_mm": np.array([0.0, 500.0]), "patch_x_mm": [1.0, 2.0]}   # the top-level copy wins
+    notes = M.upgrade_experiment(data)
+    assert data["analysis"]["fault"] == {"patch_x_mm": [187.5, 312.5], "ends_x_mm": [0.0, 500.0]}
+    assert "patch_x_mm" not in data and "fault" not in data
+    assert any("patch_x_mm -> analysis/fault/patch_x_mm" in n for n in notes)
+    data, _ = make_experiment()
+    data["fault"] = "one-dimensional PMMA fault, 500 mm long"            # a description stays
+    data["fault_ends_x_mm"] = [0.0, 500.0]
+    M.upgrade_experiment(data)
+    assert data["fault"] == "one-dimensional PMMA fault, 500 mm long"
+    assert data["analysis"]["fault"] == {"ends_x_mm": [0.0, 500.0]}
+    assert M.upgrade_experiment(data) == []                               # nothing left to do
+
+
+@pytest.mark.parametrize("suffix", [".h5", ".npz"])
+def test_write_fault_geometry_in_place(tmp_path, suffix):
+    data, _ = make_experiment()
+    data["fault"] = "one-dimensional PMMA fault, 500 mm long"
+    data["patch_x_mm"] = [187.5, 312.5]
+    dm = DataManager()
+    dm.data = data
+    path = tmp_path / f"exp{suffix}"
+    dm.save_file(path)
+    before = {"runs": len(data["runs"]), "events": len(data["runs"][0]["events"])}
+    notes = M.write_fault_geometry(path, ends_x_mm=(0, 500))
+    assert any("patch_x_mm -> analysis/fault/patch_x_mm" in n for n in notes)
+    assert any("ends_x_mm = [0.0, 500.0]" in n for n in notes)
+    dm2 = DataManager()
+    dm2.load_file(path)
+    assert np.asarray(dm2.data["analysis"]["fault"]["patch_x_mm"]).tolist() == [187.5, 312.5]
+    assert np.asarray(dm2.data["analysis"]["fault"]["ends_x_mm"]).tolist() == [0.0, 500.0]
+    assert "patch_x_mm" not in dm2.data and dm2.data["fault"] == "one-dimensional PMMA fault, 500 mm long"
+    assert len(dm2.data["runs"]) == before["runs"] and len(dm2.data["runs"][0]["events"]) == before["events"]
+    assert M.write_fault_geometry(path, patch_x_mm=[187.5, 312.5], ends_x_mm=[0, 500]) == []   # already so
+    notes = M.write_fault_geometry(path, patch_x_mm=[50, 450])
+    assert notes == ["analysis/fault/patch_x_mm = [50.0, 450.0]"]
+    dm3 = DataManager()
+    dm3.load_file(path)
+    assert np.asarray(dm3.data["analysis"]["fault"]["patch_x_mm"]).tolist() == [50.0, 450.0]
+    assert M.main([str(path), "--ends-x-mm=0,400"]) == 0
+    dm4 = DataManager()
+    dm4.load_file(path)
+    assert np.asarray(dm4.data["analysis"]["fault"]["ends_x_mm"]).tolist() == [0.0, 400.0]
+    with pytest.raises(ValueError, match="two numbers"):
+        M.write_fault_geometry(path, patch_x_mm=[1.0])
+
+
+def test_flat_pzt_settings_and_version_1_stores_upgrade_to_result_sets():
+    data = {"name": "x", "runs": [], "analysis": {"pzt_spectrum": {
+        "settings": {"pre_ms": 1.0}, "sensors": {"pzt_1": {"t_star_s": 1e-6}, "pzt_2": {"t_star_s": 2e-6}},
+        "sets": {"default": {"sensors": {"pzt_1": {"t_star_s": 3e-6}}}}}}}
+    notes = M.upgrade_experiment(data)
+    assert len(notes) == 2
+    pz = data["analysis"]["pzt_spectrum"]
+    assert "settings" not in pz and "sensors" not in pz
+    assert pz["sets"]["default"]["settings"] == {"pre_ms": 1.0}
+    assert pz["sets"]["default"]["sensors"] == {"pzt_1": {"t_star_s": 3e-6}, "pzt_2": {"t_star_s": 2e-6}}   # the set's own wins
+    assert M.upgrade_experiment(data) == []
+    event = {"waveform": {"elsys": {"spectrum": {"version": 1, "channels": {"ch0": {"channel": 0}}}}}}
+    notes = M.upgrade_event(event, {}, "e")
+    assert any("version 2" in n for n in notes)
+    assert event["waveform"]["elsys"]["spectrum"] == {"version": 2, "sets": {"default": {"channels": {"ch0": {"channel": 0}}}}}
+    assert M.upgrade_event(event, {}, "e") == []
