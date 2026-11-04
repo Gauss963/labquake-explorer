@@ -534,7 +534,13 @@ needed, so a large file is checked in seconds.
 - `calibration.Calibration(*steps)` applies ordered steps and records them:
   `Linear` (`field = factor * source + offset`), `EddySlip` (eddy-current volts
   to `slip_k` in um, zeroed at the run start, plus `displacement`), `Friction`.
-  `pressure_transducers(section)` gives the lab's stress conversions. A new
+  `pressure_transducers(section)` gives the lab's stress conversions
+  (`PRESSURE_PRESETS`: Tseng 2026, Table B.1, with the 1D shear factors
+  tripled since 2026-11-02 because a 1D run presses one shear jack, not the
+  three the table assumed; `shear_stress` and `friction` in 1D files built
+  before that are three times too high and are fixed by dividing by three,
+  in the runs and in every event's slice of them, along with the factor and
+  formula of the `calibration` step). A new
   conversion is a class with `apply(run, units)` and `describe()`.
 - `alignment.offset_from_trigger(ni, elsys)` puts the Elsys clock on the NI
   clock from the NI trigger sample; `slip_step_table` checks that slip follows
