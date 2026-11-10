@@ -13,8 +13,9 @@ strains, as it always was.  A record already in a stress unit (``unit`` of
 ``Pa``, ``kPa``, ``MPa`` or ``GPa``: a recorder read through a conversion)
 is compared with the model's stresses directly, in MPa on the axes.  Its
 channels are grouped by sensor through their names (``<sensor>_sigma_xy``,
-``_sigma_xx``, ``_sigma_yy``): the gauge box lists one entry per sensor (its
-``sigma_xy`` channel), three panels show the sensor's xy, xx and yy
+``_sigma_xx``, ``_sigma_yy``): the gauge box lists the sensors the record
+has by name (``shear_1``, ``rosette_1``, ...: five entries for three shear
+gauges and two rosettes, whatever the number of channels), three panels show the sensor's xy, xx and yy
 components, and ``Fit`` adjusts Gc and Xc to all the components ticked in
 the ``Fit`` boxes at once (a rosette: all three; a shear gauge: xy alone).
 sigma_xy is zeroed at x_max, sigma_xx and sigma_yy at x_min; the window is
@@ -142,6 +143,7 @@ class CZMFitterView(EventView):
                                            width=5, state="readonly")
         self.gauge_combobox.grid(row=0, column=3, padx=5, sticky="w")
         self.gauge_combobox.bind("<<ComboboxSelected>>", self.update_plot)
+        self.sensor_var = tk.StringVar(master=self)        # the box's variable when it lists sensors by name
         self.channel_var = tk.StringVar(master=self)       # the selected channel's name, when the record names it
         ttk.Label(control_frame, textvariable=self.channel_var).grid(row=0, column=6, padx=5, sticky="w")
 
@@ -276,7 +278,13 @@ class CZMFitterView(EventView):
         self.stress_scale = STRESS_UNITS.get(self.record_unit(block))
         names = waveform_channels(block)
         self.channel_names = names if names != [str(i) for i in range(self.num_gauges)] else []
-        self.gauge_combobox.config(values=[str(i) for i in self.gauge_choices()])
+        sensors = self.sensors()
+        if sensors:                                        # the sensors the record has, by name
+            self.gauge_combobox.config(textvariable=self.sensor_var, values=list(sensors),
+                                       width=max(5, max(len(name) for name in sensors) + 1))
+        else:                                              # the record's channels, by index
+            self.gauge_combobox.config(textvariable=self.strain_gauge, width=5,
+                                       values=[str(i) for i in range(self.num_gauges)])
         self.layout_axes(len(COMPONENTS) if self.stress_mode else 2)
         if self.stress_mode:
             self.fit_frame.grid()
@@ -314,7 +322,7 @@ class CZMFitterView(EventView):
             self.line_positions = []
             if not 0 <= self.strain_gauge.get() < self.num_gauges or (self.stress_mode and not self._opened):
                 self.strain_gauge.set(default_gauge)     # a stress record opens on its first sigma_xy channel
-        self.gauge_combobox.set(self.strain_gauge.get())
+        self.show_gauge()
         self._opened = True
 
         self.axs[0].set_xlim(self.x_lim_min, self.x_lim_max)
@@ -357,14 +365,33 @@ class CZMFitterView(EventView):
         """The record's name for a channel index, '' when it has none."""
         return self.channel_names[gauge_idx] if 0 <= gauge_idx < len(self.channel_names) else ""
 
-    def gauge_choices(self) -> list:
-        """The channel indices the gauge box offers: every channel; for a stress
-        record whose channels are named by sensor, one per sensor (its ``sigma_xy``)."""
-        if self.stress_mode:
-            sensors = [i for i, name in enumerate(self.channel_names) if name.endswith("_sigma_xy")]
-            if sensors:
-                return sensors
-        return list(range(self.num_gauges))
+    def sensors(self) -> dict:
+        """``{sensor name: index of its sigma_xy channel}`` for a stress record
+        whose channels are named by sensor (``<sensor>_sigma_xy``), in channel
+        order; empty otherwise.  These are the entries of the gauge box: as
+        many as the record has sensors, not channels."""
+        if not self.stress_mode:
+            return {}
+        return {name[:-len("_sigma_xy")]: i for i, name in enumerate(self.channel_names)
+                if name.endswith("_sigma_xy")}
+
+    def show_gauge(self) -> None:
+        """Make the gauge box show the selection held in ``strain_gauge``: the
+        channel index, or the name of the sensor that channel belongs to (the
+        first sensor when it belongs to none)."""
+        sensors = self.sensors()
+        if not sensors:
+            self.gauge_combobox.set(self.strain_gauge.get())
+            return
+        xy = self.sensor_channels()["xy"]
+        name = next((n for n, i in sensors.items() if i == xy), next(iter(sensors)))
+        self.strain_gauge.set(sensors[name])
+        self.sensor_var.set(name)
+
+    def selected_sensor(self) -> str:
+        """The name of the selected sensor, '' when the box lists channels."""
+        name = self.sensor_var.get()
+        return name if name in self.sensors() else ""
 
     def sensor_channels(self, gauge_idx=None) -> dict:
         """``{component: channel index}`` of the sensor a channel of a stress
@@ -379,14 +406,12 @@ class CZMFitterView(EventView):
         return found if "xy" in found else {"xy": gauge}
 
     def sensor_label(self) -> str:
-        """What the gauge box's selection stands for: the channel's name, or the
-        sensor and its components for a stress record (``rosette_1: xy, xx, yy``)."""
-        gauge = int(self.strain_gauge.get())
-        name = self.channel_name(gauge)
-        if not self.stress_mode or "_sigma_" not in name:
-            return name
-        channels = self.sensor_channels(gauge)
-        return f"{name.rpartition('_sigma_')[0]}: {', '.join(c for c in COMPONENTS if c in channels)}"
+        """What stands next to the gauge box: the channel's name; for a sensor
+        of a stress record, the components it has (``xy, xx, yy``)."""
+        if self.selected_sensor():
+            channels = self.sensor_channels()
+            return ", ".join(c for c in COMPONENTS if c in channels)
+        return self.channel_name(int(self.strain_gauge.get()))
 
     def panels(self) -> list:
         """``(component, channel index or None)`` for each axes, top to bottom:
@@ -559,6 +584,9 @@ class CZMFitterView(EventView):
             ax.clear()
 
         t = self._time()
+        sensor = self.selected_sensor()
+        if sensor:                                         # the box holds a sensor's name: its sigma_xy channel
+            self.strain_gauge.set(self.sensors()[sensor])
         gauge = self.strain_gauge.get()
         self.channel_var.set(self.sensor_label())
         if self.stress_mode:                               # only the components the sensor has can be ticked
@@ -579,7 +607,7 @@ class CZMFitterView(EventView):
                 ax.plot(t, (measured - measured[zero]) * scale, COMPONENT_STYLE[component], label=label)
                 ax.plot(t, (model[component] - model[component][zero]) * scale, 'g--', label='CZM')
             elif self.stress_mode:
-                ax.text(0.5, 0.5, f"no {label} channel for {self.channel_name(gauge) or f'channel {gauge}'}",
+                ax.text(0.5, 0.5, f"no {label} channel for {sensor or self.channel_name(gauge) or f'channel {gauge}'}",
                         ha='center', va='center', transform=ax.transAxes, color='gray')
             else:
                 ax.text(0.5, 0.5, f"no Eyy gauge: channel {self.EYY_GAUGE} missing "
@@ -741,7 +769,8 @@ class CZMFitterView(EventView):
 
     def fit_context(self) -> dict:
         """What the parameters were fitted to and with: the channel's name (the
-        sensor's ``sigma_xy`` channel for a stress record), the record's unit,
+        sensor's ``sigma_xy`` channel for a stress record, with the ``sensor``
+        itself), the record's unit,
         the elastic medium, the components fitted together (stress records)
         and the peak strength ``tau_p`` (Pa) that Gc and Xc imply at this Cf."""
         gauge = int(self.strain_gauge.get())
@@ -749,6 +778,8 @@ class CZMFitterView(EventView):
             gauge = self.sensor_channels(gauge)["xy"]
         context = {"channel": self.channel_name(gauge), "unit": self.record_unit(self.strain_block(self.event)),
                    "E": float(self.E), "nu": float(self.nu), "C_s": float(self.C_s), "C_d": float(self.C_d)}
+        if self.selected_sensor():
+            context["sensor"] = self.selected_sensor()
         if self.stress_mode and self.fit_components():
             context["fit_components"] = self.fit_components()
         with np.errstate(all="ignore"):

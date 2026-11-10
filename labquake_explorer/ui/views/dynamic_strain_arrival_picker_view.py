@@ -268,6 +268,20 @@ class DynamicStrainArrivalPickerView(EventView):
             base = [i in (6, 8, 10, 12) for i in range(16)]
         return (base + [False] * n_channels)[:n_channels]
 
+    @staticmethod
+    def one_channel_per_sensor(names) -> list | None:
+        """Default flags for a record whose channels are the stress components
+        of its sensors (``<sensor>_sigma_xy``, ``_sigma_xx``, ``_sigma_yy``):
+        one arrival per sensor, picked on its ``sigma_xy``, so a rosette's
+        ``sigma_xx`` and ``sigma_yy`` start switched off (the menus switch them
+        on).  A channel not named that way, or of a sensor without
+        ``sigma_xy``, stays on.  None when no channel is named that way."""
+        parts = [str(name).rpartition("_sigma_") for name in names]
+        with_xy = {sensor for sensor, sep, component in parts if sep and component == "xy"}
+        if not with_xy:
+            return None
+        return [not (sep and sensor in with_xy and component in ("xx", "yy")) for sensor, sep, component in parts]
+
     def default_picks(self, block, n_channels: int, n_samples: int) -> list:
         """Initial marker positions: the record's own trigger time when it has
         one (the waves arrive there), else the middle of the record."""
@@ -344,10 +358,13 @@ class DynamicStrainArrivalPickerView(EventView):
             head = max(1, y.shape[1] // 100)
             y -= y[:, :head].mean(axis=1, keepdims=True)
 
+        one_per_sensor = None if legacy else self.one_channel_per_sensor(self.channel_names())
         if self.enabled_channels is None or len(self.enabled_channels) != n_channels:
-            self.enabled_channels = self.default_enabled_channels(n_channels, exp_number, legacy)
+            self.enabled_channels = (list(one_per_sensor) if one_per_sensor
+                                     else self.default_enabled_channels(n_channels, exp_number, legacy))
         if self.fitting_channels is None or len(self.fitting_channels) != n_channels:
-            self.fitting_channels = self.default_fitting_channels(n_channels, exp_number, legacy)
+            self.fitting_channels = (list(one_per_sensor) if one_per_sensor
+                                     else self.default_fitting_channels(n_channels, exp_number, legacy))
         if len(self.locations) != n_channels:
             self.locations = self.block_locations(strain, n_channels) or self.default_locations(n_channels, exp_number)
         amplitude = self.trace_amplitude(self.locations)
@@ -560,14 +577,13 @@ class DynamicStrainArrivalPickerView(EventView):
     # --------------------------------------------------------------- menus
     @staticmethod
     def _fill_channel_menu(menubutton, flags, command, names=()):
-        """One checkbutton per channel, ``channel <i>``, followed by the channel's
-        name when the record gives one (``names``)."""
+        """One checkbutton per channel: the channel's name when the record gives
+        one (``names``), else ``channel <i>``."""
         menubutton.menu.delete(0, "end")
         menubutton.items = [tk.IntVar(value=int(bool(flag))) for flag in flags]
         for i, var in enumerate(menubutton.items):
             name = names[i] if i < len(names) and names[i] != str(i) else ""
-            menubutton.menu.add_checkbutton(label=f"channel {i}: {name}" if name else "channel %d" % i,
-                                            variable=var, command=command)
+            menubutton.menu.add_checkbutton(label=name or "channel %d" % i, variable=var, command=command)
 
     def channel_names(self) -> list:
         """The record's channel names; empty for the PSU layout, which has none."""

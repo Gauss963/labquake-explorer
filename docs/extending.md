@@ -269,10 +269,13 @@ of those two cases the dict also holds `channel` (the channel's name),
 strength Gc and Xc imply at that `Cf`.
 
 A stress record's channels are grouped by sensor through their names
-(`<sensor>_sigma_xy`, `_sigma_xx`, `_sigma_yy`). The view shows the three
-components of the selected sensor and fits Gc and Xc to the ticked ones at
-once; `fit_components` records which (`['xy', 'xx', 'yy']` for a rosette,
-`['xy']` for a shear gauge), and `channel` is the sensor's `sigma_xy` channel.
+(`<sensor>_sigma_xy`, `_sigma_xx`, `_sigma_yy`). The gauge box lists the
+record's sensors by name, the view shows the three components of the
+selected one and fits Gc and Xc to the ticked ones at once; `sensor` records
+its name, `fit_components` which components (`['xy', 'xx', 'yy']` for a
+rosette, `['xy']` for a shear gauge), and `channel` is the sensor's
+`sigma_xy` channel. Pick Arrivals starts such a record with one trace per
+sensor (its `sigma_xy`); the menus switch the other components on.
 
 ### `interevent` (InterEventView, run level, version 1)
 

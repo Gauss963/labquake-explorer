@@ -429,9 +429,10 @@ def test_stress_record_opens_by_sensor(app_with_strain):
     try:
         assert v.stress_mode and v.medium_source == "experiment"
         assert (v.E, v.nu, v.C_s, v.C_d) == (medium["E"], medium["nu"], medium["C_s"], medium["C_d"])
-        # one entry per sensor (its sigma_xy channel); opens on the first, at the sensor's distance, on the record's span
-        assert list(v.gauge_combobox["values"]) == ["1", "2"]
-        assert v.strain_gauge.get() == 1 and v.channel_var.get() == "shear_1: xy"
+        # the box lists the record's sensors by name (two, for eight channels); opens on the first,
+        # at the sensor's distance, on the record's span
+        assert list(v.gauge_combobox["values"]) == ["shear_1", "rosette_1"] and v.sensors() == {"shear_1": 1, "rosette_1": 2}
+        assert v.gauge_combobox.get() == "shear_1" and v.strain_gauge.get() == 1 and v.channel_var.get() == "xy"
         assert v.y.get() == pytest.approx(1e-3)
         assert v.axs[0].get_xlim() == pytest.approx((-2e-3, 2e-3))
         assert positions(v) == pytest.approx([-1e-3, 0.0, 1e-3])
@@ -448,13 +449,15 @@ def test_stress_record_opens_by_sensor(app_with_strain):
         assert any("no sigma_yy channel" in t.get_text() for t in v.axs[2].texts)
         assert v.fit_frame.winfo_manager() and v.fit_boxes["xx"].instate(["disabled"])
         # the rosette brings its three components
-        v.gauge_combobox.set("2")
+        v.gauge_combobox.set("rosette_1")
         v.update_plot()
-        assert v.channel_var.get() == "rosette_1: xy, xx, yy"
+        assert v.strain_gauge.get() == 2 and v.channel_var.get() == "xy, xx, yy"
         assert v.sensor_channels() == {"xy": 2, "xx": 3, "yy": 0} and v.fit_components() == ["xy", "xx", "yy"]
         assert v.fit_boxes["xx"].instate(["!disabled"])
-        v.set_event(1), v.set_event(2)                                    # back from a volts record: channel kept
-        assert v.strain_gauge.get() == 2 and len(v.axs) == 3
+        v.set_event(1)                                                    # a volts record: channels by index again
+        assert list(v.gauge_combobox["values"]) == [str(i) for i in range(16)] and v.gauge_combobox.get() == "2"
+        v.set_event(2)                                                    # back: the same sensor
+        assert v.gauge_combobox.get() == "rosette_1" and v.strain_gauge.get() == 2 and len(v.axs) == 3
     finally:
         v.on_close()
 
@@ -464,7 +467,7 @@ def test_rosette_components_are_fitted_together(app_with_strain):
     medium = add_stress_record(app_with_strain, event)
     v = CZMFitterView(app_with_strain, 0, 2)
     try:
-        v.gauge_combobox.set("2")
+        v.gauge_combobox.set("rosette_1")
         v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
         v.update_plot()
         # with the true parameters the model lies on every component (levels removed at the zero lines, in MPa)
@@ -507,15 +510,18 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.update_plot()
         v.save_parameters()
         saved = event["czm_parms"]
-        assert set(saved) == EXPECTED_KEYS | {"channel", "unit", "E", "nu", "C_s", "C_d", "tau_p", "fit_components"}
-        assert saved["channel"] == "rosette_1_sigma_xy" and saved["unit"] == "MPa" and saved["strain_gauge"] == 2
+        assert set(saved) == EXPECTED_KEYS | {"channel", "sensor", "unit", "E", "nu", "C_s", "C_d", "tau_p",
+                                              "fit_components"}
+        assert saved["sensor"] == "rosette_1" and saved["channel"] == "rosette_1_sigma_xy"
+        assert saved["unit"] == "MPa" and saved["strain_gauge"] == 2
         assert saved["fit_components"] == ["xy", "xx"]
         assert saved["E"] == medium["E"] and saved["C_s"] == medium["C_s"] and 1e4 < saved["tau_p"] < 1e8
     finally:
         v.on_close()
     again = CZMFitterView(app_with_strain, 0, 2)                         # reopening restores channel, boxes, parameters
     try:
-        assert again.strain_gauge.get() == 2 and again.fit_components() == ["xy", "xx"]
+        assert again.gauge_combobox.get() == "rosette_1" and again.strain_gauge.get() == 2
+        assert again.fit_components() == ["xy", "xx"]
         assert again.Gc.get() == pytest.approx(saved["Gc"]) and again.Xc.get() == pytest.approx(saved["Xc"])
         assert positions(again) == pytest.approx([-1e-3, 0.0, 1e-3])
     finally:
@@ -550,6 +556,7 @@ def test_stress_record_with_unnamed_sensors_fits_the_selected_channel(app_with_s
         v.gauge_combobox.set("2")
         v.update_plot()
         assert v.channel_var.get() == "gauge_2" and v.sensor_channels() == {"xy": 2} and v.fit_components() == ["xy"]
+        assert v.sensors() == {} and v.strain_gauge.get() == 2
         v.Cf.set(TRUE["Cf"])
         assert v.build_fit_objective()([TRUE["Gc"], TRUE["Xc"]]) < 1e-9
     finally:

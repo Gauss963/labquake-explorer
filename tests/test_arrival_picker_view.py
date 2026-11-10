@@ -465,34 +465,56 @@ def test_czm_and_pzt_view_read_the_record_arrivals(app):
         pv.on_close()
 
 
-def test_record_with_constant_levels_is_drawn_at_the_sensor_positions(app_with_strain):
-    """A stress record carries levels of tens of MPa: every trace still starts at
-    its sensor position, and the channel menus name the channels."""
+def stress_record_event(app):
+    """Event 2 with a stress record of three sensors: two shear gauges and a
+    rosette (xx, xy, yy), each channel on a level of several MPa with a 1 MPa
+    drop arriving at 1000 m/s."""
     from labquake_explorer.data.channels import channel_array, positions_table
-    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
-    names = ["shear_1_sigma_xy", "rosette_1_sigma_xx", "rosette_1_sigma_xy", "shear_2_sigma_xy"]
-    xs = [100.0, 250.0, 250.0, 400.0]
+    event = app.data_manager.get_data("runs/[0]/events/[2]")
+    names = ["shear_1_sigma_xy", "rosette_1_sigma_xx", "rosette_1_sigma_yy", "rosette_1_sigma_xy", "shear_2_sigma_xy"]
+    xs = [100.0, 250.0, 250.0, 250.0, 400.0]
     t = np.arange(-1000, 1001) / 1e6
-    step = lambda t0: -0.5 * (1 + np.tanh((t - t0) / 2e-5))             # a 1 MPa drop arriving at t0
-    levels = [2.4, 36.0, -18.0, -3.9]
+    step = lambda t0: -0.5 * (1 + np.tanh((t - t0) / 2e-5))
+    levels = [2.4, 36.0, -64.0, -18.0, -3.9]
     data = np.vstack([level + step((x - 100.0) * 1e-3 / 1000.0) for level, x in zip(levels, xs)])
     event.pop("strain", None)
     event["waveform"] = {"elsys": channel_array(
         data, names, unit="MPa", dtype=np.float64, time=float(event["event_time"]) + t, sample_rate=1e6, block=2,
         positions=positions_table(names, {n: (x, 1.0, np.nan) for n, x in zip(names, xs)}))}
+    return event, names, xs
+
+
+def test_stress_record_shows_one_trace_per_sensor_at_its_position(app_with_strain):
+    """A stress record carries levels of tens of MPa and several components per
+    rosette: one trace per sensor (its sigma_xy), each starting at the sensor's
+    position; the menus name the channels and switch the other components on."""
+    event, names, xs = stress_record_event(app_with_strain)
     v = DynamicStrainArrivalPickerView(app_with_strain, 0, 2)
     try:
-        assert v.locations == xs and v.enabled_channels == [True] * 4
+        assert v.locations == xs
+        assert v.enabled_channels == [True, False, False, True, True] == v.fitting_channels   # three sensors
+        assert [line is not None for line in v.lines] == v.enabled_channels
         lo, hi = sorted(v.axs[4].get_ylim())
         for line, x in zip(v.lines, xs):
+            if line is None:
+                continue
             y = line.get_data()[1]
             assert y[0] == pytest.approx(x, abs=1e-6)                    # starts on its dotted position line
             assert lo < y.min() and y.max() < hi                         # and stays inside the panel
         menu = v.enabled_channels_mb.menu
-        assert [menu.entrycget(i, "label") for i in range(4)] == [f"channel {i}: {n}" for i, n in enumerate(names)]
-        v.magic()                                                        # picks follow the front at 1000 m/s
+        assert [menu.entrycget(i, "label") for i in range(5)] == names
+        v.magic()                                                        # one pick per sensor follows the front
         v.update_fitted_line()
-        assert v.rupture_speed is not None
+        assert len(v.fitting_markers) == 3 and v.rupture_speed is not None
+        v.enabled_channels_mb.items[1].set(1)                            # the rosette's sigma_xx, switched on
+        v.enabled_channels_changed()
+        assert v.lines[1] is not None and v.lines[1].get_data()[1][0] == pytest.approx(250.0, abs=1e-6)
     finally:
         v.on_close()
 
+
+def test_one_channel_per_sensor_rule():
+    rule = DynamicStrainArrivalPickerView.one_channel_per_sensor
+    assert rule(["pzt_1", "pzt_2"]) is None and rule([]) is None and rule(["0", "1"]) is None
+    assert rule(["a_sigma_xy", "a_sigma_xx", "a_sigma_yy", "b_sigma_xy", "pzt_1"]) == [True, False, False, True, True]
+    assert rule(["a_sigma_xx", "a_sigma_yy", "b_sigma_xy"]) == [True, True, True]    # sensor a has no sigma_xy: kept
