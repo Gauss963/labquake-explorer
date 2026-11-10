@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, simpledialog, messagebox
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from labquake_explorer._version import __version__
 from labquake_explorer.data.channels import is_channel_array
 from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.utils.config import LabquakeExplorerConfig
@@ -24,7 +25,7 @@ class LabquakeExplorer:
     def __init__(self, root: tk.Tk):
         self.config = LabquakeExplorerConfig()
         self.root = root
-        self.root.title(self.config.WINDOW_TITLE)
+        self.root.title(f"{self.config.WINDOW_TITLE} {__version__}")
         
         self.data_manager = DataManager()
         self.child_windows: List[tk.Toplevel] = []

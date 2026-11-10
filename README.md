@@ -30,6 +30,15 @@ the node they belong to and written to disk with "Save As" (`.npz`, `.h5` or
 `.hdf5`; other suffixes are refused, and a failed save leaves the previous
 file untouched).
 
+## Versions
+
+`labquake-explorer --version` prints the package version (the window title
+shows it too); it is written once, in `labquake_explorer/_version.py`, and
+releases are tagged `v<version>`. Every experiment file written records,
+under a top-level `labquake_explorer` dict, the version that last wrote it
+and when, the git commit when run from a checkout, and the version that
+built it.
+
 ## Features
 
 - Load and analyze labquake data stored in NPZ and HDF5 formats
@@ -39,6 +48,10 @@ file untouched).
   slip); apply one set of ranges to all events of a run
 - Inter-event Metrics: recurrence, load-point advance, fault slip and creep
   per stick-slip cycle
+- Slip Distribution: coseismic slip of every eddy-current sensor with its own
+  event time (largest slip rate or dragged by hand) and fit windows before and
+  after it; slip along the fault with a quadratic or earthquake arrest zone
+  fit, and the rupture-front velocity from the event times
 - Pick dynamic strain arrivals and estimate rupture speed
 - Fit a Cohesive Zone Model to dynamic strain records
 - PZT Spectrum: calibrated amplitude spectrum, omega^-n source fit and

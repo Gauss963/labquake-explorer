@@ -31,6 +31,8 @@ from labquake_explorer.ui.views.base import RunView, event_list
 from labquake_explorer.ui.views.point_picker import PointPicker
 
 RESULT_VERSION = 1
+FIELDS_REFERENCE = "reference (event_fields)"   # the waveform channels the run's reference names
+FIELDS_ALL = "all channels"
 DEFAULT_HALF_WINDOW_S = 5.0      # start/end default to -/+ config.DEFAULT_WINDOW_SIZE, else this
 X_INDEX = "index"
 ZOOM_FACTOR = 3.0                # "Zoom to event" shows this many windows around the event
@@ -110,6 +112,12 @@ class EventPickerView(RunView):
             row=1, column=5, columnspan=3, padx=4, pady=3, sticky="w")
         self.extract_button = ttk.Button(box, text="Extract Events", command=self.extract)
         self.extract_button.grid(row=1, column=8, padx=10, pady=3, sticky="ew")
+        ttk.Label(box, text="Waveform channels:").grid(row=4, column=0, padx=4, pady=(0, 3), sticky="e")
+        self.fields_combo = ttk.Combobox(box, width=22, values=[FIELDS_REFERENCE, FIELDS_ALL])
+        self.fields_combo.set(FIELDS_REFERENCE)
+        self.fields_combo.grid(row=4, column=1, columnspan=2, padx=4, pady=(0, 3), sticky="w")
+        ttk.Label(box, text="into waveform/<recorder>: the reference's event_fields, all, or names (comma-separated)",
+                  wraplength=560, justify="left").grid(row=4, column=3, columnspan=6, padx=4, pady=(0, 3), sticky="w")
         ttk.Label(box, text=HELP_TEXT, wraplength=900, justify="left").grid(
             row=2, column=0, columnspan=9, padx=4, pady=(0, 3), sticky="w")
         self.status_var = tk.StringVar(master=self, value="")
@@ -150,6 +158,7 @@ class EventPickerView(RunView):
         if "start_s" in saved and "end_s" in saved:
             self.start_var.set(f"{float(saved['start_s']):g}")
             self.end_var.set(f"{float(saved['end_s']):g}")
+        self.fields_combo.set(self.fields_text(saved.get("waveform_fields")))
         self.picker.picks[:] = self.saved_picks()
         self.refresh_event_list(0)
         self.plot()
@@ -401,6 +410,29 @@ class EventPickerView(RunView):
             self.update_status("picks saved")
         return picks
 
+    @staticmethod
+    def fields_text(value) -> str:
+        """The box text for a saved ``waveform_fields`` (None / 'reference', 'all', or a list)."""
+        if value is None:
+            return FIELDS_REFERENCE
+        if isinstance(value, str):
+            key = value.strip().lower()
+            return FIELDS_REFERENCE if key in ("", "reference") else (FIELDS_ALL if key == "all" else value)
+        try:
+            return ", ".join(str(v.decode() if isinstance(v, bytes) else v) for v in value)
+        except TypeError:
+            return FIELDS_REFERENCE
+
+    def waveform_fields(self):
+        """What the Waveform channels box asks for: None (the reference's
+        ``event_fields``), ``'all'`` or a list of names."""
+        choice = self.fields_combo.get().strip()
+        if not choice or choice == FIELDS_REFERENCE or choice.lower() == "reference":
+            return None
+        if choice == FIELDS_ALL or choice.lower() == "all":
+            return "all"
+        return [f.strip() for f in choice.replace(";", ",").split(",") if f.strip()]
+
     def extract(self, confirm: bool = True) -> int:
         """Save the picks, extract every one with the current window; returns the count."""
         try:
@@ -417,8 +449,9 @@ class EventPickerView(RunView):
                                           icon=messagebox.WARNING, parent=self):
                 return 0
         picks = self.save_picks(refresh=False)
+        fields = self.waveform_fields()
         events = self.data_manager.event_processor.extract_events(
-            self.run, picks, window=max(-start, end), pre=-start, post=end)
+            self.run, picks, window=max(-start, end), pre=-start, post=end, fields=fields)
         self.data_manager.set_data(f"{self.run_path}/events", events, add_key=True)
         self.result = {
             "version": RESULT_VERSION,
@@ -428,6 +461,7 @@ class EventPickerView(RunView):
             "x_field": self.x_combo.get(),
             "y_field": self.y_combo.get(),
             "n_events": len(events),
+            "waveform_fields": "reference" if fields is None else fields,
         }
         self.save_results(dict(self.result))      # also refreshes the tree
         self.update_status(f"{len(events)} events extracted, window {start:+g} s .. {end:+g} s")

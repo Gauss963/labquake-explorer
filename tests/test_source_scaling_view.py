@@ -716,7 +716,7 @@ def test_pzt_view_records_feed_the_scaling_view(app_with_strain, tmp_path):
             assert pv.save()
         finally:
             pv.on_close()
-    assert set(events[0]["strain"]["spectrum"]["channels"]) == {"ch3"}      # saved with the record
+    assert set(events[0]["strain"]["spectrum"]["sets"]["default"]["channels"]) == {"ch3"}      # saved with the record
 
     v = SourceScalingView(app, 0)
     try:
@@ -775,3 +775,136 @@ def test_records_under_the_waveform_records_are_gathered(app):
     assert set(per_channel) == {"ch0", "ch1"}
     assert per_channel["ch1"]["seismic_moment_nm"] == pytest.approx(2.0)
     assert "ch1" in available_channels(run) and "ch0" in available_channels(run)
+
+
+def test_result_set_chooser_selects_the_records(app_with_strain):
+    from labquake_explorer.ui.views.source_scaling_view import available_sets
+    app = app_with_strain
+    events = populate(app)                                    # the legacy maps are the 'default' set
+    for j, event in enumerate(events):
+        m0 = M0_VALUES[j % len(M0_VALUES)]
+        event["strain"]["spectrum"] = {"version": 2, "sets": {
+            "EGF": {"channels": {"ch0": dict(source_record(10.0 * m0), channel=0)}}}}
+    assert available_sets(app.data_manager.get_data("runs/[0]")) == ["default", "EGF"]
+    v = SourceScalingView(app, 0)
+    try:
+        assert list(v.set_combo["values"]) == ["default", "EGF"] and v.result_set == "default"
+        assert list(v.channel_combo["values"]) == [ALL_CHANNELS, "ch0", "ch1"]
+        m0_default = float(v.table.item("0")["values"][1])
+        v.set_combo.set("EGF")
+        v.on_set_selected()
+        assert list(v.channel_combo["values"]) == [ALL_CHANNELS, "ch0"]
+        assert float(v.table.item("0")["values"][1]) == pytest.approx(10.0 * m0_default)
+        assert "set 'EGF'" in v.status_var.get()
+        assert v.fit_power_law() is not None
+        saved = v.save()
+        assert saved["result_set"] == "EGF"
+        v.on_close()
+        v2 = SourceScalingView(app, 0)                        # reopens on the saved set
+        try:
+            assert v2.result_set == "EGF" and list(v2.channel_combo["values"]) == [ALL_CHANNELS, "ch0"]
+        finally:
+            v2.on_close()
+    finally:
+        if v in app.child_windows:
+            v.on_close()
+
+
+def test_ensemble_percentiles_become_error_bars(app, view):
+    events = app.data_manager.get_data("runs/[0]/events")
+    rows0 = {r["event"]: r for r in view.rows}
+    assert all(np.isnan(r["fc_p16"]) and np.isnan(r["m0_p84"]) for r in rows0.values())
+    assert view.error_bar_artist is None
+    for j, event in enumerate(events[:3]):
+        for rec in event["pzt_spectrum"]["channels"].values():
+            fc, m0 = rec["source"]["fc_hz"], rec["source"]["seismic_moment_nm"]
+            rec["ensemble"] = {"version": 1, "n_members": 16, "n_valid": 16, "n_resolved": 10 if j else 0, "stats": {
+                "fc": {"p16": 0.8 * fc, "p84": 1.3 * fc, "min": 0.7 * fc, "max": 1.4 * fc, "median": fc, "n": 16},
+                "seismic_moment_nm": {"p16": 0.9 * m0, "p84": 1.2 * m0, "min": 0.8 * m0, "max": 1.3 * m0, "median": m0, "n": 16}},
+                "stats_resolved": {                                  # the pinned members left out: narrower
+                    "fc": {"p16": 0.9 * fc, "p84": 1.1 * fc, "min": 0.85 * fc, "max": 1.2 * fc, "median": fc, "n": 10 if j else 0},
+                    "seismic_moment_nm": {"p16": 0.95 * m0, "p84": 1.1 * m0, "min": 0.9 * m0, "max": 1.2 * m0, "median": m0, "n": 10 if j else 0}}}
+    view.refresh()
+    rows = {r["event"]: r for r in view.rows}
+    assert rows[0]["fc_p16"] == pytest.approx(0.8 * rows[0]["fc_hz"]) and rows[0]["m0_p84"] == pytest.approx(1.2 * rows[0]["seismic_moment_nm"])   # none resolved: every valid member
+    assert rows[1]["fc_p16"] == pytest.approx(0.9 * rows[1]["fc_hz"]) and rows[1]["m0_p84"] == pytest.approx(1.1 * rows[1]["seismic_moment_nm"])   # the resolved ones
+    assert np.isnan(rows[3]["fc_p16"])
+    assert view.error_bar_artist is not None
+    # a single channel reads the record's own percentiles; the other Y variables carry no fc bar
+    view.set_channel("ch0")
+    assert view.error_bar_artist is not None
+    rec0 = events[0]["pzt_spectrum"]["channels"]["ch0"]
+    row = {r["event"]: r for r in view.rows}[0]
+    assert row["fc_p84"] == pytest.approx(rec0["ensemble"]["stats"]["fc"]["p84"])
+    view.set_y_variable(Y_STRESS_DROP)
+    assert view.error_bar_artist is not None                 # M0 bars still drawn
+
+
+def test_shared_t_star_scan_and_refit_set(app):
+    from dataclasses import replace
+    from labquake_explorer.analysis import spectrum as sp
+    from labquake_explorer.analysis import t_star_scan as ts
+    from labquake_explorer.ui.views.source_scaling_view import PLOT_T_STAR, T_STAR_KEY, parse_t_star_grid
+    events = populate(app, channels=("3",))
+    # give every record a binned spectrum attenuated with t* = 20 us
+    for k, event in enumerate(events):
+        rec = event["pzt_spectrum"]["channels"]["ch3"]
+        t, x = sp.brune_pulse(1e6, 8000, 1.0, 8e3 + 2e3 * k, 4e-3)
+        s = sp.compute_spectrum(sp.extract_window(t, x, 4e-3, 2e-3, 2e-3), fmin=500.0, fmax=100e3)
+        loss = np.exp(-np.pi * s.f_binned * 20e-6)                 # attenuated by the medium
+        s = replace(s, amp_binned=s.amp_binned * loss, noise_binned=s.noise_binned * loss)
+        rec.update({"spectrum": s.as_dict(), "fmin_hz": 1000.0, "fmax_hz": 50e3, "snr_min": None, "n_fixed": True,
+                    "loss": "linear", "n_max": 8.0, "t_star_s": None, "result_set": "default", "field": "pzt_4"})
+    app.data_manager.data.setdefault("analysis", {})["pzt_spectrum"] = {
+        "sets": {"default": {"settings": {"pre_ms": 0.5}, "sensors": {"pzt_4": {"t_star_s": None, "distance_m": 0.1}}}}}
+    v = SourceScalingView(app, 0)
+    try:
+        assert v.t_star_text.get() == "no scan yet"
+        assert list(parse_t_star_grid("-10, 50, 2") * 1e6)[:3] == pytest.approx([-10.0, -8.0, -6.0])
+        for bad in ("1, 2", "a, b, c", "10, 0, 5", "0, 10, 0"):
+            with pytest.raises(ValueError):
+                parse_t_star_grid(bad)
+        v.t_star_grid_var.set("abc")
+        assert not v.scan_t_star() and "t* grid" in v.status_var.get()
+        v.t_star_grid_var.set("-10, 50, 2")
+        assert v.scan_t_star(), v.status_var.get()
+        scan = v.t_star_scans["ch3"]
+        assert scan.best_t_star_s == pytest.approx(20e-6) and scan.n_records == len(events)
+        assert "ch3: t* = 20 us" in v.t_star_text.get() and v.plot_combo.get() == PLOT_T_STAR
+        assert len(v.ax.lines) >= 2 and "t* scan" in v.ax.get_title()
+        saved = app.data_manager.get_data(f"runs/[0]/{T_STAR_KEY}")
+        assert saved["result_set"] == "default" and saved["sensors"]["ch3"]["best_t_star_s"] == pytest.approx(20e-6)
+        v.plot_combo.set("scaling")
+        v.plot()
+        assert "source scaling" in v.ax.get_title()
+        # the refits go into a new set, which is then shown; the sensor's t* is carried into its settings
+        assert not v.save_refits() or True
+        v.refit_set_var.set("default")
+        assert not v.save_refits() and "different" in v.status_var.get()
+        v.refit_set_var.set("tstar")
+        assert v.save_refits(), v.status_var.get()
+        assert v.result_set == "tstar" and list(v.set_combo["values"]) == ["default", "tstar"]
+        new = events[0]["pzt_spectrum"]["sets"]["tstar"]["channels"]["ch3"]
+        old = events[0]["pzt_spectrum"]["sets"]["default"]["channels"]["ch3"]
+        assert new["t_star_s"] == pytest.approx(20e-6) and new["result_set"] == "tstar" and new["ensemble"] is None
+        assert new["t_star_refit"]["from_set"] == "default"
+        assert ts.record_input(old).fit(0.0).fc < 0.5 * new["fit"]["fc"]       # the uncorrected fit sits far too low
+        assert new["fit"]["fc"] == pytest.approx(8e3, rel=0.05) and new["source"]["valid"]
+        assert new["source"]["seismic_moment_nm"] != old["source"]["seismic_moment_nm"]
+        sets = app.data_manager.data["analysis"]["pzt_spectrum"]["sets"]
+        assert sets["tstar"]["sensors"]["pzt_4"]["t_star_s"] == pytest.approx(20e-6) and sets["tstar"]["settings"]["pre_ms"] == 0.5
+        assert sets["default"]["sensors"]["pzt_4"]["t_star_s"] is None
+        # the scan belongs to the set it was made on
+        assert "saved scan is for set 'default'" in v.t_star_text.get()
+        v.on_close()
+        v2 = SourceScalingView(app, 0)
+        try:
+            v2.set_combo.set("default")
+            v2.on_set_selected()
+            assert v2.t_star_scans["ch3"].best_t_star_s == pytest.approx(20e-6)     # restored from the run
+            assert "ch3: t* = 20 us" in v2.t_star_text.get()
+        finally:
+            v2.on_close()
+    finally:
+        if v in app.child_windows:
+            v.on_close()

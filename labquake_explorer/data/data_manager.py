@@ -7,6 +7,7 @@ import numpy as np
 import h5py
 from labquake_explorer.data.event_processor import EventProcessor
 from labquake_explorer.data.sources import run_time
+from labquake_explorer.data.stamp import stamp
 
 # HDF5 group attribute recording whether a group was written from a dict or a
 # list, so digit-keyed dicts and lists round-trip as what they were.  Files
@@ -123,10 +124,13 @@ class DataManager:
         after the whole tree has been written, so a failure part-way through
         never leaves a truncated file behind (the usual flow overwrites the
         file that was just loaded).  Any other suffix raises ``ValueError``
-        instead of silently writing nothing.
+        instead of silently writing nothing.  The top-level ``labquake_explorer``
+        dict is refreshed first: the package version writing the file and when
+        (``labquake_explorer.data.stamp``).
         """
         if not self.data:
             raise ValueError("No data to save")
+        stamp(self.data)
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_SUFFIXES:

@@ -128,7 +128,7 @@ def test_views_reopen_after_hdf5_reload(populated, app_from_file, tmp_path):
         # recompute + save on the reloaded data works and keeps the channel map
         pv.rho_var.set("2700")
         assert pv.compute() and pv.compute_source() and pv.save()
-        assert set(events[2]["strain"]["spectrum"]["channels"]) == {"ch3"} and "pzt_spectrum" not in events[2]
+        assert set(events[2]["strain"]["spectrum"]["sets"]["default"]["channels"]) == {"ch3"} and "pzt_spectrum" not in events[2]
     finally:
         pv.on_close()
 

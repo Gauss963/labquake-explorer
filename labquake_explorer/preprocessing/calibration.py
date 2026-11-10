@@ -215,10 +215,21 @@ class Calibration:
 # ---------------------------------------------------------------------------
 # Pressure-transducer voltages to stress for the biaxial apparatus
 # (Tseng 2026, NTU thesis, Appendix B.3.3 / Table B.1): V = a * sigma + b on the
-# normal-stress line and V = c * tau on the shear jack, by fault section.
+# normal-stress line and V = c * tau on the shear line, by fault section.
+#
+# A factor is c = c_2D * (A_fault / A_2D) * (n_2D / n), the 2D constant scaled by
+# the fault area and the number of jacks pressed by the line: the 2D sample
+# (0.25 m^2) is loaded by nine normal and three shear jacks, a 1D sample by the
+# middle three normal jacks and the middle shear jack only.  The normal factors
+# of Table B.1 already count three jacks (0.739 * 0.1 * 9/3 = 0.222 for 5 cm);
+# its shear factors (0.109, 0.217) scale the 2D one by area alone, i.e. assume
+# the three shear jacks, and gave shear stress and friction three times too
+# high.  Corrected 2026-11-02 to one jack: 1.087 * 0.1 * 3 = 0.326 (5 cm) and
+# 1.087 * 0.2 * 3 = 0.652 (10 cm).  Files built with the old factors are fixed
+# by dividing shear_stress and friction by three.
 PRESSURE_PRESETS = {
-    "1D-5cm":  {"normal_v_per_mpa": 0.222, "normal_offset_v": 0.091, "shear_v_per_mpa": 0.109},
-    "1D-10cm": {"normal_v_per_mpa": 0.444, "normal_offset_v": 0.091, "shear_v_per_mpa": 0.217},
+    "1D-5cm":  {"normal_v_per_mpa": 0.222, "normal_offset_v": 0.091, "shear_v_per_mpa": 0.326},
+    "1D-10cm": {"normal_v_per_mpa": 0.444, "normal_offset_v": 0.091, "shear_v_per_mpa": 0.652},
     "2D-50cm": {"normal_v_per_mpa": 0.739, "normal_offset_v": 0.091, "shear_v_per_mpa": 1.087},
 }
 

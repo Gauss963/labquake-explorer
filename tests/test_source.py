@@ -352,3 +352,25 @@ def test_end_to_end_geometry_radiation_free_surface():
     assert sp.seismic_moment_nm == pytest.approx(
         seismic_moment(1e-10, RHO, VP, geo.distance_m, rad, fsf))
     assert isinstance(RadiationPattern(1.0, 0.0, False).as_dict(), dict)
+
+
+def test_source_parameters_moment_spectrum_takes_m0_from_the_plateau():
+    import math
+    from labquake_explorer.analysis import source as src
+    r = src.source_parameters(2.5, 4000.0, "P", None, None, 3500.0, None, moment_spectrum=True)
+    assert r.valid and r.seismic_moment_nm == 2.5 and r.mw == pytest.approx(src.moment_magnitude(2.5))
+    assert r.source_radius_m == pytest.approx(0.32 * 3500.0 / 4000.0)
+    assert r.stress_drop_pa == pytest.approx(src.stress_drop_eshelby(2.5, r.source_radius_m))
+    assert math.isnan(r.kR) and r.far_field_ok is None and r.warnings == []
+    c = r.constants
+    assert c["moment_spectrum"] is True and c["rho_kg_m3"] is None and c["vp_m_s"] is None and c["distance_m"] is None
+    assert c["radiation_coefficient"] is None and c["free_surface_factor"] is None and c["f_plateau_hz"] is None
+    # the S phase uses its own k; entries given anyway are ignored; Vs is still required
+    s = src.source_parameters(2.5, 4000.0, "S", 2700.0, 6000.0, 3500.0, 0.1, radiation_coefficient=0.0,
+                              free_surface_factor=-1.0, f_plateau_hz=1500.0, moment_spectrum=True)
+    assert s.valid and s.seismic_moment_nm == 2.5 and s.source_radius_m == pytest.approx(0.372 * 3500.0 / 4000.0)
+    with pytest.raises(ValueError):
+        src.source_parameters(2.5, 4000.0, "P", None, None, None, None, moment_spectrum=True)
+    bad = src.source_parameters(-1.0, 4000.0, "P", None, None, 3500.0, None, moment_spectrum=True)
+    assert not bad.valid and "positive" in bad.reason
+    assert src.source_parameters(1e-12, 4000.0, "P", 2700, 6000, 3500, 0.1).constants["moment_spectrum"] is False

@@ -19,7 +19,7 @@ def synthetic_run(fs=2000.0, duration=2.0):
     return {
         "name": "run1", "time": t,
         "pressure_1": (0.222 * 8.0 + 0.091 + 0 * t).astype(np.float32),
-        "pressure_2": (0.109 * 5.0 + 0 * t).astype(np.float32),
+        "pressure_2": (0.326 * 5.0 + 0 * t).astype(np.float32),
         "eddy_1": (-0.5 - 0.01 * t).astype(np.float32),        # gap opens: V falls, slip grows
         "eddy_2": (1.0 - 0.02 * t).astype(np.float32),
         "lvdt": (4.0 + 0 * t).astype(np.float32),
@@ -37,6 +37,12 @@ def test_linear_friction_and_presets():
     desc = run["calibration"]
     assert desc["note"] == "thesis table B.1" and [s["kind"] for s in desc["steps"]] == ["linear", "linear", "friction"]
     assert "normal_stress (MPa)" in desc["steps"][0]["formula"]
+    # the 1D factors are the 2D constants scaled by the fault area (0.1 and 0.2 of the 2D sample) and the jacks
+    # pressed: three of nine on the normal line, one of three on the shear line (Table B.1 assumed three)
+    from labquake_explorer.preprocessing import PRESSURE_PRESETS as P
+    for section, area in (("1D-5cm", 0.1), ("1D-10cm", 0.2)):
+        assert P[section]["normal_v_per_mpa"] == pytest.approx(P["2D-50cm"]["normal_v_per_mpa"] * area * 9 / 3, rel=2e-3)
+        assert P[section]["shear_v_per_mpa"] == pytest.approx(P["2D-50cm"]["shear_v_per_mpa"] * area * 3 / 1, rel=2e-3)
     # a missing source is skipped, not an error
     run2 = {"time": np.arange(5.0), "x": np.ones(5, dtype=np.float32)}
     Calibration(Linear("y", "nope", 2.0, unit="u"), Friction()).apply(run2)
@@ -96,7 +102,7 @@ def elsys(tmp_path):
     write_tpc5(path, {
         "A1 (0.A1)": lambda t: pulse(0.5)(t) + pulse(1.4)(t),
         "A5 (0.A5)": lambda t: 0.222 * 8.0 + 0.091 + 0 * t,
-        "A6 (0.A6)": lambda t: 0.109 * 5.0 + 0 * t,
+        "A6 (0.A6)": lambda t: 0.326 * 5.0 + 0 * t,
         "B1 (0.B1)": lambda t: -0.5 - 0.01 * t,
     }, trigger_times=(0.5, 1.4), volt_range=12.0)
     return path
@@ -141,7 +147,7 @@ def ni(tmp_path):
     path = tmp_path / "T0001-raw-run1-20260101_000000.npz"
     write_ni_npz(path, {
         "n": lambda t: 0.222 * 8.0 + 0.091 + 0 * t,
-        "s": lambda t: 0.109 * 5.0 + 0 * t,
+        "s": lambda t: 0.326 * 5.0 + 0 * t,
         "e": lambda t: -0.5 - 0.01 * t - 0.3 * (t > 1.25),          # slip step 50 ms after the trigger
     }, fs=10_000.0, duration=3.0, trigger_sample_index=12_000)
     return path

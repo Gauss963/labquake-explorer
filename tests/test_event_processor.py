@@ -244,3 +244,23 @@ def test_mean_on_samples_puts_a_converted_channel_on_the_run_samples(tmp_path):
     assert t[i] == pytest.approx(1.2, abs=1e-4)                     # the pulse, at the run's samples
     win = src.read_window(t[i] - 0.5e-4, t[i] + 0.5e-4, ["sigma_xy"], dtype=np.float64)
     assert win.data[0].min() <= y[i] <= win.data[0].max() and y[i] < -0.2   # the mean of the Elsys samples there
+
+
+def test_waveform_fields_choice(elsys, tmp_path):
+    run = run_from_tpc5(elsys, ELSYS_MAP, tmp_path, event_fields=["pzt_1"])
+    ep = EventProcessor(tmp_path / "exp.h5")
+    source = ep.open_sources(run)["elsys"]
+    everything = list(source.fields)
+    assert len(everything) > 1
+    idx = [index_at(run, 0.5)]
+    assert list(ep.extract_events(run, idx, window=0.05)[0]["waveform"]["elsys"]["channels"]) == ["pzt_1"]
+    e_all = ep.extract_events(run, idx, window=0.05, fields="all")[0]
+    assert list(e_all["waveform"]["elsys"]["channels"]) == everything
+    assert e_all["waveform"]["elsys"]["data"].shape[0] == len(everything)
+    chosen = ep.extract_events(run, idx, window=0.05, fields=[everything[-1], "nope"])[0]
+    assert list(chosen["waveform"]["elsys"]["channels"]) == [everything[-1]]
+    assert list(ep.extract_events(run, idx, window=0.05, fields=f"{everything[0]}, {everything[-1]}")[0]
+                ["waveform"]["elsys"]["channels"]) == [everything[0], everything[-1]]
+    missing = ep.extract_events(run, idx, window=0.05, fields=["nope"])[0]
+    assert "waveform" not in missing and any("none of the fields" in n for n in missing["notes"])
+    assert EventProcessor.waveform_fields(source, None) is None
