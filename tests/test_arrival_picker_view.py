@@ -463,3 +463,36 @@ def test_czm_and_pzt_view_read_the_record_arrivals(app):
         assert pv.window.trigger_time == pytest.approx(time[arrivals["picked_idx"][2]])
     finally:
         pv.on_close()
+
+
+def test_record_with_constant_levels_is_drawn_at_the_sensor_positions(app_with_strain):
+    """A stress record carries levels of tens of MPa: every trace still starts at
+    its sensor position, and the channel menus name the channels."""
+    from labquake_explorer.data.channels import channel_array, positions_table
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    names = ["shear_1_sigma_xy", "rosette_1_sigma_xx", "rosette_1_sigma_xy", "shear_2_sigma_xy"]
+    xs = [100.0, 250.0, 250.0, 400.0]
+    t = np.arange(-1000, 1001) / 1e6
+    step = lambda t0: -0.5 * (1 + np.tanh((t - t0) / 2e-5))             # a 1 MPa drop arriving at t0
+    levels = [2.4, 36.0, -18.0, -3.9]
+    data = np.vstack([level + step((x - 100.0) * 1e-3 / 1000.0) for level, x in zip(levels, xs)])
+    event.pop("strain", None)
+    event["waveform"] = {"elsys": channel_array(
+        data, names, unit="MPa", dtype=np.float64, time=float(event["event_time"]) + t, sample_rate=1e6, block=2,
+        positions=positions_table(names, {n: (x, 1.0, np.nan) for n, x in zip(names, xs)}))}
+    v = DynamicStrainArrivalPickerView(app_with_strain, 0, 2)
+    try:
+        assert v.locations == xs and v.enabled_channels == [True] * 4
+        lo, hi = sorted(v.axs[4].get_ylim())
+        for line, x in zip(v.lines, xs):
+            y = line.get_data()[1]
+            assert y[0] == pytest.approx(x, abs=1e-6)                    # starts on its dotted position line
+            assert lo < y.min() and y.max() < hi                         # and stays inside the panel
+        menu = v.enabled_channels_mb.menu
+        assert [menu.entrycget(i, "label") for i in range(4)] == [f"channel {i}: {n}" for i, n in enumerate(names)]
+        v.magic()                                                        # picks follow the front at 1000 m/s
+        v.update_fitted_line()
+        assert v.rupture_speed is not None
+    finally:
+        v.on_close()
+

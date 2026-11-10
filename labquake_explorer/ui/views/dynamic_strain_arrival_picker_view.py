@@ -30,7 +30,8 @@ from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.data.channels import aligned_fields, get_field
 from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
-                                            waveform_data, waveform_time, waveform_trigger_time, write_arrivals)
+                                            waveform_channels, waveform_data, waveform_time, waveform_trigger_time,
+                                            write_arrivals)
 
 # Experiments from this number on use the 16-channel layout with three
 # extra gauges at the ends of the fault; older ones use paired gauges.
@@ -336,6 +337,12 @@ class DynamicStrainArrivalPickerView(EventView):
         tt = waveform_time(strain) - event_time
         y = np.array(waveform_data(strain), dtype=float, copy=True)
         n_channels = y.shape[0]
+        if not legacy and y.shape[1]:
+            # draw every trace from its own level at the record's start (the mean of its first 1 %, the
+            # baseline the PSU layout removes when the event is cut): a channel carrying a constant level,
+            # such as a stress of tens of MPa, would otherwise be drawn far from its sensor position
+            head = max(1, y.shape[1] // 100)
+            y -= y[:, :head].mean(axis=1, keepdims=True)
 
         if self.enabled_channels is None or len(self.enabled_channels) != n_channels:
             self.enabled_channels = self.default_enabled_channels(n_channels, exp_number, legacy)
@@ -552,17 +559,27 @@ class DynamicStrainArrivalPickerView(EventView):
 
     # --------------------------------------------------------------- menus
     @staticmethod
-    def _fill_channel_menu(menubutton, flags, command):
+    def _fill_channel_menu(menubutton, flags, command, names=()):
+        """One checkbutton per channel, ``channel <i>``, followed by the channel's
+        name when the record gives one (``names``)."""
         menubutton.menu.delete(0, "end")
         menubutton.items = [tk.IntVar(value=int(bool(flag))) for flag in flags]
         for i, var in enumerate(menubutton.items):
-            menubutton.menu.add_checkbutton(label="channel %d" % i, variable=var, command=command)
+            name = names[i] if i < len(names) and names[i] != str(i) else ""
+            menubutton.menu.add_checkbutton(label=f"channel {i}: {name}" if name else "channel %d" % i,
+                                            variable=var, command=command)
+
+    def channel_names(self) -> list:
+        """The record's channel names; empty for the PSU layout, which has none."""
+        return [] if self.is_legacy_record() else waveform_channels(self.current_block())
 
     def init_enabled_channels_mb(self):
-        self._fill_channel_menu(self.enabled_channels_mb, self.enabled_channels, self.enabled_channels_changed)
+        self._fill_channel_menu(self.enabled_channels_mb, self.enabled_channels, self.enabled_channels_changed,
+                                self.channel_names())
 
     def init_fitting_channels_mb(self):
-        self._fill_channel_menu(self.fitting_channels_mb, self.fitting_channels, self.fitting_channels_changed)
+        self._fill_channel_menu(self.fitting_channels_mb, self.fitting_channels, self.fitting_channels_changed,
+                                self.channel_names())
 
     def enabled_channels_changed(self):
         self.enabled_channels = [bool(var.get()) for var in self.enabled_channels_mb.items]
