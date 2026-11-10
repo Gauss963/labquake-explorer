@@ -7,7 +7,9 @@ metadata the preprocessing wrote (``name``, ``date``, ``sample``, ``fault``,
 
 * ``analysis['fault']``: ``patch_x_mm`` and ``ends_x_mm``, the bare PMMA
   patch edges and where the fault ends, in the frame of the sensor positions;
-* ``analysis['medium']``: ``rho_kg_m3``, ``vp_m_s``, ``vs_m_s`` of the sample;
+* ``analysis['medium']``: ``rho_kg_m3``, ``vp_m_s``, ``vs_m_s`` of the sample,
+  and optionally its elastic constants ``E_Pa`` and ``nu`` (the Cohesive
+  Zone Model view takes the medium from here only when both are given);
 * ``analysis['pzt_spectrum']``: the PZT Spectrum view's last saved controls
   and per-sensor tables per result set (``sets[<name>]['settings']``,
   ``sets[<name>]['sensors']``) and the set last saved (``current_set``);

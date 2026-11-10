@@ -360,3 +360,116 @@ def test_close_unregisters(app_with_strain):
     assert v in app_with_strain.child_windows
     v.on_close()
     assert v not in app_with_strain.child_windows
+
+
+# ---------------------------------------------------------------- stress records, experiment medium
+MEDIUM = {"E_Pa": 7.662e9, "nu": 0.2, "rho_kg_m3": 1148.0}      # wave speeds follow: C_s 1667.6, C_d 2723.2 m/s
+TRUE = {"Cf": 200.0, "y": 1e-3, "Xc": 5e-3, "Gc": 2.0}
+
+
+def add_stress_record(app, event, with_positions=True):
+    """Replace the event's strain block by a waveform record in MPa computed from
+    the cohesive-zone model itself (``TRUE``, tip passing at the event time) and
+    give the experiment the medium it was computed with."""
+    from labquake_explorer.data.channels import channel_array, positions_table
+    from labquake_explorer.ui.views.czm_fitter_view import experiment_medium
+    from labquake_explorer.utils.cohesive_crack import CohesiveCrack
+    app.data_manager.data["analysis"] = {"medium": dict(MEDIUM)}
+    m = experiment_medium(app.data_manager.data)
+    t = np.arange(-2000, 2001) / 1e6
+    _, sxy, syy = CohesiveCrack.delta_sigmas(-t * TRUE["Cf"], TRUE["y"], TRUE["Xc"], TRUE["Cf"],
+                                             m["C_s"], m["C_d"], m["nu"], TRUE["Gc"], m["E"])
+    # more channels than DEFAULT_GAUGE, so that index stays valid and must not be what the view opens on
+    names = ["rosette_1_sigma_yy", "shear_1_sigma_xy", "rosette_1_sigma_xy"] + [f"spare_{i}_sigma_yy" for i in range(5)]
+    record = channel_array(np.vstack([syy, sxy + 3.0e6, sxy] + [syy] * 5) / 1e6, names, unit="MPa", dtype=np.float64,
+                           positions=positions_table(names, {n: (100.0, 1.0, np.nan) for n in names})
+                           if with_positions else None,
+                           time=float(event["event_time"]) + t, sample_rate=1e6, block=2)
+    event.pop("strain", None)
+    event.pop("czm_parms", None)
+    event["waveform"] = {"elsys": record}
+    return m
+
+
+def test_experiment_medium_rules():
+    from labquake_explorer.ui.views.czm_fitter_view import experiment_medium
+    assert experiment_medium({}) is None and experiment_medium({"analysis": {"medium": {}}}) is None
+    # the PZT view's medium (density and wave speeds only) does not define the CZM medium
+    assert experiment_medium({"analysis": {"medium": {"rho_kg_m3": 2650.0, "vp_m_s": 5000.0, "vs_m_s": 3000.0}}}) is None
+    assert experiment_medium({"analysis": {"medium": {"E_Pa": 7.662e9, "nu": 0.2}}}) is None   # no speeds, no density
+    m = experiment_medium({"analysis": {"medium": MEDIUM}})
+    assert m["E"] == 7.662e9 and m["nu"] == 0.2
+    assert m["C_s"] == pytest.approx(1667.6, abs=0.1) and m["C_d"] == pytest.approx(2723.2, abs=0.1)
+    given = experiment_medium({"analysis": {"medium": {"E_Pa": np.array(51e9), "nu": 0.25, "vs_m_s": 2760.0, "vp_m_s": 4790.0}}})
+    assert given == {"E": 51e9, "nu": 0.25, "C_s": 2760.0, "C_d": 4790.0}
+
+
+def test_volts_record_keeps_the_default_medium_and_saved_keys(app_with_strain, view):
+    assert not view.stress_mode and view.medium_source == "default"
+    assert (view.E, view.nu, view.C_s, view.C_d) == (51e9, 0.25, 2760, 4790)
+    assert view.channel_var.get() == "" and "default" in view.medium_var.get()
+    view.save_parameters()
+    assert set(view.event["czm_parms"]) == EXPECTED_KEYS
+
+
+def test_stress_record_is_fitted_as_stress(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    medium = add_stress_record(app_with_strain, event)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.stress_mode and v.medium_source == "experiment"
+        assert (v.E, v.nu, v.C_s, v.C_d) == (medium["E"], medium["nu"], medium["C_s"], medium["C_d"])
+        # opens on the first sigma_xy channel, at the sensor's distance, on the record's own span
+        assert v.strain_gauge.get() == 1 and v.channel_var.get() == "shear_1_sigma_xy"
+        assert v.y.get() == pytest.approx(1e-3)
+        assert v.axs[0].get_xlim() == pytest.approx((-2e-3, 2e-3))
+        assert positions(v) == pytest.approx([-1e-3, 0.0, 1e-3])
+        assert v.axs[0].get_ylabel() == "sigma_xy (MPa)" and v.axs[1].get_ylabel() == "sigma_yy (MPa)"
+        assert v.eyy_gauge() is None and any("no sigma_yy channel" in t.get_text() for t in v.axs[1].texts)
+        # the rosette's sigma_xy brings its sigma_yy into the lower panel
+        v.gauge_combobox.set("2")
+        v.update_plot()
+        assert v.eyy_gauge() == 0 and "sigma_yy" in [l.get_label() for l in v.axs[1].get_lines()]
+        v.set_event(1), v.set_event(2)                                    # coming back keeps the channel in use
+        assert v.strain_gauge.get() == 2
+        # with the true parameters the model lies on the record (zeroed at x_max, drawn in MPa)
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        measured, model = (l.get_ydata() for l in v.axs[0].get_lines() if l.get_label() in ("sigma_xy", "CZM"))
+        np.testing.assert_allclose(measured, model, atol=1e-6 * np.ptp(measured))
+        assert 0.05 < np.ptp(measured) < 50                               # MPa, not Pa
+        assert v.build_fit_objective()([TRUE["Gc"], TRUE["Xc"]]) < 1e-9
+        # from another starting point the fit comes back to them
+        v.Xc.set(8e-3), v.Gc.set(1.0)
+        result = v.fit_parameters()
+        assert result is not None and result.success and result.fun < 1e-3 * result.initial_fun
+        assert v.Gc.get() == pytest.approx(TRUE["Gc"], rel=0.05) and v.Xc.get() == pytest.approx(TRUE["Xc"], rel=0.05)
+        v.save_parameters()
+        saved = event["czm_parms"]
+        assert set(saved) == EXPECTED_KEYS | {"channel", "unit", "E", "nu", "C_s", "C_d", "tau_p"}
+        assert saved["channel"] == "rosette_1_sigma_xy" and saved["unit"] == "MPa" and saved["strain_gauge"] == 2
+        assert saved["E"] == medium["E"] and saved["C_s"] == medium["C_s"] and 1e4 < saved["tau_p"] < 1e8
+    finally:
+        v.on_close()
+    again = CZMFitterView(app_with_strain, 0, 2)                         # reopening restores channel and parameters
+    try:
+        assert again.strain_gauge.get() == 2 and again.Gc.get() == pytest.approx(saved["Gc"])
+        assert again.Xc.get() == pytest.approx(saved["Xc"]) and positions(again) == pytest.approx([-1e-3, 0.0, 1e-3])
+    finally:
+        again.on_close()
+
+
+def test_stress_record_without_positions_or_medium_uses_the_defaults(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event, with_positions=False)
+    del app_with_strain.data_manager.data["analysis"]
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.stress_mode and v.medium_source == "default" and v.E == 51e9
+        assert v.y.get() == pytest.approx(8e-3)
+        v.save_parameters()
+        assert event["czm_parms"]["unit"] == "MPa" and event["czm_parms"]["E"] == 51e9
+        v.set_event(1)                                                   # back on a volts record: strain again
+        assert not v.stress_mode and v.axs[0].get_ylabel() == "Exy"
+    finally:
+        v.on_close()

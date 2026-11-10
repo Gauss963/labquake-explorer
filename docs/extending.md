@@ -259,6 +259,15 @@ Dict with `Cf`, `y`, `Xc`, `Gc`, `x_min`, `x_tip`, `x_max`, `x_lim_min`,
 `x_lim_max`, `strain_gauge`; `Cf` defaults to `|rupture_speed|` when Pick
 Arrivals has saved one. A legacy list of eight values is still read.
 
+A record in volts is fitted as strain, with the view's default medium. A
+record stored in a stress unit (`Pa`, `kPa`, `MPa`, `GPa`: a recorder read
+through a `conversion`) is fitted as stress; an experiment sets its own
+medium with `analysis['medium']`: `E_Pa` and `nu`, plus the wave speeds
+(`vs_m_s`, `vp_m_s`) or the density `rho_kg_m3` they follow from. In either
+of those two cases the dict also holds `channel` (the channel's name),
+`unit`, the medium used (`E`, `nu`, `C_s`, `C_d`) and `tau_p` (Pa), the peak
+strength Gc and Xc imply at that `Cf`.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,
