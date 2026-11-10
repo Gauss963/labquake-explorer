@@ -11,9 +11,15 @@ Results are saved under ``event['czm_parms']`` as a dict.
 A record in volts is turned into strain and compared with the model's
 strains, as it always was.  A record already in a stress unit (``unit`` of
 ``Pa``, ``kPa``, ``MPa`` or ``GPa``: a recorder read through a conversion)
-is compared with the model's stresses directly, in MPa on the axes; the
-upper panel then opens on the first ``sigma_xy`` channel and the lower one
-shows the ``sigma_yy`` channel of the same sensor when the record has one.
+is compared with the model's stresses directly, in MPa on the axes.  Its
+channels are grouped by sensor through their names (``<sensor>_sigma_xy``,
+``_sigma_xx``, ``_sigma_yy``): the gauge box lists one entry per sensor (its
+``sigma_xy`` channel), three panels show the sensor's xy, xx and yy
+components, and ``Fit`` adjusts Gc and Xc to all the components ticked in
+the ``Fit`` boxes at once (a rosette: all three; a shear gauge: xy alone).
+sigma_xy is zeroed at x_max, sigma_xx and sigma_yy at x_min; the window is
+tip..max for every component.  sigma_xx and sigma_yy change sign with the
+side of the fault the sensor sits on: a negative ``y`` puts it on the other side.
 
 The elastic medium is the class default (E, nu, C_s, C_d below) unless the
 experiment gives its own: ``analysis['medium']`` with ``E_Pa`` and ``nu``
@@ -38,6 +44,8 @@ from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, 
 from labquake_explorer.utils.cohesive_crack import CohesiveCrack
 
 STRESS_UNITS = {"Pa": 1.0, "kPa": 1e3, "MPa": 1e6, "GPa": 1e9}   # Pa per unit of a record stored in stress
+COMPONENTS = ("xy", "xx", "yy")                                   # the panels of a stress record, top to bottom
+COMPONENT_STYLE = {"xy": "b-", "xx": "m-", "yy": "r-"}
 MEDIUM_SETTING = "medium"                                         # analysis['medium']: E_Pa, nu, vs_m_s, vp_m_s, rho_kg_m3
 
 
@@ -96,6 +104,7 @@ class CZMFitterView(EventView):
         self.line_positions = []
         self.vlines = []
         self.vlines_twin = []
+        self.vlines_other = []          # the marker lines of the panels below the second one (stress records)
         self.active_line_idx = None
         self.drag_active = False
         super().__init__(app, run_idx, event_idx)
@@ -135,6 +144,18 @@ class CZMFitterView(EventView):
         self.gauge_combobox.bind("<<ComboboxSelected>>", self.update_plot)
         self.channel_var = tk.StringVar(master=self)       # the selected channel's name, when the record names it
         ttk.Label(control_frame, textvariable=self.channel_var).grid(row=0, column=6, padx=5, sticky="w")
+
+        # which components of the selected sensor Fit uses (stress records only; hidden otherwise)
+        self.fit_frame = ttk.Frame(control_frame)
+        self.fit_frame.grid(row=0, column=7, padx=10, sticky="w")
+        ttk.Label(self.fit_frame, text="Fit:").pack(side=tk.LEFT, padx=2)
+        self.fit_vars, self.fit_boxes = {}, {}
+        for component in COMPONENTS:
+            self.fit_vars[component] = tk.BooleanVar(master=self, value=True)
+            self.fit_boxes[component] = ttk.Checkbutton(self.fit_frame, text=component,
+                                                        variable=self.fit_vars[component])
+            self.fit_boxes[component].pack(side=tk.LEFT)
+        self.fit_frame.grid_remove()
 
         # Filter controls
         filter_frame = ttk.Frame(control_frame)
@@ -251,11 +272,16 @@ class CZMFitterView(EventView):
             raise ValueError(f"{self.event_path} has no strain data (no waveform record or strain block) "
                              "to fit a cohesive zone model to")
         self.num_gauges = len(raw)
-        self.gauge_combobox.config(values=[str(i) for i in range(self.num_gauges)])
         block = self.strain_block(self.event)
         self.stress_scale = STRESS_UNITS.get(self.record_unit(block))
         names = waveform_channels(block)
         self.channel_names = names if names != [str(i) for i in range(self.num_gauges)] else []
+        self.gauge_combobox.config(values=[str(i) for i in self.gauge_choices()])
+        self.layout_axes(len(COMPONENTS) if self.stress_mode else 2)
+        if self.stress_mode:
+            self.fit_frame.grid()
+        else:
+            self.fit_frame.grid_remove()
         self.load_medium()
         default_gauge = self.default_gauge()
 
@@ -278,6 +304,11 @@ class CZMFitterView(EventView):
                 self.strain_gauge.set(int(gauge))
             else:
                 self.strain_gauge.set(default_gauge)
+            chosen = params.get('fit_components')
+            if chosen is not None:
+                chosen = {c.decode() if isinstance(c, bytes) else str(c) for c in np.atleast_1d(chosen)}
+            for component, var in self.fit_vars.items():
+                var.set(chosen is None or component in chosen)
         else:
             self._set_default_parameters()
             self.line_positions = []
@@ -326,6 +357,66 @@ class CZMFitterView(EventView):
         """The record's name for a channel index, '' when it has none."""
         return self.channel_names[gauge_idx] if 0 <= gauge_idx < len(self.channel_names) else ""
 
+    def gauge_choices(self) -> list:
+        """The channel indices the gauge box offers: every channel; for a stress
+        record whose channels are named by sensor, one per sensor (its ``sigma_xy``)."""
+        if self.stress_mode:
+            sensors = [i for i, name in enumerate(self.channel_names) if name.endswith("_sigma_xy")]
+            if sensors:
+                return sensors
+        return list(range(self.num_gauges))
+
+    def sensor_channels(self, gauge_idx=None) -> dict:
+        """``{component: channel index}`` of the sensor a channel of a stress
+        record belongs to: the channels named ``<sensor>_sigma_xy|xx|yy``.  A
+        channel not named that way stands alone as ``{'xy': index}``."""
+        gauge = int(self.strain_gauge.get()) if gauge_idx is None else int(gauge_idx)
+        sensor, sep, component = self.channel_name(gauge).rpartition("_sigma_")
+        if not sep or component not in COMPONENTS:
+            return {"xy": gauge}
+        found = {c: self.channel_names.index(f"{sensor}_sigma_{c}") for c in COMPONENTS
+                 if f"{sensor}_sigma_{c}" in self.channel_names}
+        return found if "xy" in found else {"xy": gauge}
+
+    def sensor_label(self) -> str:
+        """What the gauge box's selection stands for: the channel's name, or the
+        sensor and its components for a stress record (``rosette_1: xy, xx, yy``)."""
+        gauge = int(self.strain_gauge.get())
+        name = self.channel_name(gauge)
+        if not self.stress_mode or "_sigma_" not in name:
+            return name
+        channels = self.sensor_channels(gauge)
+        return f"{name.rpartition('_sigma_')[0]}: {', '.join(c for c in COMPONENTS if c in channels)}"
+
+    def panels(self) -> list:
+        """``(component, channel index or None)`` for each axes, top to bottom:
+        Exy and Eyy of a record in volts; sigma_xy, sigma_xx and sigma_yy of the
+        selected sensor of a stress record."""
+        if self.stress_mode:
+            channels = self.sensor_channels()
+            return [(c, channels.get(c)) for c in COMPONENTS]
+        return [("xy", int(self.strain_gauge.get())), ("yy", self.eyy_gauge())]
+
+    def fit_components(self) -> list:
+        """The components ``Fit`` compares with the model: xy alone for a record
+        in volts; for a stress record, those of the sensor that are ticked."""
+        if not self.stress_mode:
+            return ["xy"]
+        channels = self.sensor_channels()
+        return [c for c in COMPONENTS if c in channels and self.fit_vars[c].get()]
+
+    def layout_axes(self, n: int) -> None:
+        """Give the figure ``n`` shared-x panels (2 for volts, 3 for stress),
+        keeping the ones it has when the number does not change."""
+        if len(self.axs) == n:
+            return
+        self._clear_vlines()
+        self.figure.clear()
+        self.gs = self.figure.add_gridspec(n, hspace=0.3)
+        self.axs = self.gs.subplots(sharex=True)
+        for ax in self.axs:
+            ax.grid(True)
+
     def default_gauge(self) -> int:
         """The channel a fresh event opens on: ``DEFAULT_GAUGE`` (clipped to the
         record); for a stress record, its first ``sigma_xy`` channel when it names one."""
@@ -373,13 +464,14 @@ class CZMFitterView(EventView):
                 self.x_lim_min, self.x_lim_max = float(t[0]), float(t[-1])
 
     def _clear_vlines(self):
-        for line in self.vlines + self.vlines_twin:
+        for line in self.vlines + self.vlines_twin + [l for lines in self.vlines_other for l in lines]:
             try:
                 line.remove()
             except (ValueError, NotImplementedError):
                 pass
         self.vlines = []
         self.vlines_twin = []
+        self.vlines_other = []
 
     def current_line_positions(self):
         """x positions of the three marker lines (from the artists when present)."""
@@ -433,27 +525,30 @@ class CZMFitterView(EventView):
         of a record in volts; for a stress record, the ``sigma_yy`` channel of
         the selected sensor (the selected name with ``sigma_xy`` -> ``sigma_yy``)."""
         if self.stress_mode:
-            name = self.channel_name(self.strain_gauge.get())
-            twin = name.replace("sigma_xy", "sigma_yy")
-            return self.channel_names.index(twin) if twin != name and twin in self.channel_names else None
+            return self.sensor_channels().get("yy")
         return self.EYY_GAUGE if 0 <= self.EYY_GAUGE < self.num_gauges else None
 
     def _time(self):
         return waveform_time(self.strain_block(self.event)) - self.event["event_time"]
 
-    def _model_strains(self, t, x_tip, Xc, Gc):
-        """Cohesive-zone prediction along the gauge line at times ``t``, in the
-        quantity of :meth:`_strain`: (Exy, Eyy) strains, or (sigma_xy, sigma_yy)
-        in Pa for a stress record."""
+    def _model_components(self, t, x_tip, Xc, Gc) -> dict:
+        """Cohesive-zone prediction along the gauge line at times ``t`` as
+        ``{'xy', 'xx', 'yy'}``, in the quantity of :meth:`_strain`: strains, or
+        stresses in Pa for a stress record."""
         Cf = self.Cf.get()
         x_zeroed = -t * Cf + x_tip * Cf  # position relative to the tip, in meters
         delta_sigma_xx, delta_sigma_xy, delta_sigma_yy = CohesiveCrack.delta_sigmas(
             x_zeroed, self.y.get(), Xc, Cf, self.C_s, self.C_d, self.nu, Gc, self.E)
         if self.stress_mode:
-            return delta_sigma_xy, delta_sigma_yy
+            return {"xy": delta_sigma_xy, "xx": delta_sigma_xx, "yy": delta_sigma_yy}
         delta_e_xx, delta_e_xy, delta_e_yy = DataProcessor.stress_to_strain(
             self.E, self.nu, delta_sigma_xx, delta_sigma_xy, delta_sigma_yy)
-        return delta_e_xy, delta_e_yy
+        return {"xy": delta_e_xy, "xx": delta_e_xx, "yy": delta_e_yy}
+
+    def _model_strains(self, t, x_tip, Xc, Gc):
+        """The (xy, yy) pair of :meth:`_model_components`."""
+        model = self._model_components(t, x_tip, Xc, Gc)
+        return model["xy"], model["yy"]
 
     # ----------------------------------------------------------------- plot
     def update_plot(self, event=None):
@@ -465,42 +560,43 @@ class CZMFitterView(EventView):
 
         t = self._time()
         gauge = self.strain_gauge.get()
-        exy = self._strain(gauge)
-        eyy_gauge = self.eyy_gauge()
-        self.channel_var.set(self.channel_name(gauge))
-        # a stress record is drawn in MPa; strains as they are
-        scale, xy_label, yy_label = (1e-6, 'sigma_xy', 'sigma_yy') if self.stress_mode else (1.0, 'Exy', 'Eyy')
+        self.channel_var.set(self.sensor_label())
+        if self.stress_mode:                               # only the components the sensor has can be ticked
+            available = self.sensor_channels()
+            for component, box in self.fit_boxes.items():
+                box.state(["!disabled"] if component in available else ["disabled"])
+        scale = 1e-6 if self.stress_mode else 1.0          # a stress record is drawn in MPa; strains as they are
 
-        idx_zero_xy = int(np.argmin(np.abs(t - line_positions[2])))
-        idx_zero_yy = int(np.argmin(np.abs(t - line_positions[0])))
-        self.axs[0].plot(t, (exy - exy[idx_zero_xy]) * scale, 'b-', label=xy_label)
-
-        delta_e_xy, delta_e_yy = self._model_strains(t, line_positions[1], self.Xc.get(), self.Gc.get())
-        delta_e_xy = delta_e_xy - delta_e_xy[idx_zero_xy]
-        delta_e_yy = delta_e_yy - delta_e_yy[idx_zero_yy]
-        self.axs[0].plot(t, delta_e_xy * scale, 'g--', label='CZM')
-        if eyy_gauge is not None:
-            eyy = self._strain(eyy_gauge)
-            self.axs[1].plot(t, (eyy - eyy[idx_zero_yy]) * scale, 'r-', label=yy_label)
-            self.axs[1].plot(t, delta_e_yy * scale, 'g--', label='CZM')
-        elif self.stress_mode:
-            self.axs[1].text(0.5, 0.5, f"no sigma_yy channel for {self.channel_name(gauge) or f'channel {gauge}'}",
-                             ha='center', va='center', transform=self.axs[1].transAxes, color='gray')
-        else:
-            self.axs[1].text(0.5, 0.5, f"no Eyy gauge: channel {self.EYY_GAUGE} missing "
-                                       f"({self.num_gauges} strain channels)",
-                             ha='center', va='center', transform=self.axs[1].transAxes, color='gray')
-
-        self.axs[1].set_xlabel('Time (s)')
-        self.axs[0].set_ylabel(f'{xy_label} (MPa)' if self.stress_mode else xy_label)
-        self.axs[1].set_ylabel(f'{yy_label} (MPa)' if self.stress_mode else yy_label)
+        # xy is zeroed at x_max (the level behind the front), the other components at x_min (before it arrives)
+        idx_zero = {"xy": int(np.argmin(np.abs(t - line_positions[2])))}
+        idx_zero["xx"] = idx_zero["yy"] = int(np.argmin(np.abs(t - line_positions[0])))
+        model = self._model_components(t, line_positions[1], self.Xc.get(), self.Gc.get())
+        for ax, (component, channel) in zip(self.axs, self.panels()):
+            label = f"sigma_{component}" if self.stress_mode else f"E{component}"
+            zero = idx_zero[component]
+            if channel is not None:
+                measured = self._strain(channel)
+                ax.plot(t, (measured - measured[zero]) * scale, COMPONENT_STYLE[component], label=label)
+                ax.plot(t, (model[component] - model[component][zero]) * scale, 'g--', label='CZM')
+            elif self.stress_mode:
+                ax.text(0.5, 0.5, f"no {label} channel for {self.channel_name(gauge) or f'channel {gauge}'}",
+                        ha='center', va='center', transform=ax.transAxes, color='gray')
+            else:
+                ax.text(0.5, 0.5, f"no Eyy gauge: channel {self.EYY_GAUGE} missing "
+                                  f"({self.num_gauges} strain channels)",
+                        ha='center', va='center', transform=ax.transAxes, color='gray')
+            ax.set_ylabel(f"{label} (MPa)" if self.stress_mode else label)
+        self.axs[-1].set_xlabel('Time (s)')
         self.figure.suptitle(self.figure_title())
 
         self.vlines = []
         self.vlines_twin = []
+        self.vlines_other = [[] for _ in self.axs[2:]]
         for x_pos in line_positions:
             self.vlines.append(self.axs[0].axvline(x=x_pos, color='g', linestyle='--', alpha=0.5))
             self.vlines_twin.append(self.axs[1].axvline(x=x_pos, color='g', linestyle='--', alpha=0.5))
+            for ax, lines in zip(self.axs[2:], self.vlines_other):
+                lines.append(ax.axvline(x=x_pos, color='g', linestyle='--', alpha=0.5))
         self.line_positions = list(line_positions)
 
         for ax in self.axs:
@@ -537,16 +633,21 @@ class CZMFitterView(EventView):
         new_x = float(new_x)
         self.vlines[idx].set_xdata([new_x, new_x])
         self.vlines_twin[idx].set_xdata([new_x, new_x])
+        for lines in self.vlines_other:
+            lines[idx].set_xdata([new_x, new_x])
         self.update_plot()
 
     # ------------------------------------------------------------------ fit
     def build_fit_objective(self):
-        """Return ``objective([Gc, Xc])`` for the Exy data between the tip and max lines.
+        """Return ``objective([Gc, Xc])`` for the data between the tip and max lines.
 
-        The objective is the sum of squared residuals (in nano-strain; in kPa
-        for a stress record) between the zeroed measured Exy and the
-        cohesive-zone prediction over the tip..max window.  Returns None when the three marker lines are not
-        available or no samples lie inside the window.
+        A record in volts: the sum of squared residuals (in nano-strain)
+        between the zeroed measured Exy and the cohesive-zone prediction over
+        the tip..max window.  A stress record: the same sum (in kPa) over every
+        component of :meth:`fit_components` at once, sigma_xy zeroed at x_max
+        and sigma_xx, sigma_yy at x_min, as they are drawn.  Returns None when
+        the three marker lines are not available, no samples lie inside the
+        window, or no component is ticked.
         """
         if len(self.vlines) < 3:
             print("Need 3 vertical lines to define fitting region")
@@ -560,11 +661,13 @@ class CZMFitterView(EventView):
             print("No samples between the tip and max lines")
             return None
         t_fit = t[mask]
+        if self.stress_mode:
+            return self.build_joint_objective(t, t_fit, mask, t0, t1, t2)
         exy_fit = exy[mask]
         idx_zero = int(np.argmin(np.abs(t_fit - t2)))
         exy_fit = exy_fit - exy_fit[idx_zero]
 
-        residual_scale = 1e-3 if self.stress_mode else 1e9   # Pa -> kPa, strain -> nano-strain
+        residual_scale = 1e9   # strain -> nano-strain
 
         def objective(params):
             Gc, Xc = params
@@ -574,8 +677,37 @@ class CZMFitterView(EventView):
 
         return objective
 
+    def build_joint_objective(self, t, t_fit, mask, t0, t1, t2):
+        """The objective of a stress record: every ticked component of the
+        selected sensor over the window, each minus its value at its zero line
+        (xy: ``t2``, x_max; xx and yy: ``t0``, x_min), residuals in kPa."""
+        components = self.fit_components()
+        if not components:
+            print("No component ticked to fit")
+            return None
+        channels = self.sensor_channels()
+        i_min, i_max = int(np.argmin(np.abs(t - t0))), int(np.argmin(np.abs(t - t2)))
+        targets = {}
+        for component in components:
+            measured = self._strain(channels[component])
+            targets[component] = measured[mask] - measured[i_max if component == "xy" else i_min]
+        t_model = np.concatenate([t_fit, [t[i_min], t[i_max]]])     # the window, then the two zero points
+
+        def objective(params):
+            Gc, Xc = params
+            model = self._model_components(t_model, t1, Xc, Gc)
+            total = 0.0
+            for component in components:
+                values = model[component]
+                zeroed = values[:-2] - (values[-1] if component == "xy" else values[-2])
+                total += float(np.sum(((targets[component] - zeroed) * 1e-3) ** 2))    # Pa -> kPa
+            return total
+
+        return objective
+
     def fit_parameters(self):
-        """Fit Gc and Xc to the Exy data between the tip and max lines.
+        """Fit Gc and Xc to the data between the tip and max lines (see
+        :meth:`build_fit_objective`).
 
         Returns the scipy ``OptimizeResult`` (with ``initial_fun`` added: the
         objective at the starting guess), or None if no fit could be set up.
@@ -608,12 +740,17 @@ class CZMFitterView(EventView):
         return results
 
     def fit_context(self) -> dict:
-        """What the parameters were fitted to and with: the channel's name, the
-        record's unit, the elastic medium, and the peak strength ``tau_p`` (Pa)
-        that Gc and Xc imply at this Cf."""
+        """What the parameters were fitted to and with: the channel's name (the
+        sensor's ``sigma_xy`` channel for a stress record), the record's unit,
+        the elastic medium, the components fitted together (stress records)
+        and the peak strength ``tau_p`` (Pa) that Gc and Xc imply at this Cf."""
         gauge = int(self.strain_gauge.get())
+        if self.stress_mode:
+            gauge = self.sensor_channels(gauge)["xy"]
         context = {"channel": self.channel_name(gauge), "unit": self.record_unit(self.strain_block(self.event)),
                    "E": float(self.E), "nu": float(self.nu), "C_s": float(self.C_s), "C_d": float(self.C_d)}
+        if self.stress_mode and self.fit_components():
+            context["fit_components"] = self.fit_components()
         with np.errstate(all="ignore"):
             Cf = self.Cf.get()
             alpha_s, alpha_d = CohesiveCrack.alpha_s(Cf, self.C_s), CohesiveCrack.alpha_d(Cf, self.C_d)

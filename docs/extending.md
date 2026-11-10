@@ -268,6 +268,12 @@ of those two cases the dict also holds `channel` (the channel's name),
 `unit`, the medium used (`E`, `nu`, `C_s`, `C_d`) and `tau_p` (Pa), the peak
 strength Gc and Xc imply at that `Cf`.
 
+A stress record's channels are grouped by sensor through their names
+(`<sensor>_sigma_xy`, `_sigma_xx`, `_sigma_yy`). The view shows the three
+components of the selected sensor and fits Gc and Xc to the ticked ones at
+once; `fit_components` records which (`['xy', 'xx', 'yy']` for a rosette,
+`['xy']` for a shear gauge), and `channel` is the sensor's `sigma_xy` channel.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,
