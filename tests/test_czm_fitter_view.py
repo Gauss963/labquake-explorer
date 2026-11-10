@@ -511,7 +511,7 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.save_parameters()
         saved = event["czm_parms"]
         assert set(saved) == EXPECTED_KEYS | {"channel", "sensor", "unit", "E", "nu", "C_s", "C_d", "tau_p",
-                                              "fit_components"}
+                                              "fit_components", "x_base"}
         assert saved["sensor"] == "rosette_1" and saved["channel"] == "rosette_1_sigma_xy"
         assert saved["unit"] == "MPa" and saved["strain_gauge"] == 2
         assert saved["fit_components"] == ["xy", "xx"]
@@ -561,3 +561,152 @@ def test_stress_record_with_unnamed_sensors_fits_the_selected_channel(app_with_s
         assert v.build_fit_objective()([TRUE["Gc"], TRUE["Xc"]]) < 1e-9
     finally:
         v.on_close()
+
+
+# ---------------------------------------------------------------- background window, model line, Auto
+def test_rayleigh_speed():
+    from labquake_explorer.ui.views.czm_fitter_view import rayleigh_speed
+    from labquake_explorer.utils.cohesive_crack import CohesiveCrack
+    c_s, c_d = 1667.6, 2723.2
+    c_r = rayleigh_speed(c_s, c_d)
+    assert 0.90 * c_s < c_r < 0.93 * c_s
+    assert abs(CohesiveCrack.D(CohesiveCrack.alpha_s(c_r, c_s), CohesiveCrack.alpha_d(c_r, c_d))) < 1e-9
+    assert 0.90 * 2760 < rayleigh_speed(2760.0, 4790.0) < 0.93 * 2760
+
+
+def test_stress_traces_start_at_zero_on_the_background_window(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)                             # levels of +3, +40 and -60 MPa
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("rosette_1")
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        t = v._time()
+        # the window runs from the record's start to the left line, drawn as a band with a dotted line at its start
+        assert v.x_base is None and v.baseline_window(t, positions(v)) == pytest.approx((-2e-3, -1e-3))
+        assert len(v.base_lines) == 3 and float(v.base_lines[0].get_xdata()[0]) == pytest.approx(-2e-3)
+        inside = (t >= -2e-3) & (t <= -1e-3)
+        for ax, component in zip(v.axs, ("xy", "xx", "yy")):
+            measured = drawn(ax, f"sigma_{component}")
+            assert abs(np.mean(measured[inside])) < 1e-3                  # MPa: every trace starts at 0
+            assert np.abs(measured).max() < 50                            # the 40 / 60 MPa levels are gone
+        # the model: black, solid, above the data
+        model = next(l for l in v.axs[0].get_lines() if l.get_label() == "CZM")
+        data = next(l for l in v.axs[0].get_lines() if l.get_label() == "sigma_xy")
+        assert model.get_color() == "k" and model.get_linestyle() == "-" and model.get_zorder() > data.get_zorder()
+        # moving the start of the window, by hand and with the mouse
+        v.move_baseline(-1.5e-3)
+        assert v.x_base == pytest.approx(-1.5e-3) and v.baseline_window(t, positions(v)) == pytest.approx((-1.5e-3, -1e-3))
+        dispatch(v, "button_press_event", -1.5e-3)
+        assert v.drag_base and not v.drag_active
+        dispatch(v, "motion_notify_event", -1.8e-3)
+        dispatch(v, "button_release_event", -1.8e-3)
+        assert v.x_base == pytest.approx(-1.8e-3, abs=2e-5) and not v.drag_base
+        assert positions(v) == pytest.approx([-1e-3, 0.0, 1e-3])          # the three lines did not move
+        v.save_parameters()
+        assert event["czm_parms"]["x_base"] == pytest.approx(-1.8e-3, abs=2e-5)
+    finally:
+        v.on_close()
+    again = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert again.x_base == pytest.approx(-1.8e-3, abs=2e-5)           # restored with the event
+    finally:
+        again.on_close()
+
+
+def test_single_noisy_samples_do_not_shift_the_curves(app_with_strain):
+    """Levels come from windows, not single samples: noise on the record moves
+    the drawn traces by far less than its own size."""
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    record = event["waveform"]["elsys"]
+    clean = record["data"].copy()
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("rosette_1")
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        reference = drawn(v.axs[0], "CZM").copy()
+        record["data"] = clean + np.random.default_rng(1).normal(0.0, 0.05, clean.shape)     # 0.05 MPa of noise
+        v.update_plot()
+        assert np.abs(drawn(v.axs[0], "CZM") - reference).max() < 0.02    # the model moved by a fraction of it
+    finally:
+        v.on_close()
+
+
+def moving_front_record(app, event, speed=200.0, saved_speed=None):
+    """A stress record of three shear gauges 100 mm apart that the same front
+    reaches one after the other at ``speed`` (the middle one at the event time)."""
+    from labquake_explorer.data.channels import channel_array, positions_table
+    from labquake_explorer.ui.views.czm_fitter_view import experiment_medium
+    from labquake_explorer.utils.cohesive_crack import CohesiveCrack
+    app.data_manager.data["analysis"] = {"medium": dict(MEDIUM)}
+    m = experiment_medium(app.data_manager.data)
+    t = np.arange(-3000, 3001) / 1e6
+    names, xs = ["shear_1_sigma_xy", "shear_2_sigma_xy", "shear_3_sigma_xy"], [100.0, 200.0, 300.0]
+    rows = []
+    for x in xs:
+        delay = (x - 200.0) * 1e-3 / speed
+        _, sxy, _ = CohesiveCrack.delta_sigmas(-(t - delay) * TRUE["Cf"], TRUE["y"], TRUE["Xc"], TRUE["Cf"],
+                                               m["C_s"], m["C_d"], m["nu"], TRUE["Gc"], m["E"])
+        rows.append(sxy + 2.0e6)
+    record = channel_array(np.vstack(rows) / 1e6, names, unit="MPa", dtype=np.float64,
+                           positions=positions_table(names, {n: (x, 1.0, np.nan) for n, x in zip(names, xs)}),
+                           time=float(event["event_time"]) + t, sample_rate=1e6, block=2)
+    if saved_speed is not None:
+        record["arrivals"] = {"version": 1, "rupture_speed": saved_speed}
+    event.pop("strain", None)
+    event.pop("czm_parms", None)
+    event["waveform"] = {"elsys": record}
+
+
+def test_auto_gives_a_starting_point_and_fits(app_with_strain):
+    from labquake_explorer.ui.views.czm_fitter_view import CF_LIMIT, rayleigh_speed
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    moving_front_record(app_with_strain, event, speed=200.0)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.auto_button.winfo_manager() and v.Cf.get() == 10          # nothing saved: the fallback speed
+        assert v.estimate_rupture_speed() == pytest.approx(200.0, rel=0.02)   # from the three sensors' fronts
+        v.gauge_combobox.set("shear_2")
+        result = v.auto_fit()
+        assert result is not None and result.success
+        assert v.Cf.get() == pytest.approx(200.0, rel=0.02)
+        left, tip, end = positions(v)
+        assert left < tip < end and abs(tip) < 5e-5                         # the tip line on the front at the event time
+        assert 1e-5 < end - tip < 2e-4 and v.x_base is None
+        lo, hi = v.axs[0].get_xlim()
+        assert -3e-3 <= lo < left and end < hi <= 3e-3                      # zoomed on the lines, inside the record
+        # a usable starting point: the fit lands within a factor of two of the parameters the record was made with
+        assert 0.5 * TRUE["Gc"] < v.Gc.get() < 2 * TRUE["Gc"] and 0.5 * TRUE["Xc"] < v.Xc.get() < 2 * TRUE["Xc"]
+        assert result.fun <= result.initial_fun
+    finally:
+        v.on_close()
+    # the speed Pick Arrivals saved wins over the estimate
+    moving_front_record(app_with_strain, event, speed=200.0, saved_speed=-350.0)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.estimate_rupture_speed() == pytest.approx(350.0)
+        v.auto_fit()
+        assert v.Cf.get() == pytest.approx(350.0)
+    finally:
+        v.on_close()
+    # a front faster than the Rayleigh speed: Cf is kept just below it, where the model exists
+    moving_front_record(app_with_strain, event, speed=5000.0)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        result = v.auto_fit()
+        limit = CF_LIMIT * rayleigh_speed(v.C_s, v.C_d)
+        assert v.Cf.get() == pytest.approx(limit) and result is not None
+        v.Cf.set(1.01 * rayleigh_speed(v.C_s, v.C_d))                       # above it: said on the plot, no fit
+        v.update_plot()
+        assert any("no model" in text.get_text() for text in v.axs[0].texts) and v.fit_parameters() is None
+    finally:
+        v.on_close()
+
+
+def test_auto_is_for_stress_records(app_with_strain, view):
+    assert not view.auto_button.winfo_manager() and view.auto_fit() is None
+    assert view.base_lines == [] and view.x_base is None
+

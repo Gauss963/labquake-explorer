@@ -277,6 +277,15 @@ rosette, `['xy']` for a shear gauge), and `channel` is the sensor's
 `sigma_xy` channel. Pick Arrivals starts such a record with one trace per
 sensor (its `sigma_xy`); the menus switch the other components on.
 
+Levels of a stress record: the mean of each component over the background
+window (from `x_base`, the record's start unless moved, to the left marker
+line) is removed, so every trace starts at 0; the model's `sigma_xx` and
+`sigma_yy` are referred to the same window and its `sigma_xy`, which is zero
+at the residual level, is attached to the measured trace at `x_max`. `Auto`
+sets `Cf` (the saved arrivals, else the fronts at the record's sensors, kept
+below the Rayleigh speed), the lines, and starting values of `Xc` and `Gc`,
+then fits. `x_base` is saved with the other keys.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,

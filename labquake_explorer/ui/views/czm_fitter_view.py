@@ -18,9 +18,20 @@ has by name (``shear_1``, ``rosette_1``, ...: five entries for three shear
 gauges and two rosettes, whatever the number of channels), three panels show the sensor's xy, xx and yy
 components, and ``Fit`` adjusts Gc and Xc to all the components ticked in
 the ``Fit`` boxes at once (a rosette: all three; a shear gauge: xy alone).
-sigma_xy is zeroed at x_max, sigma_xx and sigma_yy at x_min; the window is
-tip..max for every component.  sigma_xx and sigma_yy change sign with the
-side of the fault the sensor sits on: a negative ``y`` puts it on the other side.
+sigma_xx and sigma_yy change sign with the side of the fault the sensor
+sits on: a negative ``y`` puts it on the other side.
+
+Levels of a stress record.  The grey band, from the dotted baseline line to
+the left marker line, is the background window: the mean of each component
+over it is removed, so every trace starts at 0 MPa.  The model's sigma_xx
+and sigma_yy are referred to the same window.  The model's sigma_xy is zero
+at the residual level behind the front, so it is attached to the measured
+trace at x_max (its mean over the Filter Window around that line).  The fit
+window is tip..max for every component.  ``Auto`` gives a starting point:
+it takes ``Cf`` from the saved arrivals or from the fronts at the record's
+sensors (kept below the Rayleigh speed), places the lines on the selected
+sensor's front, derives Xc and Gc from the duration and size of the drop,
+and runs the fit.
 
 The elastic medium is the class default (E, nu, C_s, C_d below) unless the
 experiment gives its own: ``analysis['medium']`` with ``E_Pa`` and ``nu``
@@ -47,6 +58,18 @@ from labquake_explorer.utils.cohesive_crack import CohesiveCrack
 STRESS_UNITS = {"Pa": 1.0, "kPa": 1e3, "MPa": 1e6, "GPa": 1e9}   # Pa per unit of a record stored in stress
 COMPONENTS = ("xy", "xx", "yy")                                   # the panels of a stress record, top to bottom
 COMPONENT_STYLE = {"xy": "b-", "xx": "m-", "yy": "r-"}
+MODEL_STYLE = {"color": "k", "linestyle": "-", "linewidth": 1.8, "zorder": 5}   # the CZM curve, on top of the data
+CF_LIMIT = 0.98                                                   # Auto keeps Cf below this fraction of the Rayleigh speed
+
+
+def rayleigh_speed(c_s: float, c_d: float) -> float:
+    """The Rayleigh wave speed of a medium: the speed below ``c_s`` at which
+    ``D = 4 alpha_s alpha_d - (1 + alpha_s^2)^2`` vanishes.  The steady
+    cohesive-zone solution exists only for rupture speeds below it."""
+    def d(c):
+        a_s, a_d = np.sqrt(1 - (c / c_s) ** 2), np.sqrt(1 - (c / c_d) ** 2)
+        return 4 * a_s * a_d - (1 + a_s ** 2) ** 2
+    return float(optimize.brentq(d, 0.3 * c_s, c_s * (1 - 1e-9)))
 MEDIUM_SETTING = "medium"                                         # analysis['medium']: E_Pa, nu, vs_m_s, vp_m_s, rho_kg_m3
 
 
@@ -106,6 +129,9 @@ class CZMFitterView(EventView):
         self.vlines = []
         self.vlines_twin = []
         self.vlines_other = []          # the marker lines of the panels below the second one (stress records)
+        self.x_base = None              # where the background window of a stress record starts (None: the record's start)
+        self.base_lines = []            # the dotted line at x_base, one per panel
+        self.drag_base = False
         self.active_line_idx = None
         self.drag_active = False
         super().__init__(app, run_idx, event_idx)
@@ -203,6 +229,7 @@ class CZMFitterView(EventView):
 
         button_frame = ttk.Frame(params_frame)
         button_frame.pack(side=tk.LEFT, padx=10)
+        self.auto_button = ttk.Button(button_frame, text="Auto", command=self.auto_fit)   # stress records only
         self.update_button = ttk.Button(button_frame, text="Update", command=self.update_plot)
         self.update_button.pack(side=tk.LEFT, padx=5)
         self.fit_button = ttk.Button(button_frame, text="Fit", command=self.fit_parameters)
@@ -288,8 +315,11 @@ class CZMFitterView(EventView):
         self.layout_axes(len(COMPONENTS) if self.stress_mode else 2)
         if self.stress_mode:
             self.fit_frame.grid()
+            self.auto_button.pack(side=tk.LEFT, padx=5, before=self.update_button)
         else:
             self.fit_frame.grid_remove()
+            self.auto_button.pack_forget()
+        self.x_base = None
         self.load_medium()
         default_gauge = self.default_gauge()
 
@@ -317,6 +347,10 @@ class CZMFitterView(EventView):
                 chosen = {c.decode() if isinstance(c, bytes) else str(c) for c in np.atleast_1d(chosen)}
             for component, var in self.fit_vars.items():
                 var.set(chosen is None or component in chosen)
+            try:
+                self.x_base = float(params['x_base']) if self.stress_mode and 'x_base' in params else None
+            except (TypeError, ValueError):
+                self.x_base = None
         else:
             self._set_default_parameters()
             self.line_positions = []
@@ -358,8 +392,11 @@ class CZMFitterView(EventView):
             self.medium_source = "experiment"
         compared = (f"stress record ({self.record_unit(self.strain_block(self.event))}) against the model's stress"
                     if self.stress_mode else "strain from the record's volts against the model's strain")
-        self.medium_var.set(f"{compared};  medium ({self.medium_source}): E = {self.E / 1e9:.4g} GPa, "
-                            f"nu = {self.nu:.3g}, C_s = {self.C_s:.0f} m/s, C_d = {self.C_d:.0f} m/s")
+        text = (f"{compared};  medium ({self.medium_source}): E = {self.E / 1e9:.4g} GPa, "
+                f"nu = {self.nu:.3g}, C_s = {self.C_s:.0f} m/s, C_d = {self.C_d:.0f} m/s")
+        if self.stress_mode:
+            text += f", C_R = {rayleigh_speed(self.C_s, self.C_d):.0f} m/s (Cf must stay below it)"
+        self.medium_var.set(text)
 
     def channel_name(self, gauge_idx) -> str:
         """The record's name for a channel index, '' when it has none."""
@@ -387,6 +424,14 @@ class CZMFitterView(EventView):
         name = next((n for n, i in sensors.items() if i == xy), next(iter(sensors)))
         self.strain_gauge.set(sensors[name])
         self.sensor_var.set(name)
+
+    def sync_gauge(self) -> str:
+        """Make ``strain_gauge`` follow the gauge box when it lists sensors (the
+        selected sensor's sigma_xy channel); returns the sensor's name, or ''."""
+        sensor = self.selected_sensor()
+        if sensor:
+            self.strain_gauge.set(self.sensors()[sensor])
+        return sensor
 
     def selected_sensor(self) -> str:
         """The name of the selected sensor, '' when the box lists channels."""
@@ -489,7 +534,8 @@ class CZMFitterView(EventView):
                 self.x_lim_min, self.x_lim_max = float(t[0]), float(t[-1])
 
     def _clear_vlines(self):
-        for line in self.vlines + self.vlines_twin + [l for lines in self.vlines_other for l in lines]:
+        for line in (self.vlines + self.vlines_twin + [l for lines in self.vlines_other for l in lines]
+                     + self.base_lines):
             try:
                 line.remove()
             except (ValueError, NotImplementedError):
@@ -497,6 +543,50 @@ class CZMFitterView(EventView):
         self.vlines = []
         self.vlines_twin = []
         self.vlines_other = []
+        self.base_lines = []
+
+    def set_lines(self, positions) -> None:
+        """Put the three marker lines at ``positions`` (the artists when drawn)."""
+        positions = [float(p) for p in positions]
+        self.line_positions = list(positions)
+        for lines in [self.vlines, self.vlines_twin] + list(self.vlines_other):
+            for line, x in zip(lines, positions):
+                line.set_xdata([x, x])
+
+    # ------------------------------------------------ levels of a stress record
+    def baseline_window(self, t, positions) -> tuple:
+        """``(start, end)`` of the background window: from ``x_base`` (the
+        record's start when it was never moved) to the left marker line."""
+        end = min(positions)
+        start = float(t[0]) if self.x_base is None else float(self.x_base)
+        return (start, end) if start <= end else (end, start)
+
+    def baseline_mask(self, t, positions) -> np.ndarray:
+        """The samples of the background window; the one nearest to its end
+        when the window holds none."""
+        start, end = self.baseline_window(t, positions)
+        mask = (t >= start) & (t <= end)
+        if not mask.any():
+            mask[int(np.argmin(np.abs(t - end)))] = True
+        return mask
+
+    def level_window(self, index: int) -> slice:
+        """The samples a level is read over at one line: the Filter Window
+        centred on ``index`` (noise on a single sample would shift the curve)."""
+        half = max(self._filter_window_length() // 2, 0)
+        return slice(max(index - half, 0), index + half + 1)
+
+    def referenced(self, component, measured, model, base, i_max):
+        """A stress component and its model on the levels they are compared on:
+        the measured trace minus its background (mean over ``base``); the
+        model's sigma_xx and sigma_yy minus theirs; the model's sigma_xy
+        attached to the measured trace at ``i_max`` (x_max): both averaged
+        over :meth:`level_window` there."""
+        data = measured - float(np.mean(measured[base]))
+        if component == "xy":
+            window = self.level_window(i_max)
+            return data, model - float(np.mean(model[window])) + float(np.mean(data[window]))
+        return data, model - float(np.mean(model[base]))
 
     def current_line_positions(self):
         """x positions of the three marker lines (from the artists when present)."""
@@ -584,9 +674,7 @@ class CZMFitterView(EventView):
             ax.clear()
 
         t = self._time()
-        sensor = self.selected_sensor()
-        if sensor:                                         # the box holds a sensor's name: its sigma_xy channel
-            self.strain_gauge.set(self.sensors()[sensor])
+        sensor = self.sync_gauge()
         gauge = self.strain_gauge.get()
         self.channel_var.set(self.sensor_label())
         if self.stress_mode:                               # only the components the sensor has can be ticked
@@ -595,17 +683,29 @@ class CZMFitterView(EventView):
                 box.state(["!disabled"] if component in available else ["disabled"])
         scale = 1e-6 if self.stress_mode else 1.0          # a stress record is drawn in MPa; strains as they are
 
-        # xy is zeroed at x_max (the level behind the front), the other components at x_min (before it arrives)
-        idx_zero = {"xy": int(np.argmin(np.abs(t - line_positions[2])))}
-        idx_zero["xx"] = idx_zero["yy"] = int(np.argmin(np.abs(t - line_positions[0])))
-        model = self._model_components(t, line_positions[1], self.Xc.get(), self.Gc.get())
+        if self.stress_mode:
+            # every trace minus its background; see ``referenced`` for the model's levels
+            x_min, x_tip, x_max = sorted(line_positions)
+            base = self.baseline_mask(t, line_positions)
+            i_max = int(np.argmin(np.abs(t - x_max)))
+        else:
+            # Exy is zeroed at x_max (the level behind the front), Eyy at x_min (before it arrives)
+            x_tip = line_positions[1]
+            idx_zero = {"xy": int(np.argmin(np.abs(t - line_positions[2])))}
+            idx_zero["xx"] = idx_zero["yy"] = int(np.argmin(np.abs(t - line_positions[0])))
+        with np.errstate(all="ignore"):
+            model = self._model_components(t, x_tip, self.Xc.get(), self.Gc.get())
         for ax, (component, channel) in zip(self.axs, self.panels()):
             label = f"sigma_{component}" if self.stress_mode else f"E{component}"
-            zero = idx_zero[component]
             if channel is not None:
                 measured = self._strain(channel)
-                ax.plot(t, (measured - measured[zero]) * scale, COMPONENT_STYLE[component], label=label)
-                ax.plot(t, (model[component] - model[component][zero]) * scale, 'g--', label='CZM')
+                if self.stress_mode:
+                    data, curve = self.referenced(component, measured, model[component], base, i_max)
+                else:
+                    zero = idx_zero[component]
+                    data, curve = measured - measured[zero], model[component] - model[component][zero]
+                ax.plot(t, data * scale, COMPONENT_STYLE[component], label=label, linewidth=0.8, zorder=2)
+                ax.plot(t, curve * scale, label='CZM', **MODEL_STYLE)
             elif self.stress_mode:
                 ax.text(0.5, 0.5, f"no {label} channel for {sensor or self.channel_name(gauge) or f'channel {gauge}'}",
                         ha='center', va='center', transform=ax.transAxes, color='gray')
@@ -614,6 +714,16 @@ class CZMFitterView(EventView):
                                   f"({self.num_gauges} strain channels)",
                         ha='center', va='center', transform=ax.transAxes, color='gray')
             ax.set_ylabel(f"{label} (MPa)" if self.stress_mode else label)
+        self.base_lines = []
+        if self.stress_mode:
+            start, end = self.baseline_window(t, line_positions)
+            for ax in self.axs:                            # the background window: a grey band and its movable start
+                ax.axvspan(start, end, color='0.85', alpha=0.6, zorder=0)
+                self.base_lines.append(ax.axvline(x=start, color='0.35', linestyle=':'))
+            if not np.isfinite(model["xy"]).any():
+                self.axs[0].text(0.5, 0.9, f"no model: Cf = {self.Cf.get():g} m/s is not below the Rayleigh speed "
+                                           f"({rayleigh_speed(self.C_s, self.C_d):.0f} m/s)",
+                                 ha='center', va='center', transform=self.axs[0].transAxes, color='crimson')
         self.axs[-1].set_xlabel('Time (s)')
         self.figure.suptitle(self.figure_title())
 
@@ -645,9 +755,13 @@ class CZMFitterView(EventView):
                 self.drag_active = True
                 self.active_line_idx = i
                 break
+        else:
+            if self.base_lines and abs(event.xdata - self.base_lines[0].get_xdata()[0]) < tolerance:
+                self.drag_base = True                      # the start of the background window
 
     def on_mouse_release(self, event):
         self.drag_active = False
+        self.drag_base = False
         self.active_line_idx = None
 
     def on_mouse_move(self, event):
@@ -655,6 +769,13 @@ class CZMFitterView(EventView):
             return
         if self.drag_active and event.inaxes and self.active_line_idx is not None:
             self.move_line(self.active_line_idx, event.xdata)
+        elif self.drag_base and event.inaxes and event.xdata is not None:
+            self.move_baseline(event.xdata)
+
+    def move_baseline(self, new_x) -> None:
+        """Move the start of the background window to ``new_x`` and redraw."""
+        self.x_base = float(new_x)
+        self.update_plot()
 
     def move_line(self, idx, new_x):
         """Move marker pair ``idx`` to ``new_x`` and redraw."""
@@ -682,6 +803,7 @@ class CZMFitterView(EventView):
             return None
         t0, t1, t2 = sorted(self.current_line_positions())
 
+        self.sync_gauge()
         t = self._time()
         exy = self._strain(self.strain_gauge.get())
         mask = (t >= t1) & (t <= t2)
@@ -707,28 +829,38 @@ class CZMFitterView(EventView):
 
     def build_joint_objective(self, t, t_fit, mask, t0, t1, t2):
         """The objective of a stress record: every ticked component of the
-        selected sensor over the window, each minus its value at its zero line
-        (xy: ``t2``, x_max; xx and yy: ``t0``, x_min), residuals in kPa."""
+        selected sensor over the window, on the levels they are drawn on
+        (:meth:`referenced`), residuals in kPa."""
         components = self.fit_components()
         if not components:
             print("No component ticked to fit")
             return None
         channels = self.sensor_channels()
-        i_min, i_max = int(np.argmin(np.abs(t - t0))), int(np.argmin(np.abs(t - t2)))
-        targets = {}
+        base = self.baseline_mask(t, [t0, t1, t2])
+        i_max = int(np.argmin(np.abs(t - t2)))
+        targets, anchor = {}, 0.0
         for component in components:
             measured = self._strain(channels[component])
-            targets[component] = measured[mask] - measured[i_max if component == "xy" else i_min]
-        t_model = np.concatenate([t_fit, [t[i_min], t[i_max]]])     # the window, then the two zero points
+            data = measured - float(np.mean(measured[base]))
+            targets[component] = data[mask]
+            if component == "xy":
+                anchor = float(np.mean(data[self.level_window(i_max)]))
+        t_base, t_level = t[base], t[self.level_window(i_max)]
+        t_model = np.concatenate([t_fit, t_base, t_level])          # the window, the background window, around x_max
+        n, n_base = t_fit.size, t_base.size
 
         def objective(params):
             Gc, Xc = params
-            model = self._model_components(t_model, t1, Xc, Gc)
+            with np.errstate(all="ignore"):
+                model = self._model_components(t_model, t1, Xc, Gc)
             total = 0.0
             for component in components:
                 values = model[component]
-                zeroed = values[:-2] - (values[-1] if component == "xy" else values[-2])
-                total += float(np.sum(((targets[component] - zeroed) * 1e-3) ** 2))    # Pa -> kPa
+                if component == "xy":
+                    curve = values[:n] - float(np.mean(values[n + n_base:])) + anchor
+                else:
+                    curve = values[:n] - float(np.mean(values[n:n + n_base]))
+                total += float(np.sum(((targets[component] - curve) * 1e-3) ** 2))    # Pa -> kPa
             return total
 
         return objective
@@ -746,7 +878,21 @@ class CZMFitterView(EventView):
 
         initial_guess = [self.Gc.get(), self.Xc.get()]
         bounds = ((1e-6, None), (1e-6, None))
-        result = optimize.minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+        if self.stress_mode:
+            # Gc and Xc span orders of magnitude between samples: search their logarithms
+            initial_guess = [max(v, 1e-6) for v in initial_guess]
+            if not np.isfinite(objective(initial_guess)):
+                print("No fit: the model has no value at these parameters (Cf must be below the Rayleigh speed)")
+                return None
+            start = objective(initial_guess)
+            result = optimize.minimize(lambda u: objective(np.exp(u)), np.log(initial_guess), method='Nelder-Mead',
+                                       bounds=[(np.log(1e-6), np.log(1e9)), (np.log(1e-6), np.log(1e3))],
+                                       options={"xatol": 1e-4, "fatol": max(1e-7 * start, 1e-9), "maxiter": 2000})
+            result.x = np.exp(result.x)
+            if not result.success and np.isfinite(result.fun) and result.fun <= start:
+                result.success = True                      # out of iterations, yet no worse than the start: keep it
+        else:
+            result = optimize.minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
         result.initial_fun = objective(initial_guess)
 
         if result.success:
@@ -757,6 +903,107 @@ class CZMFitterView(EventView):
         else:
             print("Fitting failed:", result.message)
         return result
+
+    # ----------------------------------------------------------------- auto
+    def front(self, channel) -> dict | None:
+        """The rupture front on one channel of a stress record, from the trace
+        smoothed over 50 us: ``change`` (largest change over 50 us, signed, Pa),
+        ``t_front`` (when), ``t_peak`` (the extreme before it, within 0.3 ms),
+        ``t_end`` (when 90 % of the way from that peak to the opposite extreme
+        of the next 0.5 ms is covered) and ``size`` (the level at the peak minus
+        that opposite extreme, Pa).  None for a record too short to look at."""
+        t = self._time()
+        if t.size < 50:
+            return None
+        fs = 1.0 / float(np.median(np.diff(t)))
+        lag = int(np.clip(round(50e-6 * fs), 3, t.size // 4))
+        window = min(lag | 1, t.size - 1 - (t.size % 2 == 0))
+        raw = np.asarray(waveform_data(self.strain_block(self.event))[channel], dtype=float) * self.stress_scale
+        smooth = signal.savgol_filter(raw, max(window, 5), 2)
+        step = smooth[lag:] - smooth[:-lag]
+        i = int(np.argmax(np.abs(step)))
+        sign = 1.0 if step[i] >= 0 else -1.0                # +1: the trace rises at the front; -1: it drops
+        before = max(i - int(round(300e-6 * fs)), 0)
+        i_peak = before + int(np.argmin(sign * smooth[before: i + lag // 2 + 1]))
+        after = min(i + int(round(500e-6 * fs)), t.size)
+        travelled = sign * (smooth[i_peak: after] - smooth[i_peak])        # how far the trace has moved from the peak
+        size = float(travelled.max())
+        i_end = i_peak + int(np.argmax(travelled >= 0.9 * size))
+        return {"change": float(step[i]), "t_front": float(t[min(i + lag // 2, t.size - 1)]),
+                "t_peak": float(t[i_peak]), "t_end": float(t[i_end]), "size": size}
+
+    def estimate_rupture_speed(self) -> float | None:
+        """Rupture speed (m/s, positive) for ``Auto``: the one Pick Arrivals
+        saved with the record, else the median slope between the fronts of the
+        record's sensors (their sigma_xy) and their positions; None when the
+        record has fewer than two sensor positions."""
+        block = self.strain_block(self.event)
+        try:
+            return float(abs(read_arrivals(block, self.event)["rupture_speed"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        positions = block.get("positions") if isinstance(block, dict) else None
+        sensors = self.sensors()
+        if not isinstance(positions, dict) or len(sensors) < 2:
+            return None
+        scale = {"mm": 1e-3, "cm": 1e-2, "m": 1.0}.get(str(positions.get("unit", "mm")), 1e-3)
+        points = []
+        for channel in sensors.values():
+            found = self.front(channel)
+            try:
+                x = float(np.asarray(positions["x"], dtype=float).ravel()[channel]) * scale
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if found is not None and np.isfinite(x):
+                points.append((x, found["t_front"]))
+        slopes = [(tb - ta) / (xb - xa) for k, (xa, ta) in enumerate(points) for xb, tb in points[k + 1:] if xb != xa]
+        slope = float(np.median(slopes)) if slopes else 0.0
+        return 1.0 / abs(slope) if slope else None
+
+    def auto_fit(self):
+        """A starting point for a stress record, then the fit.
+
+        ``Cf`` from :meth:`estimate_rupture_speed`, kept below ``CF_LIMIT`` of the
+        Rayleigh speed (the value in the box when there is nothing to estimate
+        from); the tip line on the selected sensor's sigma_xy extreme just
+        before its front, x_max where the change ends, the left line (end of
+        the background window) four drop durations before the tip; Xc as the
+        distance the front covers during the drop and Gc as the value whose
+        peak strength equals the size of the drop.  Returns what
+        :meth:`fit_parameters` returns, or None when no front is found.
+        """
+        if not self.stress_mode:
+            return None
+        self.sync_gauge()
+        found = self.front(self.sensor_channels()["xy"])
+        if found is None or found["size"] <= 0:
+            print("Auto: no front found on this sensor")
+            return None
+        t = self._time()
+        limit = CF_LIMIT * rayleigh_speed(self.C_s, self.C_d)
+        speed = self.estimate_rupture_speed()
+        Cf = min(speed, limit) if speed else min(self.Cf.get(), limit)
+        self.Cf.set(float(Cf))
+        tip, end = found["t_peak"], found["t_end"]
+        if end - tip < 5 * float(np.median(np.diff(t))):          # no measurable drop time: 0.1 ms
+            end = min(tip + 1e-4, float(t[-1]))
+        drop = end - tip
+        left = max(tip - 4 * drop, float(t[0]) + 0.1 * (tip - float(t[0])))
+        self.x_base = None                                        # the background window: record start .. left line
+        self.set_lines([left, tip, end])
+        Xc = max(Cf * drop, 1e-6)
+        with np.errstate(all="ignore"):
+            alpha_s, alpha_d = CohesiveCrack.alpha_s(Cf, self.C_s), CohesiveCrack.alpha_d(Cf, self.C_d)
+            A2 = CohesiveCrack.compute_A2(Cf, self.C_s, self.nu, CohesiveCrack.D(alpha_s, alpha_d))
+            Gc = found["size"] ** 2 * (32 * Xc / (9 * np.pi)) * (1 - self.nu ** 2) * A2 / self.E   # tau_p = size
+        self.Xc.set(float(Xc))
+        self.Gc.set(float(Gc) if np.isfinite(Gc) and Gc > 0 else 1.0)
+        margin = 0.5 * (end - left)
+        self.axs[0].set_xlim(max(left - margin, float(t[0])), min(end + 2 * margin, float(t[-1])))
+        self.update_plot()
+        print(f"Auto: Cf={Cf:.0f} m/s, tip at {tip:.6f} s, drop over {drop * 1e6:.0f} us of {found['size'] / 1e6:.3f} MPa; "
+              f"start Xc={self.Xc.get():.3g} m, Gc={self.Gc.get():.3g} J/m^2")
+        return self.fit_parameters()
 
     # ----------------------------------------------------------------- save
     def collect_results(self):
@@ -771,8 +1018,9 @@ class CZMFitterView(EventView):
         """What the parameters were fitted to and with: the channel's name (the
         sensor's ``sigma_xy`` channel for a stress record, with the ``sensor``
         itself), the record's unit,
-        the elastic medium, the components fitted together (stress records)
-        and the peak strength ``tau_p`` (Pa) that Gc and Xc imply at this Cf."""
+        the elastic medium, the components fitted together and the start of
+        the background window ``x_base`` (stress records), and the peak
+        strength ``tau_p`` (Pa) that Gc and Xc imply at this Cf."""
         gauge = int(self.strain_gauge.get())
         if self.stress_mode:
             gauge = self.sensor_channels(gauge)["xy"]
@@ -780,6 +1028,8 @@ class CZMFitterView(EventView):
                    "E": float(self.E), "nu": float(self.nu), "C_s": float(self.C_s), "C_d": float(self.C_d)}
         if self.selected_sensor():
             context["sensor"] = self.selected_sensor()
+        if self.stress_mode:
+            context["x_base"] = self.baseline_window(self._time(), self.current_line_positions())[0]
         if self.stress_mode and self.fit_components():
             context["fit_components"] = self.fit_components()
         with np.errstate(all="ignore"):
