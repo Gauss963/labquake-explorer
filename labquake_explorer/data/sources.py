@@ -39,7 +39,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import h5py
 import numpy as np
 
-from labquake_explorer.data.channels import channel_array, channel_names, is_channel_array
+from labquake_explorer.data.channels import channel_array, channel_names, is_channel_array, positions_for
 from labquake_explorer.utils import tpc5
 from labquake_explorer.utils.ni_npz import NIRecord, open_ni_npz
 
@@ -139,6 +139,15 @@ class Source:
                     dtype=np.float32) -> Optional[Window]:
         """Samples between two run times, or None when no record covers them."""
         raise NotImplementedError
+
+    def read_history(self, t_from: float, t_to: float, fields: Optional[Sequence[str]] = None,
+                     dtype=np.float32) -> Optional[Window]:
+        """Samples of the whole-run record between two run times: what a time
+        history of the run is drawn from.  The same as :meth:`read_window`,
+        except for a recorder that also writes separate high-rate records
+        around triggers (see :class:`Tpc5Source`), which reads its continuous
+        record here whatever trigger records exist."""
+        return self.read_window(t_from, t_to, fields, dtype)
 
     def event_window(self, event_time: float, pre: float, post: float,
                      fields: Optional[Sequence[str]] = None, dtype=np.float32) -> Optional[Window]:
@@ -377,6 +386,20 @@ class Tpc5Source(Source):
         return Window(self.to_run_time(t), np.asarray(data, dtype=dtype), [self.fields[i] for i in idx],
                       block.sample_rate, block.block)
 
+    def read_history(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
+        """The continuous (whole-run) block between two run times, also when the
+        file has trigger blocks; None when the block does not reach the window."""
+        block = self.continuous
+        lo = max(self.to_file_time(t_from), block.start)
+        hi = min(self.to_file_time(t_to), block.end)
+        if hi < lo:
+            return None
+        idx = self.field_indices(fields)
+        with h5py.File(self.path, "r") as f:
+            t, data = tpc5.read_window(f, block, lo, hi, [self.channel_numbers[i] for i in idx], dtype=np.float64)
+        return Window(self.to_run_time(t), np.asarray(data, dtype=dtype), [self.fields[i] for i in idx],
+                      block.sample_rate, block.block)
+
     def to_reference(self, base_dir) -> dict:
         ref = super().to_reference(base_dir)
         ref.update({
@@ -544,13 +567,17 @@ class ConvertedSource(Source):
     """Another source read through a linear map: each output channel is
     ``matrix @ inputs`` of the base source's samples (e.g. strain-gauge volts to
     stress in MPa), computed for every window, so nothing converted is stored.
-    Clock, records and everything else come from the base source."""
+    Clock, records and everything else come from the base source.  The
+    conversion may carry ``positions``, the sensor positions of its output
+    channels (a table from :func:`~labquake_explorer.data.channels.positions_table`,
+    one entry per channel), which the records copied into events inherit."""
 
     def __init__(self, base: Source, conversion: Mapping):
         self.base = base
         self.inputs = [str(f) for f in conversion["inputs"]]
         self.matrix = np.asarray(conversion["matrix"], dtype=np.float64).reshape(-1, len(self.inputs))
         self.unit = str(conversion.get("unit", ""))
+        self.positions = conversion.get("positions") if isinstance(conversion.get("positions"), Mapping) else None
         channels = [str(c) for c in conversion["channels"]]
         if len(channels) != self.matrix.shape[0]:
             raise ValueError("conversion: one matrix row per output channel")
@@ -598,20 +625,41 @@ class ConvertedSource(Source):
     def read_window(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
         return self._convert(self.base.read_window(t_from, t_to, self._inputs_for(fields), dtype), fields)
 
+    def read_history(self, t_from, t_to, fields=None, dtype=np.float32) -> Optional[Window]:
+        return self._convert(self.base.read_history(t_from, t_to, self._inputs_for(fields), dtype), fields)
+
     def waveform(self, event_time, pre, post, fields=None, dtype=np.float32) -> Optional[Window]:
         fields = self.event_fields if fields is None else fields
         win = self.base.waveform(event_time, pre, post, self._inputs_for(fields), dtype)
         return self._convert(win, fields)
+
+    def read_record(self, block, fields=None, dtype=np.float32) -> Window:
+        """One whole record of the base source (see :meth:`Tpc5Source.read_record`), converted."""
+        fields = self.event_fields if fields is None else fields
+        return self._convert(self.base.read_record(block, self._inputs_for(fields), dtype), fields)
+
+    def positions_for(self, fields: Sequence[str]) -> Optional[dict]:
+        """The positions table of the output channels ``fields`` (NaN for one
+        the conversion does not place); None when it carries no positions."""
+        if self.positions is None:
+            return None
+        table = {"data": np.empty((len(self.fields), 0)), "channels": list(self.fields), "positions": self.positions}
+        return positions_for(table, fields)
 
     def to_reference(self, base_dir) -> dict:
         return self.base.to_reference(base_dir)
 
 
 def mean_on_samples(source: Source, field: str, time: np.ndarray, chunk_s: float = 5.0) -> np.ndarray:
-    """One field of ``source`` averaged onto the run samples ``time`` (run clock):
-    each value is the mean of the source's samples within half a run sample of
-    it, NaN where the source has none.  Read ``chunk_s`` of the run at a time,
-    so a whole 2 MHz record fits in memory as the run's resolution."""
+    """One field of ``source`` on the run samples ``time`` (run clock), from its
+    whole-run record (:meth:`Source.read_history`), NaN where that has none.
+
+    A record sampled at least as fast as the run is averaged: each value is the
+    mean of the source's samples within half a run sample of it.  A record
+    sampled more slowly (the continuous block of a tpc5 that keeps its full
+    rate for the trigger blocks) is interpolated linearly between its samples.
+    Read ``chunk_s`` of the run at a time, so a whole 2 MHz record fits in
+    memory as the run's resolution."""
     time = np.asarray(time, dtype=np.float64).ravel()
     out = np.full(time.size, np.nan)
     if time.size < 2:
@@ -619,14 +667,20 @@ def mean_on_samples(source: Source, field: str, time: np.ndarray, chunk_s: float
     half = 0.5 * float(np.median(np.diff(time)))
     lo, hi = 0, time.size
     cont = getattr(source, "continuous", None)
+    pad = 0.0
     if cont is not None:                                   # only the stretch the record covers
         lo = int(np.searchsorted(time, source.to_run_time(cont.start) - half))
         hi = int(np.searchsorted(time, source.to_run_time(cont.end) + half))
+        if float(cont.sample_rate) * 2 * half < 1 - 1e-9:  # slower than the run: interpolate,
+            pad = 1.0 / float(cont.sample_rate)            # with one more source sample on each side of a chunk
     step = max(int(round(chunk_s / (2 * half))), 1)
     for i0 in range(lo, hi, step):
         i1 = min(i0 + step, hi)
-        win = source.read_window(time[i0] - half, time[i1 - 1] + half, [field], dtype=np.float64)
+        win = source.read_history(time[i0] - half - pad, time[i1 - 1] + half + pad, [field], dtype=np.float64)
         if win is None or win.time.size == 0:
+            continue
+        if pad:
+            out[i0:i1] = np.interp(time[i0:i1], win.time, win.data[0], left=np.nan, right=np.nan)
             continue
         edges = np.searchsorted(win.time, np.append(time[i0:i1] - half, time[i1 - 1] + half))
         counts = np.diff(edges)

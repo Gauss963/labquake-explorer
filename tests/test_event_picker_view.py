@@ -301,6 +301,23 @@ def test_y_can_be_a_converted_source_channel(tmp_path, app_from_file):
     v.on_close()
 
 
+def test_converted_channel_of_a_dual_mode_file_is_drawn_over_the_whole_run(tmp_path, app_from_file):
+    import numpy as np
+    from labquake_explorer.data.data_manager import DataManager
+    from tests.test_event_processor import dual_mode_run
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [dual_mode_run(tmp_path)]}
+    dm.save_file(tmp_path / "t0001.h5")
+    app = app_from_file(tmp_path / "t0001.h5")
+    v = EventPickerView(app, 0)
+    v.y_combo.set("elsys/sigma_xy")
+    v.plot()
+    y = v.y_values()
+    inside = (v.time >= 0.5) & (v.time <= 2.4995)             # the Elsys continuous block on the run clock
+    assert y.shape == v.time.shape and np.isfinite(y[inside]).all() and np.isnan(y[~inside]).all()
+    v.on_close()
+
+
 def test_waveform_channels_box_reaches_the_extraction_and_is_restored(app, view):
     from labquake_explorer.ui.views.event_picker_view import FIELDS_ALL, FIELDS_REFERENCE
     assert view.fields_combo.get() == FIELDS_REFERENCE and view.waveform_fields() is None
