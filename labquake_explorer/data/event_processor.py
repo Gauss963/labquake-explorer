@@ -156,16 +156,22 @@ class EventProcessor:
         """``event['waveform'][key]``: the samples ``source`` read as a channel
         array, with the unit and sensor positions of the run's ``raw_data``
         for that recorder and the reference's ``filename``; a source read
-        through a conversion states its own unit (``win.unit``) and the
-        positions of its output channels."""
+        through a conversion states its own unit (``win.unit``), the
+        positions of its output channels and, when the conversion flags them,
+        which of them are ``valid``."""
         ref = run_sources(run_data).get(key, {})
         raw = ref.get("raw_data")
         unit = win.unit or (str(raw.get("unit", "V")) if is_channel_array(raw) else "V")
         positions = positions_for(raw, win.fields) if is_channel_array(raw) else None
-        if positions is None and win.unit and hasattr(source, "positions_for"):
-            positions = source.positions_for(win.fields)       # converted channels: placed by the conversion
+        extra = {}
+        if win.unit and hasattr(source, "positions_for"):      # converted channels: what the conversion says of them
+            if positions is None:
+                positions = source.positions_for(win.fields)
+            valid = source.valid_for(win.fields)
+            if valid is not None:
+                extra["valid"] = valid
         return win.as_channel_array(dtype, unit=unit, positions=positions,
-                                    filename=str(ref.get("filename", source.path.name)))
+                                    filename=str(ref.get("filename", source.path.name)), **extra)
 
     # ------------------------------------------------------------- legacy
     @staticmethod

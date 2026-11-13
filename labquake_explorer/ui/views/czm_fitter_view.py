@@ -37,6 +37,9 @@ takes ``Cf`` from the saved arrivals or from the fronts at the record's
 sensors (kept below the Rayleigh speed), places the lines on the selected
 sensor's front, derives Xc and Gc from the duration and size of the drop,
 and runs the fit; on a sensor without a clear front it changes nothing.
+The front is the largest drop of sigma_xy over 50 us.  A component the
+record flags as not valid (``valid``, from the conversion: an input it uses
+was railed) is drawn grey and left out of every fit.
 
 The elastic medium is the class default (E, nu, C_s, C_d below) unless the
 experiment gives its own: ``analysis['medium']`` with ``E_Pa`` and ``nu``
@@ -474,12 +477,24 @@ class CZMFitterView(EventView):
                  if f"{sensor}_sigma_{c}" in self.channel_names}
         return found if "xy" in found else {"xy": gauge}
 
+    def channel_valid(self, channel) -> bool:
+        """False when the record flags a channel as not a real measurement
+        (its ``valid`` list, which a conversion passes on); True otherwise."""
+        flags = self.strain_block(self.event).get("valid")
+        if flags is None or channel is None:
+            return True
+        try:
+            return bool(np.asarray(flags).ravel()[int(channel)])
+        except (IndexError, TypeError, ValueError):
+            return True
+
     def sensor_label(self) -> str:
         """What stands next to the gauge box: the channel's name; for a sensor
         of a stress record, the components it has (``xy, xx, yy``)."""
         if self.selected_sensor():
             channels = self.sensor_channels()
-            return ", ".join(c for c in COMPONENTS if c in channels)
+            return ", ".join(c if self.channel_valid(channels[c]) else f"{c} (not valid)"
+                             for c in COMPONENTS if c in channels)
         return self.channel_name(int(self.strain_gauge.get()))
 
     def panels(self) -> list:
@@ -493,11 +508,13 @@ class CZMFitterView(EventView):
 
     def fit_components(self) -> list:
         """The components ``Fit`` compares with the model: xy alone for a record
-        in volts; for a stress record, those of the sensor that are ticked."""
+        in volts; for a stress record, those of the sensor that are ticked and
+        that the record does not flag as not valid."""
         if not self.stress_mode:
             return ["xy"]
         channels = self.sensor_channels()
-        return [c for c in COMPONENTS if c in channels and self.fit_vars[c].get()]
+        return [c for c in COMPONENTS
+                if c in channels and self.fit_vars[c].get() and self.channel_valid(channels[c])]
 
     def layout_axes(self, n: int) -> None:
         """Give the figure ``n`` shared-x panels (2 for volts, 3 for stress),
@@ -714,7 +731,8 @@ class CZMFitterView(EventView):
         if self.stress_mode:                               # only the components the sensor has can be ticked
             available = self.sensor_channels()
             for component, box in self.fit_boxes.items():
-                box.state(["!disabled"] if component in available else ["disabled"])
+                usable = component in available and self.channel_valid(available[component])
+                box.state(["!disabled"] if usable else ["disabled"])
         scale = 1e-6 if self.stress_mode else 1.0          # a stress record is drawn in MPa; strains as they are
 
         if self.stress_mode:
@@ -739,6 +757,13 @@ class CZMFitterView(EventView):
                 else:
                     zero = idx_zero[component]
                     data, curve = measured - measured[zero], model[component] - model[component][zero]
+                if self.stress_mode and not self.channel_valid(channel):
+                    # flagged by the record: shown for its timing, never compared with the model
+                    ax.plot(t, data * scale, color='0.6', label=f"{label} (not valid)", linewidth=0.8, zorder=2)
+                    ax.text(0.5, 0.9, f"{label} is flagged not valid in this record: left out of the fit",
+                            ha='center', va='center', transform=ax.transAxes, color='gray')
+                    ax.set_ylabel(f"{label} (MPa)")
+                    continue
                 ax.plot(t, data * scale, COMPONENT_STYLE[component], label=label, linewidth=0.8, zorder=2)
                 if self.stress_mode and fit.any():         # the model counts inside the fit window: faint outside it
                     ax.plot(t, curve * scale, **MODEL_OUTSIDE_STYLE)
@@ -924,7 +949,12 @@ class CZMFitterView(EventView):
         mask = (t >= t1) & (t <= t2)
         components = self.fit_components()
         if not mask.any() or not components:
-            return "no sample between 'tip' and 'fit end'" if components else "no component ticked to fit"
+            if components:
+                return "no sample between 'tip' and 'fit end'"
+            channels = self.sensor_channels()
+            flagged = [c for c in COMPONENTS if c in channels and not self.channel_valid(channels[c])]
+            return ("no valid component to fit: " + ", ".join(flagged) + " flagged not valid in this record"
+                    if flagged and len(flagged) == len(channels) else "no component ticked to fit")
         try:
             objective = self.build_joint_objective(t, t[mask], mask, t0, t1, t2)
             value = objective([self.Gc.get(), self.Xc.get()])
@@ -983,15 +1013,10 @@ class CZMFitterView(EventView):
         return result
 
     # ----------------------------------------------------------------- auto
-    def front(self, channel) -> dict | None:
-        """The rupture front on one channel of a stress record, from the trace
-        smoothed over 50 us: ``change`` (largest change over 50 us, signed, Pa),
-        ``t_front`` (when), ``t_peak`` (the extreme before it, within 0.3 ms),
-        ``t_end`` (when 90 % of the way from that peak to the opposite extreme
-        of the next 0.5 ms is covered), ``size`` (the level at the peak minus
-        that opposite extreme, Pa) and ``noise`` (the robust scatter of the
-        50 us changes over the whole record, Pa: pure noise reaches about 4.5
-        times it somewhere).  None for a record too short to look at."""
+    def smoothed_changes(self, channel):
+        """``(t, fs, lag, smooth, step)`` of one channel of a stress record: the
+        trace (Pa) smoothed over 50 us and its change over 50 us (``lag``
+        samples); None for a record too short to look at."""
         t = self._time()
         if t.size < 50:
             return None
@@ -1000,9 +1025,45 @@ class CZMFitterView(EventView):
         window = min(lag | 1, t.size - 1 - (t.size % 2 == 0))
         raw = np.asarray(waveform_data(self.strain_block(self.event))[channel], dtype=float) * self.stress_scale
         smooth = signal.savgol_filter(raw, max(window, 5), 2)
-        step = smooth[lag:] - smooth[:-lag]
+        return t, fs, lag, smooth, smooth[lag:] - smooth[:-lag]
+
+    def arrival(self, channel) -> float | None:
+        """When the front reaches a sensor: the moment its smoothed trace first
+        leaves the level it had before its largest 50 us change (by 5 times
+        that level's scatter, at least a tenth of the change), looked for in
+        the 0.5 ms before the change.  Rise or drop, so a channel flagged not
+        valid still tells the time.  None without a clear change (below
+        ``CLEAR_FRONT`` times the scatter of the 50 us changes)."""
+        looked = self.smoothed_changes(channel)
+        if looked is None:
+            return None
+        t, fs, lag, smooth, step = looked
         i = int(np.argmax(np.abs(step)))
-        sign = 1.0 if step[i] >= 0 else -1.0                # +1: the trace rises at the front; -1: it drops
+        noise = 1.4826 * float(np.median(np.abs(step - np.median(step))))
+        if abs(step[i]) < CLEAR_FRONT * noise:
+            return None
+        half_ms = max(int(round(500e-6 * fs)), 1)
+        lo = max(i - half_ms, 0)
+        quiet = smooth[max(lo - half_ms, 0): lo] if lo > 1 else smooth[: lo + 1]
+        level, scatter = float(np.median(quiet)), float(np.std(quiet))
+        away = np.abs(smooth[lo: i + lag + 1] - level) > max(5 * scatter, 0.1 * abs(step[i]))
+        return float(t[lo + int(np.argmax(away))]) if away.any() else float(t[min(i + lag // 2, t.size - 1)])
+
+    def front(self, channel) -> dict | None:
+        """The rupture front on one channel of a stress record, from the trace
+        smoothed over 50 us: ``change`` (the largest drop over 50 us, negative, Pa),
+        ``t_front`` (when), ``t_peak`` (the maximum before it, within 0.3 ms),
+        ``t_end`` (when 90 % of the way from that peak to the minimum of the
+        next 0.5 ms is covered), ``size`` (the level at the peak minus that
+        minimum, Pa) and ``noise`` (the robust scatter of the
+        50 us changes over the whole record, Pa: pure noise reaches about 4.5
+        times it somewhere).  None for a record too short to look at."""
+        looked = self.smoothed_changes(channel)
+        if looked is None:
+            return None
+        t, fs, lag, smooth, step = looked
+        i = int(np.argmin(step))                            # the largest drop: sigma_xy falls behind the front
+        sign = -1.0
         before = max(i - int(round(300e-6 * fs)), 0)
         i_peak = before + int(np.argmin(sign * smooth[before: i + lag // 2 + 1]))
         after = min(i + int(round(500e-6 * fs)), t.size)
@@ -1015,9 +1076,9 @@ class CZMFitterView(EventView):
 
     def estimate_rupture_speed(self) -> float | None:
         """Rupture speed (m/s, positive) for ``Auto``: the one Pick Arrivals
-        saved with the record, else the median slope between the fronts of the
-        record's sensors (their sigma_xy) and their positions; None when the
-        record has fewer than two sensor positions."""
+        saved with the record, else the median slope between the arrivals at
+        the record's sensors (:meth:`arrival` on their sigma_xy) and their
+        positions; None when fewer than two sensor positions are left."""
         block = self.strain_block(self.event)
         try:
             return float(abs(read_arrivals(block, self.event)["rupture_speed"]))
@@ -1030,13 +1091,13 @@ class CZMFitterView(EventView):
         scale = {"mm": 1e-3, "cm": 1e-2, "m": 1.0}.get(str(positions.get("unit", "mm")), 1e-3)
         points = []
         for channel in sensors.values():
-            found = self.front(channel)
+            when = self.arrival(channel)                    # None: this sensor saw no clear change
             try:
                 x = float(np.asarray(positions["x"], dtype=float).ravel()[channel]) * scale
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
-            if found is not None and np.isfinite(x):
-                points.append((x, found["t_front"]))
+            if when is not None and np.isfinite(x):
+                points.append((x, when))
         slopes = [(tb - ta) / (xb - xa) for k, (xa, ta) in enumerate(points) for xb, tb in points[k + 1:] if xb != xa]
         slope = float(np.median(slopes)) if slopes else 0.0
         return 1.0 / abs(slope) if slope else None
@@ -1056,11 +1117,16 @@ class CZMFitterView(EventView):
         if not self.stress_mode:
             return None
         self.sync_gauge()
-        found = self.front(self.sensor_channels()["xy"])
         name = self.selected_sensor() or self.channel_name(self.sensor_channels()["xy"]) or "this channel"
+        if not self.channel_valid(self.sensor_channels()["xy"]):
+            self.auto_note = f"Auto: sigma_xy of {name} is flagged not valid in this record; nothing changed"
+            print(self.auto_note)
+            self.result_var.set(self.result_text())
+            return None
+        found = self.front(self.sensor_channels()["xy"])
         if found is None or found["size"] <= 0 or abs(found["change"]) < CLEAR_FRONT * found["noise"]:
             what = ("the record is too short" if found is None else
-                    f"its largest change over 50 us is {abs(found['change']) / 1e6:.3f} MPa against a scatter of "
+                    f"its largest drop over 50 us is {abs(found['change']) / 1e6:.3f} MPa against a scatter of "
                     f"{found['noise'] / 1e6:.3f} MPa")
             self.auto_note = f"Auto: no clear front on {name} ({what}); nothing changed"
             print(self.auto_note)

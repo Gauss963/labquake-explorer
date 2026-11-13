@@ -814,3 +814,59 @@ def test_auto_finds_the_side_of_the_fault_for_a_rosette(app_with_strain):
     finally:
         v.on_close()
 
+
+def test_components_flagged_not_valid_are_left_out(app_with_strain):
+    """The record says which stress components are real (``valid``, passed on by
+    the conversion): the others are drawn grey and never fitted."""
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    record = event["waveform"]["elsys"]
+    record["valid"] = [name not in ("rosette_1_sigma_xx", "rosette_1_sigma_yy") for name in STRESS_NAMES]
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("rosette_1")
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        assert v.channel_var.get() == "xy, xx (not valid), yy (not valid)"
+        assert all(var.get() for var in v.fit_vars.values()) and v.fit_components() == ["xy"]    # ticked, yet left out
+        assert v.fit_boxes["xy"].instate(["!disabled"]) and v.fit_boxes["xx"].instate(["disabled"])
+        for ax, component in zip(v.axs[1:], ("xx", "yy")):
+            labels = [l.get_label() for l in ax.get_lines()]
+            assert f"sigma_{component} (not valid)" in labels and "CZM" not in labels
+            assert any("flagged not valid" in text.get_text() for text in ax.texts)
+        assert "CZM" in [l.get_label() for l in v.axs[0].get_lines()]
+        assert "fit window 1000 us, xy:" in v.result_var.get() and "misfit (rms) 0.000 MPa" in v.result_var.get()
+        v.save_parameters()
+        assert event["czm_parms"]["fit_components"] == ["xy"]
+        # a sensor with nothing valid: said so, Auto and Fit do nothing
+        record["valid"] = [not name.startswith("rosette_1") for name in STRESS_NAMES]
+        v.update_plot()
+        assert v.fit_components() == [] and "no valid component to fit" in v.result_var.get()
+        assert v.auto_fit() is None and "flagged not valid" in v.result_var.get() and v.fit_parameters() is None
+        v.gauge_combobox.set("shear_1")                                    # the shear gauge is untouched by the flags
+        v.update_plot()
+        assert v.fit_components() == ["xy"] and v.channel_var.get() == "xy"
+    finally:
+        v.on_close()
+
+
+def test_auto_takes_the_drop_not_the_rise_before_it(app_with_strain):
+    """sigma_xy may climb before it drops (a rosette near the front): the tip
+    goes on the top of that climb and the fit window on the drop."""
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    record = event["waveform"]["elsys"]
+    t = np.asarray(record["time"]) - event["event_time"]
+    bump = 0.6 * np.exp(-((t + 1.0e-4) / 4e-5) ** 2)                      # a sharp 0.6 MPa climb 0.1 ms before the tip
+    record["data"][STRESS_NAMES.index("shear_1_sigma_xy")] += bump
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.Cf.set(TRUE["Cf"])
+        found = v.front(STRESS_NAMES.index("shear_1_sigma_xy"))
+        assert found["change"] < 0 and found["t_front"] > found["t_peak"] > -2e-4   # the drop, after the top of the climb
+        assert v.auto_fit() is not None
+        left, tip, end = positions(v)
+        assert -2e-4 < tip <= 5e-5 and tip < end
+    finally:
+        v.on_close()
+

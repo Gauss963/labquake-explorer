@@ -291,6 +291,14 @@ speed), the lines, and starting values of `Xc` and `Gc`, then fits; it tries
 both sides of the fault when `sigma_xx` or `sigma_yy` are ticked and leaves
 a sensor without a clear front alone. `x_base` is saved with the other keys.
 
+A `conversion` may carry `valid`, one flag per output channel, False where
+the channel is not a real measurement (an input it uses was railed or
+unplugged). Event records inherit it (`waveform/<recorder>/valid`). Pick
+Arrivals still draws such a channel, since it tells when the front arrives;
+the CZM view draws it grey and leaves it out of every fit. `Auto` takes the
+rupture speed from the arrivals at the sensors (where each trace first
+leaves its level) and puts the tip on the largest drop of `sigma_xy`.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,

@@ -570,7 +570,9 @@ class ConvertedSource(Source):
     Clock, records and everything else come from the base source.  The
     conversion may carry ``positions``, the sensor positions of its output
     channels (a table from :func:`~labquake_explorer.data.channels.positions_table`,
-    one entry per channel), which the records copied into events inherit."""
+    one entry per channel), and ``valid``, one flag per output channel that is
+    False where the channel is not a real measurement (an input it uses was
+    railed or unplugged); the records copied into events inherit both."""
 
     def __init__(self, base: Source, conversion: Mapping):
         self.base = base
@@ -578,6 +580,10 @@ class ConvertedSource(Source):
         self.matrix = np.asarray(conversion["matrix"], dtype=np.float64).reshape(-1, len(self.inputs))
         self.unit = str(conversion.get("unit", ""))
         self.positions = conversion.get("positions") if isinstance(conversion.get("positions"), Mapping) else None
+        valid = conversion.get("valid")
+        self.valid = [bool(v) for v in np.asarray(valid).ravel()] if valid is not None else None
+        if self.valid is not None and len(self.valid) != self.matrix.shape[0]:
+            raise ValueError("conversion: one 'valid' flag per output channel")
         channels = [str(c) for c in conversion["channels"]]
         if len(channels) != self.matrix.shape[0]:
             raise ValueError("conversion: one matrix row per output channel")
@@ -645,6 +651,13 @@ class ConvertedSource(Source):
             return None
         table = {"data": np.empty((len(self.fields), 0)), "channels": list(self.fields), "positions": self.positions}
         return positions_for(table, fields)
+
+    def valid_for(self, fields: Sequence[str]) -> Optional[list]:
+        """The ``valid`` flags of the output channels ``fields``; None when the
+        conversion does not carry any."""
+        if self.valid is None:
+            return None
+        return [self.valid[i] for i in self.field_indices(fields)]
 
     def to_reference(self, base_dir) -> dict:
         return self.base.to_reference(base_dir)

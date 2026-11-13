@@ -310,6 +310,34 @@ def test_converted_record_and_its_positions(tmp_path):
     assert S.open_source(run["elsys"], tmp_path, run).positions_for(["sigma_xy"]) is None
 
 
+def test_conversion_flags_channels_that_are_not_valid(tmp_path):
+    run = dual_mode_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["a_sigma_xy", "a_sigma_xx"], "inputs": ["gauge"],
+                                  "matrix": [[-3.0], [2.0]], "unit": "MPa", "valid": [True, False]}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    assert src.valid == [True, False] and src.valid_for(["a_sigma_xx"]) == [False]
+    run["time"] = S.run_time(run)
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [run]}
+    run["events"] = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [10_000], window=0.05)
+    assert run["events"][0]["waveform"]["elsys"]["valid"] == [True, False]
+    del run["time"]
+    dm.save_file(tmp_path / "t0001.h5")                                   # the flags survive the file
+    back = DataManager()
+    back.load_file(tmp_path / "t0001.h5")
+    record = back.data["runs"][0]["events"][0]["waveform"]["elsys"]
+    assert [bool(v) for v in record["valid"]] == [True, False] and list(record["channels"]) == ["a_sigma_xy", "a_sigma_xx"]
+    assert S.open_source(back.data["runs"][0]["elsys"], tmp_path, back.data["runs"][0]).valid == [True, False]
+    # no flags in the conversion: none in the record
+    del run["elsys"]["conversion"]["valid"]
+    run["time"] = S.run_time(run)
+    event = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [10_000], window=0.05)[0]
+    assert "valid" not in event["waveform"]["elsys"] and S.open_source(run["elsys"], tmp_path, run).valid_for(["a_sigma_xy"]) is None
+    run["elsys"]["conversion"]["valid"] = [True]                           # one flag for two channels
+    with pytest.raises(ValueError, match="valid"):
+        S.open_source(run["elsys"], tmp_path, run)
+
+
 def test_waveform_fields_choice(elsys, tmp_path):
     run = run_from_tpc5(elsys, ELSYS_MAP, tmp_path, event_fields=["pzt_1"])
     ep = EventProcessor(tmp_path / "exp.h5")
