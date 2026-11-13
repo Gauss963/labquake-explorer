@@ -965,6 +965,12 @@ class CZMFitterView(EventView):
         rms = np.sqrt(value / objective.n_values) * 1e-3                           # kPa -> MPa
         text = (f"fit window {1e6 * (t2 - t1):.0f} us, {', '.join(components)}:  misfit (rms) {rms:.3f} MPa"
                 f"   |   tau_p = {self.fit_context().get('tau_p', float('nan')) / 1e6:.2f} MPa")
+        if "xy" in components:                              # the measured drop of sigma_xy over the fit window
+            xy = self._strain(self.sensor_channels()["xy"])
+            first, last = (int(np.argmin(np.abs(t - x))) for x in (t1, t2))
+            drop = float(np.mean(xy[self.level_window(first)]) - np.mean(xy[self.level_window(last)]))
+            text += f"   |   drop over the window = {drop / 1e6:.2f} MPa"
+        text += f"   |   Cf = {self.Cf.get() / rayleigh_speed(self.C_s, self.C_d):.2f} C_R"
         without = objective([1e-12, self.Xc.get()])                                # the same with no model at all
         if np.isfinite(without) and value >= 0.9 * without:
             text += "   |   no better than no model: these components do not follow it"
@@ -1053,9 +1059,9 @@ class CZMFitterView(EventView):
         """The rupture front on one channel of a stress record, from the trace
         smoothed over 50 us: ``change`` (the largest drop over 50 us, negative, Pa),
         ``t_front`` (when), ``t_peak`` (the maximum before it, within 0.3 ms),
-        ``t_end`` (when 90 % of the way from that peak to the minimum of the
-        next 0.5 ms is covered), ``size`` (the level at the peak minus that
-        minimum, Pa) and ``noise`` (the robust scatter of the
+        ``t_end`` (the end of the initial rapid drop: where the 50 us change
+        has fallen to a quarter of the steepest), ``size`` (the level at the
+        peak minus the level there, Pa) and ``noise`` (the robust scatter of the
         50 us changes over the whole record, Pa: pure noise reaches about 4.5
         times it somewhere).  None for a record too short to look at."""
         looked = self.smoothed_changes(channel)
@@ -1066,10 +1072,12 @@ class CZMFitterView(EventView):
         sign = -1.0
         before = max(i - int(round(300e-6 * fs)), 0)
         i_peak = before + int(np.argmin(sign * smooth[before: i + lag // 2 + 1]))
-        after = min(i + int(round(500e-6 * fs)), t.size)
-        travelled = sign * (smooth[i_peak: after] - smooth[i_peak])        # how far the trace has moved from the peak
-        size = float(travelled.max())
-        i_end = i_peak + int(np.argmax(travelled >= 0.9 * size))
+        # the initial, rapid drop ends where the 50 us change has fallen to a quarter of its steepest value:
+        # what follows (slower, and nearly simultaneous along the fault) is not the front's own weakening
+        slow = np.flatnonzero(step[i:] > 0.25 * step[i])
+        i_end = min(i + (int(slow[0]) if slow.size else int(round(500e-6 * fs))) + lag // 2, t.size - 1)
+        i_end = max(i_end, i_peak + 1)
+        size = float(smooth[i_peak] - smooth[i_end])
         noise = 1.4826 * float(np.median(np.abs(step - np.median(step))))  # robust scatter of the 50 us changes
         return {"change": float(step[i]), "t_front": float(t[min(i + lag // 2, t.size - 1)]),
                 "t_peak": float(t[i_peak]), "t_end": float(t[i_end]), "size": size, "noise": noise}
@@ -1107,9 +1115,11 @@ class CZMFitterView(EventView):
 
         ``Cf`` from :meth:`estimate_rupture_speed`, kept below ``CF_LIMIT`` of the
         Rayleigh speed (the value in the box when there is nothing to estimate
-        from); the tip line on the selected sensor's sigma_xy extreme just
-        before its front, x_max where the change ends, the left line (end of
-        the background window) four drop durations before the tip; Xc as the
+        from); the tip line on the selected sensor's sigma_xy maximum just
+        before its front and ``fit end`` at the end of the initial rapid drop,
+        so that the fit takes the weakening at the tip and leaves out the
+        slower drop that follows; the left line (end of the background
+        window) four drop durations before the tip; Xc as the
         distance the front covers during the drop and Gc as the value whose
         peak strength equals the size of the drop.  Returns what
         :meth:`fit_parameters` returns, or None when no front is found.
