@@ -470,10 +470,16 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.gauge_combobox.set("rosette_1")
         v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
         v.update_plot()
-        # with the true parameters the model lies on every component (levels removed at the zero lines, in MPa)
+        # with the true parameters the model lies on every component (background removed, in MPa); it is
+        # drawn black inside the fit window (tip .. fit end) and as a thin dashed line over the whole record
+        inside = (v._time() >= 0.0) & (v._time() <= 1e-3)
         for ax, component in zip(v.axs, ("xy", "xx", "yy")):
             measured, model = drawn(ax, f"sigma_{component}"), drawn(ax, "CZM")
-            np.testing.assert_allclose(measured, model, atol=1e-6 * np.ptp(measured))
+            assert model.size == int(inside.sum())
+            np.testing.assert_allclose(measured[inside], model, atol=1e-6 * np.ptp(measured))
+            whole = next(l.get_ydata() for l in ax.get_lines() if l.get_linestyle() == "--" and l.get_color() == "0.35"
+                         and l.get_ydata().size == measured.size)
+            np.testing.assert_allclose(measured, whole, atol=1e-6 * np.ptp(measured))
             assert 0.01 < np.ptp(measured) < 50                           # MPa, not Pa, and not the 40 / 60 MPa levels
         joint = v.build_fit_objective()
         assert joint([TRUE["Gc"], TRUE["Xc"]]) < 1e-9
@@ -709,4 +715,102 @@ def test_auto_gives_a_starting_point_and_fits(app_with_strain):
 def test_auto_is_for_stress_records(app_with_strain, view):
     assert not view.auto_button.winfo_manager() and view.auto_fit() is None
     assert view.base_lines == [] and view.x_base is None
+
+
+def test_lines_of_a_stress_record_say_what_they_do(app_with_strain):
+    from labquake_explorer.ui.views.czm_fitter_view import LINE_ROLES, STRESS_HINT
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        labels = {text.get_text().strip(): text for text in v.axs[0].texts}
+        assert {"background start", "background end", "tip", "fit end"} <= set(labels)
+        assert [float(labels[name].get_position()[0]) for name in ("background start", "background end", "tip", "fit end")] \
+            == pytest.approx([-2e-3, -1e-3, 0.0, 1e-3])
+        # each line in the colour of its name: grey for the background, red for the tip (solid) and fit end (dashed)
+        assert [(l.get_color(), l.get_linestyle()) for l in v.vlines] == [("0.35", "--"), ("crimson", "-"), ("crimson", "--")]
+        assert [l.get_color() for l in v.vlines_twin] == [l.get_color() for l in v.vlines]
+        assert labels["tip"].get_color() == "crimson" and labels["background end"].get_color() == "0.35"
+        assert v.hint_var.get() == STRESS_HINT and "fit window" in v.hint_var.get()
+        # the names follow the positions, not the order the lines are held in: drag the first line past the others
+        v.move_line(0, 1.5e-3)
+        assert [name for name, _ in v.line_styles(positions(v))] == ["fit end", "background end", "tip"]
+        assert v.vlines[0].get_linestyle() == "--" and v.vlines[0].get_color() == "crimson"
+        assert [role for role, _ in LINE_ROLES] == ["background end", "tip", "fit end"]
+        v.move_line(0, -1e-3)
+        # the line under the parameters gives the misfit over the fit window
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        assert "fit window 1000 us, xy" in v.result_var.get() and "misfit (rms) 0.000 MPa" in v.result_var.get()
+        v.Gc.set(4 * TRUE["Gc"])
+        v.update_plot()
+        assert "misfit (rms) 0.000 MPa" not in v.result_var.get() and "tau_p" in v.result_var.get()
+        v.set_event(1)                                                   # a record in volts: plain lines, no hint
+        assert all(l.get_color() == "g" and l.get_linestyle() == "--" for l in v.vlines)
+        assert v.hint_var.get() == "" and v.result_var.get() == "" and len(v.axs[0].texts) == 0
+    finally:
+        v.on_close()
+
+
+def test_auto_leaves_a_sensor_without_a_clear_front_alone(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    moving_front_record(app_with_strain, event, speed=200.0)
+    record = event["waveform"]["elsys"]
+    noise = np.random.default_rng(3).normal(0.0, 0.02, record["data"].shape[1])
+    record["data"][2] = 2.0 + noise                                       # shear_3: connected to nothing
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("shear_3")
+        v.update_plot()
+        before = (positions(v), v.Cf.get(), v.Gc.get(), v.Xc.get(), v.axs[0].get_xlim())
+        assert v.auto_fit() is None
+        assert (positions(v), v.Cf.get(), v.Gc.get(), v.Xc.get(), v.axs[0].get_xlim()) == before
+        assert "no clear front on shear_3" in v.result_var.get() and "nothing changed" in v.result_var.get()
+        v.gauge_combobox.set("shear_2")                                   # a sensor that does see the front
+        assert v.auto_fit() is not None and "Cf = " in v.result_var.get() and "misfit (rms)" in v.result_var.get()
+    finally:
+        v.on_close()
+
+
+def test_result_line_says_when_the_model_explains_nothing(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("rosette_1")
+        v.Cf.set(TRUE["Cf"]), v.Xc.set(TRUE["Xc"]), v.Gc.set(TRUE["Gc"])
+        v.update_plot()
+        assert "no better than no model" not in v.result_var.get()
+        v.Gc.set(1e-9)                                                    # a model of no size
+        v.update_plot()
+        assert "no better than no model" in v.result_var.get()
+        for var in v.fit_vars.values():
+            var.set(False)
+        v.update_plot()
+        assert v.result_var.get() == "no component ticked to fit"
+    finally:
+        v.on_close()
+
+
+def test_auto_finds_the_side_of_the_fault_for_a_rosette(app_with_strain):
+    """sigma_xx and sigma_yy change sign with the side: a rosette on the other
+    side is fitted with a negative y, which Auto finds by trying both."""
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    record = event["waveform"]["elsys"]
+    for name in ("rosette_1_sigma_xx", "rosette_1_sigma_yy"):             # the same rosette, seen from the other side
+        i = STRESS_NAMES.index(name)
+        record["data"][i] = 2 * record["data"][i][0] - record["data"][i]
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("rosette_1")
+        v.Cf.set(TRUE["Cf"])
+        v.update_plot()
+        assert v.fit_components() == ["xy", "xx", "yy"]
+        result = v.auto_fit()
+        assert result is not None and v.y.get() == pytest.approx(-TRUE["y"])
+        assert "no better than no model" not in v.result_var.get()
+        assert 0.5 * TRUE["Gc"] < v.Gc.get() < 2 * TRUE["Gc"]
+    finally:
+        v.on_close()
 

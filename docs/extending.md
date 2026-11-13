@@ -277,14 +277,19 @@ rosette, `['xy']` for a shear gauge), and `channel` is the sensor's
 `sigma_xy` channel. Pick Arrivals starts such a record with one trace per
 sensor (its `sigma_xy`); the menus switch the other components on.
 
-Levels of a stress record: the mean of each component over the background
-window (from `x_base`, the record's start unless moved, to the left marker
-line) is removed, so every trace starts at 0; the model's `sigma_xx` and
-`sigma_yy` are referred to the same window and its `sigma_xy`, which is zero
-at the residual level, is attached to the measured trace at `x_max`. `Auto`
-sets `Cf` (the saved arrivals, else the fronts at the record's sensors, kept
-below the Rayleigh speed), the lines, and starting values of `Xc` and `Gc`,
-then fits. `x_base` is saved with the other keys.
+Lines and levels of a stress record: the three marker lines are named on
+the plot, left to right `background end`, `tip` (the front reaches the
+sensor) and `fit end`. The mean of each component over the background
+window (grey band, from `x_base`, the record's start unless moved, to
+`background end`) is removed, so every trace starts at 0; the model's
+`sigma_xx` and `sigma_yy` are referred to the same window and its
+`sigma_xy`, which is zero at the residual level, is shifted to match the
+measured trace over the fit window (red band, `tip` to `fit end`). The line
+under the parameters gives the misfit there. `Auto` sets `Cf` (the saved
+arrivals, else the fronts at the record's sensors, kept below the Rayleigh
+speed), the lines, and starting values of `Xc` and `Gc`, then fits; it tries
+both sides of the fault when `sigma_xx` or `sigma_yy` are ticked and leaves
+a sensor without a clear front alone. `x_base` is saved with the other keys.
 
 ### `interevent` (InterEventView, run level, version 1)
 
