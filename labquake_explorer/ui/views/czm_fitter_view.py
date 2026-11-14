@@ -37,7 +37,14 @@ takes ``Cf`` from the saved arrivals or from the fronts at the record's
 sensors (kept below the Rayleigh speed), places the lines on the selected
 sensor's front, derives Xc and Gc from the duration and size of the drop,
 and runs the fit; on a sensor without a clear front it changes nothing.
-The front is the largest drop of sigma_xy over 50 us.  A component the
+The front is the largest drop of sigma_xy over 50 us.
+
+Which model.  Below the Rayleigh speed the steady sub-Rayleigh solution
+(:class:`~labquake_explorer.utils.cohesive_crack.CohesiveCrack`); between
+the shear and longitudinal wave speeds the steady supershear solution with
+the same cohesive zone (``SupershearCohesiveCrack``); between the Rayleigh
+and shear speeds, and above the longitudinal speed, no steady solution
+exists and no model is drawn.  The result line names the model in use.  A component the
 record flags as not valid (``valid``, from the conversion: an input it uses
 was railed) is drawn grey and left out of every fit.
 
@@ -61,7 +68,8 @@ from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_channels,
                                             waveform_data, waveform_time)
-from labquake_explorer.utils.cohesive_crack import CohesiveCrack
+from labquake_explorer.utils.cohesive_crack import (CohesiveCrack, cohesive_delta_sigmas, cohesive_gamma,
+                                                    cohesive_tau_p, rayleigh_speed, rupture_regime)
 
 STRESS_UNITS = {"Pa": 1.0, "kPa": 1e3, "MPa": 1e6, "GPa": 1e9}   # Pa per unit of a record stored in stress
 COMPONENTS = ("xy", "xx", "yy")                                   # the panels of a stress record, top to bottom
@@ -77,17 +85,9 @@ LINE_ROLES = (("background end", {"color": "0.35", "linestyle": "--", "alpha": 0
 STRESS_HINT = ("grey band: background, its mean is removed (drag its two edges)   |   red band: fit window, from 'tip' "
                "(the front reaches the sensor) to 'fit end'   |   black: the model, shifted to match sigma_xy inside it")
 CLEAR_FRONT = 8.0                                                 # Auto wants a front this many times the noise
-CF_LIMIT = 0.98                                                   # Auto keeps Cf below this fraction of the Rayleigh speed
+CF_LIMIT = 0.98                                                   # Auto keeps Cf this far inside a model's speed range
 
 
-def rayleigh_speed(c_s: float, c_d: float) -> float:
-    """The Rayleigh wave speed of a medium: the speed below ``c_s`` at which
-    ``D = 4 alpha_s alpha_d - (1 + alpha_s^2)^2`` vanishes.  The steady
-    cohesive-zone solution exists only for rupture speeds below it."""
-    def d(c):
-        a_s, a_d = np.sqrt(1 - (c / c_s) ** 2), np.sqrt(1 - (c / c_d) ** 2)
-        return 4 * a_s * a_d - (1 + a_s ** 2) ** 2
-    return float(optimize.brentq(d, 0.3 * c_s, c_s * (1 - 1e-9)))
 MEDIUM_SETTING = "medium"                                         # analysis['medium']: E_Pa, nu, vs_m_s, vp_m_s, rho_kg_m3
 
 
@@ -422,7 +422,8 @@ class CZMFitterView(EventView):
         text = (f"{compared};  medium ({self.medium_source}): E = {self.E / 1e9:.4g} GPa, "
                 f"nu = {self.nu:.3g}, C_s = {self.C_s:.0f} m/s, C_d = {self.C_d:.0f} m/s")
         if self.stress_mode:
-            text += f", C_R = {rayleigh_speed(self.C_s, self.C_d):.0f} m/s (Cf must stay below it)"
+            text += (f", C_R = {rayleigh_speed(self.C_s, self.C_d):.0f} m/s (sub-Rayleigh model below C_R, "
+                     f"supershear model between C_s and C_d)")
         self.medium_var.set(text)
 
     def channel_name(self, gauge_idx) -> str:
@@ -703,7 +704,7 @@ class CZMFitterView(EventView):
         stresses in Pa for a stress record."""
         Cf = self.Cf.get()
         x_zeroed = -t * Cf + x_tip * Cf  # position relative to the tip, in meters
-        delta_sigma_xx, delta_sigma_xy, delta_sigma_yy = CohesiveCrack.delta_sigmas(
+        delta_sigma_xx, delta_sigma_xy, delta_sigma_yy = cohesive_delta_sigmas(
             x_zeroed, self.y.get(), Xc, Cf, self.C_s, self.C_d, self.nu, Gc, self.E)
         if self.stress_mode:
             return {"xy": delta_sigma_xy, "xx": delta_sigma_xx, "yy": delta_sigma_yy}
@@ -794,8 +795,9 @@ class CZMFitterView(EventView):
                          fontsize=9, color=color, clip_on=True, zorder=6,
                          bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none", "pad": 0.5})
             if not np.isfinite(model["xy"]).any():
-                self.axs[0].text(0.5, 0.9, f"no model: Cf = {self.Cf.get():g} m/s is not below the Rayleigh speed "
-                                           f"({rayleigh_speed(self.C_s, self.C_d):.0f} m/s)",
+                self.axs[0].text(0.5, 0.9, f"no model: no steady solution at Cf = {self.Cf.get():g} m/s (between C_R = "
+                                           f"{rayleigh_speed(self.C_s, self.C_d):.0f} and C_s = {self.C_s:.0f} m/s, "
+                                           f"or above C_d = {self.C_d:.0f} m/s)",
                                  ha='center', va='center', transform=self.axs[0].transAxes, color='crimson')
         self.axs[-1].set_xlabel('Time (s)')
         self.figure.suptitle(self.figure_title())
@@ -970,7 +972,9 @@ class CZMFitterView(EventView):
             first, last = (int(np.argmin(np.abs(t - x))) for x in (t1, t2))
             drop = float(np.mean(xy[self.level_window(first)]) - np.mean(xy[self.level_window(last)]))
             text += f"   |   drop over the window = {drop / 1e6:.2f} MPa"
-        text += f"   |   Cf = {self.Cf.get() / rayleigh_speed(self.C_s, self.C_d):.2f} C_R"
+        regime = rupture_regime(self.Cf.get(), self.C_s, self.C_d)
+        text += (f"   |   Cf = {abs(self.Cf.get()) / self.C_s:.2f} C_s, supershear model" if regime == "supershear" else
+                 f"   |   Cf = {abs(self.Cf.get()) / rayleigh_speed(self.C_s, self.C_d):.2f} C_R, sub-Rayleigh model")
         without = objective([1e-12, self.Xc.get()])                                # the same with no model at all
         if np.isfinite(without) and value >= 0.9 * without:
             text += "   |   no better than no model: these components do not follow it"
@@ -1082,11 +1086,42 @@ class CZMFitterView(EventView):
         return {"change": float(step[i]), "t_front": float(t[min(i + lag // 2, t.size - 1)]),
                 "t_peak": float(t[i_peak]), "t_end": float(t[i_end]), "size": size, "noise": noise}
 
+    def front_delay(self, first, second, guess: float = 0.0) -> float | None:
+        """The time (s) by which channel ``second`` trails channel ``first``, from
+        the cross-correlation of the rates of change of their smoothed traces
+        over 0.6 ms around the front on ``first``: the lag within 0.2 ms of
+        ``guess`` that matches best, refined between samples.  None when
+        either trace is too short there."""
+        a, b = self.smoothed_changes(first), self.smoothed_changes(second)
+        if a is None or b is None:
+            return None
+        t, fs, lag, smooth_a, step = a
+        centre = int(np.argmax(np.abs(step))) + lag // 2
+        half, reach, shift = int(round(300e-6 * fs)), int(round(200e-6 * fs)), int(round(guess * fs))
+        start = centre - half + shift - reach                # where the lagged windows on ``second`` begin
+        if centre - half < 0 or centre + half > t.size or start < 0 or start + 2 * (half + reach) > t.size or half < 4:
+            return None
+        rate_a = np.gradient(smooth_a)[centre - half: centre + half]
+        rate_b = np.gradient(b[3])[start: start + 2 * (half + reach)]
+        rate_a = rate_a - rate_a.mean()
+        match = np.array([np.dot(rate_a, rate_b[k: k + 2 * half] - rate_b[k: k + 2 * half].mean())
+                          for k in range(2 * reach + 1)])
+        k = float(np.argmax(np.abs(match)))
+        if 0 < k < 2 * reach:                               # parabola through the peak and its neighbours
+            below, peak, above = (abs(match[int(k) + j]) for j in (-1, 0, 1))
+            if below - 2 * peak + above:
+                k += 0.5 * (below - above) / (below - 2 * peak + above)
+        return (k - reach + shift) / fs
+
     def estimate_rupture_speed(self) -> float | None:
         """Rupture speed (m/s, positive) for ``Auto``: the one Pick Arrivals
-        saved with the record, else the median slope between the arrivals at
-        the record's sensors (:meth:`arrival` on their sigma_xy) and their
-        positions; None when fewer than two sensor positions are left."""
+        saved with the record; else the median, over pairs of sensors of the
+        same kind (``shear_1`` and ``shear_3``, not a shear gauge and a
+        rosette, whose traces differ) whose sigma_xy is valid and shows a clear
+        front, of their distance over their :meth:`front_delay` (looked for
+        around the difference of their :meth:`arrival` times); else the
+        median slope between the :meth:`arrival` times of all the sensors and
+        their positions.  None when fewer than two sensor positions are left."""
         block = self.strain_block(self.event)
         try:
             return float(abs(read_arrivals(block, self.event)["rupture_speed"]))
@@ -1097,25 +1132,55 @@ class CZMFitterView(EventView):
         if not isinstance(positions, dict) or len(sensors) < 2:
             return None
         scale = {"mm": 1e-3, "cm": 1e-2, "m": 1.0}.get(str(positions.get("unit", "mm")), 1e-3)
-        points = []
-        for channel in sensors.values():
-            when = self.arrival(channel)                    # None: this sensor saw no clear change
+        placed = {}
+        for name, channel in sensors.items():
             try:
                 x = float(np.asarray(positions["x"], dtype=float).ravel()[channel]) * scale
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
-            if when is not None and np.isfinite(x):
-                points.append((x, when))
+            if np.isfinite(x):
+                placed[name] = (x, channel)
+        clear = {name: self.arrival(channel) for name, (x, channel) in placed.items()}   # None: no clear front
+        usable = [name for name in placed if clear[name] is not None and self.channel_valid(placed[name][1])]
+        speeds = []
+        for k, first in enumerate(usable):
+            for second in usable[k + 1:]:
+                if first.rstrip("0123456789") != second.rstrip("0123456789") or placed[first][0] == placed[second][0]:
+                    continue
+                delay = self.front_delay(placed[first][1], placed[second][1], clear[second] - clear[first])
+                if delay:
+                    speeds.append(abs((placed[second][0] - placed[first][0]) / delay))
+        if speeds:
+            return float(np.median(speeds))
+        points = [(placed[name][0], clear[name]) for name in placed if clear[name] is not None]
         slopes = [(tb - ta) / (xb - xa) for k, (xa, ta) in enumerate(points) for xb, tb in points[k + 1:] if xb != xa]
         slope = float(np.median(slopes)) if slopes else 0.0
         return 1.0 / abs(slope) if slope else None
 
+    def model_speed(self, speed) -> tuple:
+        """``(Cf, note)``: a measured rupture speed moved, when needed, to where a
+        steady model exists (``CF_LIMIT`` inside the nearer range), with a note
+        saying so ('' when the speed is used as it is)."""
+        speed = abs(float(speed))
+        c_r = rayleigh_speed(self.C_s, self.C_d)
+        low, high = CF_LIMIT * c_r, self.C_s / CF_LIMIT           # the edges of the two ranges facing the gap
+        top = CF_LIMIT * self.C_d
+        if speed <= low or high <= speed <= top:
+            return speed, ""
+        if speed > top:
+            return top, f"above C_d = {self.C_d:.0f} m/s: Cf kept at {CF_LIMIT:g} C_d (supershear model)"
+        if speed - low <= high - speed:
+            return low, (f"between C_R = {c_r:.0f} and C_s = {self.C_s:.0f} m/s, where no steady solution exists: "
+                         f"Cf kept at {CF_LIMIT:g} C_R (sub-Rayleigh model)")
+        return high, (f"between C_R = {c_r:.0f} and C_s = {self.C_s:.0f} m/s, where no steady solution exists: "
+                      f"Cf kept at C_s / {CF_LIMIT:g} (supershear model)")
+
     def auto_fit(self):
         """A starting point for a stress record, then the fit.
 
-        ``Cf`` from :meth:`estimate_rupture_speed`, kept below ``CF_LIMIT`` of the
-        Rayleigh speed (the value in the box when there is nothing to estimate
-        from); the tip line on the selected sensor's sigma_xy maximum just
+        ``Cf`` from :meth:`estimate_rupture_speed`, moved by :meth:`model_speed`
+        to where a steady model exists (the value in the box when there is
+        nothing to estimate from); the tip line on the selected sensor's sigma_xy maximum just
         before its front and ``fit end`` at the end of the initial rapid drop,
         so that the fit takes the weakening at the tip and leaves out the
         slower drop that follows; the left line (end of the background
@@ -1143,17 +1208,12 @@ class CZMFitterView(EventView):
             self.result_var.set(self.result_text())
             return None
         t = self._time()
-        c_r = rayleigh_speed(self.C_s, self.C_d)
-        limit = CF_LIMIT * c_r
         speed = self.estimate_rupture_speed()
-        Cf = min(speed, limit) if speed else min(self.Cf.get(), limit)
-        if speed and speed > limit:
-            self.auto_note = (f"Auto: the fronts give {speed:.0f} m/s, not below C_R = {c_r:.0f} m/s, where the model "
-                              f"does not exist: Cf kept at {CF_LIMIT:g} C_R")
-        elif speed:
-            self.auto_note = f"Auto: Cf = {speed:.0f} m/s from the fronts"
+        Cf, why = self.model_speed(speed if speed else self.Cf.get())
+        if not speed:
+            self.auto_note = "Auto: no rupture speed to take" + (f"; {why}" if why else "; Cf left as it was")
         else:
-            self.auto_note = "Auto: no rupture speed to take; Cf left as it was"
+            self.auto_note = f"Auto: the fronts give {speed:.0f} m/s" + (f"; {why}" if why else "")
         self.Cf.set(float(Cf))
         tip, end = found["t_peak"], found["t_end"]
         if end - tip < 5 * float(np.median(np.diff(t))):          # no measurable drop time: 0.1 ms
@@ -1163,10 +1223,7 @@ class CZMFitterView(EventView):
         self.x_base = None                                        # the background window: record start .. left line
         self.set_lines([left, tip, end])
         Xc = max(Cf * drop, 1e-6)
-        with np.errstate(all="ignore"):
-            alpha_s, alpha_d = CohesiveCrack.alpha_s(Cf, self.C_s), CohesiveCrack.alpha_d(Cf, self.C_d)
-            A2 = CohesiveCrack.compute_A2(Cf, self.C_s, self.nu, CohesiveCrack.D(alpha_s, alpha_d))
-            Gc = found["size"] ** 2 * (32 * Xc / (9 * np.pi)) * (1 - self.nu ** 2) * A2 / self.E   # tau_p = size
+        Gc = cohesive_gamma(found["size"], Xc, Cf, self.C_s, self.C_d, self.nu, self.E)       # tau_p = size
         self.Xc.set(float(Xc))
         self.Gc.set(float(Gc) if np.isfinite(Gc) and Gc > 0 else 1.0)
         margin = 0.5 * (end - left)
@@ -1203,8 +1260,9 @@ class CZMFitterView(EventView):
         sensor's ``sigma_xy`` channel for a stress record, with the ``sensor``
         itself), the record's unit,
         the elastic medium, the components fitted together and the start of
-        the background window ``x_base`` (stress records), and the peak
-        strength ``tau_p`` (Pa) that Gc and Xc imply at this Cf."""
+        the background window ``x_base`` (stress records), the ``model`` in
+        use at this Cf (``sub-Rayleigh`` or ``supershear``) and the peak
+        strength ``tau_p`` (Pa) that Gc and Xc imply there."""
         gauge = int(self.strain_gauge.get())
         if self.stress_mode:
             gauge = self.sensor_channels(gauge)["xy"]
@@ -1216,12 +1274,10 @@ class CZMFitterView(EventView):
             context["x_base"] = self.baseline_window(self._time(), self.current_line_positions())[0]
         if self.stress_mode and self.fit_components():
             context["fit_components"] = self.fit_components()
-        with np.errstate(all="ignore"):
-            Cf = self.Cf.get()
-            alpha_s, alpha_d = CohesiveCrack.alpha_s(Cf, self.C_s), CohesiveCrack.alpha_d(Cf, self.C_d)
-            A2 = CohesiveCrack.compute_A2(Cf, self.C_s, self.nu, CohesiveCrack.D(alpha_s, alpha_d))
-            tau_p = CohesiveCrack.compute_tau_p(CohesiveCrack.compute_K2(self.Gc.get(), self.E, self.nu, A2),
-                                                self.Xc.get())
+        regime = rupture_regime(self.Cf.get(), self.C_s, self.C_d)
+        if regime:
+            context["model"] = regime
+        tau_p = cohesive_tau_p(self.Gc.get(), self.Xc.get(), self.Cf.get(), self.C_s, self.C_d, self.nu, self.E)
         if np.isfinite(tau_p):
             context["tau_p"] = float(tau_p)
         return context

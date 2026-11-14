@@ -296,8 +296,16 @@ the channel is not a real measurement (an input it uses was railed or
 unplugged). Event records inherit it (`waveform/<recorder>/valid`). Pick
 Arrivals still draws such a channel, since it tells when the front arrives;
 the CZM view draws it grey and leaves it out of every fit. `Auto` takes the
-rupture speed from the arrivals at the sensors (where each trace first
-leaves its level) and puts the tip on the largest drop of `sigma_xy`.
+rupture speed from sensors of the same kind (cross-correlation of their
+fronts), puts the tip on the largest drop of `sigma_xy` and ends the fit
+window at the end of the initial rapid drop.
+
+The model follows the rupture speed (`utils.cohesive_crack`): below the
+Rayleigh speed the sub-Rayleigh solution (`CohesiveCrack`), between `C_s`
+and `C_d` the supershear solution with the same cohesive zone
+(`SupershearCohesiveCrack`); between the Rayleigh and shear speeds, and
+above `C_d`, no steady solution exists and nothing is drawn. When it saves
+the extra keys, `czm_parms` records which as `model`.
 
 ### `interevent` (InterEventView, run level, version 1)
 

@@ -517,7 +517,8 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.save_parameters()
         saved = event["czm_parms"]
         assert set(saved) == EXPECTED_KEYS | {"channel", "sensor", "unit", "E", "nu", "C_s", "C_d", "tau_p",
-                                              "fit_components", "x_base"}
+                                              "fit_components", "x_base", "model"}
+        assert saved["model"] == "sub-Rayleigh"
         assert saved["sensor"] == "rosette_1" and saved["channel"] == "rosette_1_sigma_xy"
         assert saved["unit"] == "MPa" and saved["strain_gauge"] == 2
         assert saved["fit_components"] == ["xy", "xx"]
@@ -698,16 +699,90 @@ def test_auto_gives_a_starting_point_and_fits(app_with_strain):
         assert v.Cf.get() == pytest.approx(350.0)
     finally:
         v.on_close()
-    # a front faster than the Rayleigh speed: Cf is kept just below it, where the model exists
+    # a front faster than any wave: Cf is kept just below C_d, where the supershear model still exists
     moving_front_record(app_with_strain, event, speed=5000.0)
     v = CZMFitterView(app_with_strain, 0, 2)
     try:
         result = v.auto_fit()
-        limit = CF_LIMIT * rayleigh_speed(v.C_s, v.C_d)
-        assert v.Cf.get() == pytest.approx(limit) and result is not None
-        v.Cf.set(1.01 * rayleigh_speed(v.C_s, v.C_d))                       # above it: said on the plot, no fit
+        assert v.Cf.get() == pytest.approx(CF_LIMIT * v.C_d) and result is not None
+        assert "supershear model" in v.result_var.get() and "above C_d" in v.result_var.get()
+        v.Cf.set(0.5 * (rayleigh_speed(v.C_s, v.C_d) + v.C_s))               # between C_R and C_s: said on the plot, no fit
         v.update_plot()
         assert any("no model" in text.get_text() for text in v.axs[0].texts) and v.fit_parameters() is None
+    finally:
+        v.on_close()
+
+
+def test_model_speed_keeps_to_where_a_steady_solution_exists(app_with_strain):
+    from labquake_explorer.ui.views.czm_fitter_view import CF_LIMIT, rayleigh_speed
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        c_r, c_s, c_d = rayleigh_speed(v.C_s, v.C_d), v.C_s, v.C_d
+        assert v.model_speed(0.6 * c_r) == (pytest.approx(0.6 * c_r), "")             # sub-Rayleigh: as measured
+        assert v.model_speed(-1.2 * c_s) == (pytest.approx(1.2 * c_s), "")            # supershear: as measured
+        speed, note = v.model_speed(1.01 * c_r)                                       # just above C_R: back under it
+        assert speed == pytest.approx(CF_LIMIT * c_r) and "sub-Rayleigh model" in note
+        speed, note = v.model_speed(0.995 * c_s)                                      # just under C_s: over it
+        assert speed == pytest.approx(c_s / CF_LIMIT) and "supershear model" in note
+        speed, note = v.model_speed(2 * c_d)
+        assert speed == pytest.approx(CF_LIMIT * c_d) and "above C_d" in note
+    finally:
+        v.on_close()
+
+
+FAST = {"Xc": 0.1, "Gc": 20.0}      # a cohesive zone a supershear front takes 50 us to cross: resolved at 2 MHz
+
+
+def supershear_record(app, event, speed):
+    """A stress record of three shear gauges 100 mm apart crossed by a
+    supershear front (the supershear cohesive-zone model itself, ``FAST``
+    for Xc and Gc), the middle gauge at the event time."""
+    from labquake_explorer.data.channels import channel_array, positions_table
+    from labquake_explorer.ui.views.czm_fitter_view import experiment_medium
+    from labquake_explorer.utils.cohesive_crack import SupershearCohesiveCrack
+    app.data_manager.data["analysis"] = {"medium": dict(MEDIUM)}
+    m = experiment_medium(app.data_manager.data)
+    t = np.arange(-3000, 3001) / 2e6
+    names, xs = ["shear_1_sigma_xy", "shear_2_sigma_xy", "shear_3_sigma_xy"], [100.0, 200.0, 300.0]
+    rows = []
+    for x in xs:
+        delay = (x - 200.0) * 1e-3 / speed
+        _, sxy, _ = SupershearCohesiveCrack.delta_sigmas(-(t - delay) * speed, TRUE["y"], FAST["Xc"], speed,
+                                                         m["C_s"], m["C_d"], m["nu"], FAST["Gc"], m["E"])
+        rows.append(sxy + 2.0e6)
+    event.pop("strain", None)
+    event.pop("czm_parms", None)
+    event["waveform"] = {"elsys": channel_array(
+        np.vstack(rows) / 1e6, names, unit="MPa", dtype=np.float64, time=float(event["event_time"]) + t,
+        sample_rate=2e6, block=2, positions=positions_table(names, {n: (x, 1.0, np.nan) for n, x in zip(names, xs)}))}
+    return m
+
+
+def test_supershear_front_is_fitted_with_the_supershear_model(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    medium = supershear_record(app_with_strain, event, speed=2000.0)       # 1.2 C_s
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert "supershear model between C_s and C_d" in v.medium_var.get()
+        v.gauge_combobox.set("shear_2")
+        result = v.auto_fit()
+        assert result is not None and result.success
+        assert v.Cf.get() == pytest.approx(2000.0, rel=0.03) and medium["C_s"] < v.Cf.get() < medium["C_d"]
+        assert "supershear model" in v.result_var.get() and "C_s" in v.result_var.get()
+        # the fit lands near the parameters the record was made with
+        assert 0.5 * FAST["Gc"] < v.Gc.get() < 2 * FAST["Gc"] and 0.5 * FAST["Xc"] < v.Xc.get() < 2 * FAST["Xc"]
+        # with the true parameters and the tip on the front, the model lies on the record inside the fit window
+        v.Cf.set(2000.0), v.Gc.set(FAST["Gc"]), v.Xc.set(FAST["Xc"])
+        left, tip, end = positions(v)
+        v.set_lines([left, 0.0, end])
+        v.update_plot()
+        measured, model = drawn(v.axs[0], "sigma_xy"), drawn(v.axs[0], "CZM")
+        inside = (v._time() >= 0.0) & (v._time() <= end)
+        np.testing.assert_allclose(measured[inside], model, atol=1e-6 * np.ptp(measured))
+        v.save_parameters()
+        assert event["czm_parms"]["model"] == "supershear" and 1e4 < event["czm_parms"]["tau_p"] < 1e8
     finally:
         v.on_close()
 
