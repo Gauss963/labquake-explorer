@@ -4,14 +4,11 @@ import pytest
 from labquake_explorer.data import spectrum_store as st
 
 
-def test_set_name_validation():
+def test_set_names_and_a_version_1_store_read_as_the_default_set():
     assert st.set_name("  EGF ") == "EGF"
     for bad in ("", "   ", None, "a/b"):
         with pytest.raises(ValueError):
             st.set_name(bad)
-
-
-def test_version_1_store_reads_as_the_default_set():
     v1 = {"version": 1, "channels": {"ch0": {"channel": 0}}}
     assert st.store_sets(v1) == {"default": v1}
     assert st.set_names(v1) == ["default"]

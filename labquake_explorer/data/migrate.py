@@ -33,7 +33,8 @@ What is brought up to date (see ``docs/extending.md`` for the layouts):
   ``high_rate``/``low_rate`` and the older per-recorder blocks with
   ``original`` become ``waveform/<recorder>`` records; every record gets its
   ``trigger_time`` and sensor ``positions``; arrival picks kept among a
-  record's data keys move under its ``arrivals``; ``event_analysis`` records
+  record's data keys move under its ``arrivals``, and a version-1 ``arrivals``
+  record becomes the pick set ``default`` of a version-2 one; ``event_analysis`` records
   of version 1 or 2 become version 3; PZT spectrum records point at
   ``waveform/<recorder>``.
 
@@ -56,8 +57,9 @@ from labquake_explorer.data.picks import EXTRACTION_KEY, LEGACY_INDICES_KEY
 from labquake_explorer.data.settings import ANALYSIS_KEY, delete_setting, get_setting, set_setting
 from labquake_explorer.data.spectrum_store import DEFAULT_SET, STORE_VERSION, ensure_set, upgrade_store
 from labquake_explorer.data.stamp import write_stamp_h5
-from labquake_explorer.data.sources import (WAVEFORM, ARRIVALS_KEY, is_legacy_strain, is_waveform_block,
-                                            read_arrivals, run_sources, waveform_trigger_time, write_arrivals)
+from labquake_explorer.data.sources import (WAVEFORM, ARRIVALS_KEY, ARRIVALS_VERSION, DEFAULT_ARRIVAL_SET,
+                                            is_legacy_strain, is_waveform_block, read_arrivals, run_sources,
+                                            upgrade_arrivals, waveform_trigger_time, write_arrivals)
 
 RUN_KEYS_DROPPED = ("file", "file_index", "ni_file", "sources")
 NI_KEYS_DROPPED = ("labels", "member_offsets")
@@ -290,6 +292,9 @@ def upgrade_event(event: dict, run: Mapping, where: str = "event") -> list:
         store = block.get("spectrum")
         if isinstance(store, dict) and store.get("version") != STORE_VERSION and upgrade_store(store):
             notes.append(f"{where}: {key}/spectrum upgraded to version {STORE_VERSION} (set {DEFAULT_SET})")
+        if upgrade_arrivals(block):
+            notes.append(f"{where}: {key}/{ARRIVALS_KEY} upgraded to version {ARRIVALS_VERSION} "
+                         f"(pick set {DEFAULT_ARRIVAL_SET})")
     return notes
 
 

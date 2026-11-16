@@ -11,7 +11,6 @@ FS, N, T0 = 1e6, 8000, 4e-3
 
 
 def attenuated_record(fc: float, t_star_s: float, seed: int = 0) -> dict:
-    """A saved-record-like dict whose binned spectrum is a Brune pulse attenuated by ``t*``."""
     t, x = sp.brune_pulse(FS, N, 1.0, fc, T0)
     s = sp.compute_spectrum(sp.extract_window(t, x, T0, 2e-3, 2e-3), fmin=500.0, fmax=100e3)
     loss = np.exp(-np.pi * s.f_binned * t_star_s)              # the medium's attenuation, no t* recorded

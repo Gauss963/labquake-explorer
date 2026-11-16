@@ -15,7 +15,7 @@ def spectrum(fc=20e3, calibration=None):
     return sp.compute_spectrum(sp.extract_window(t, x, T0, 1e-3, 1e-3), calibration=calibration, fmin=500.0, fmax=100e3)
 
 
-def test_frequency_lists_and_band_grid():
+def test_frequency_lists_band_grid_and_stats():
     assert se.parse_frequency_list("1000, 1500 2000;3000") == (1000.0, 1500.0, 2000.0, 3000.0)
     assert se.parse_frequency_list("  ", se.DEFAULT_FMINS_HZ) == se.DEFAULT_FMINS_HZ
     assert se.parse_frequency_list("2000, 1000, 2000") == (1000.0, 2000.0)
@@ -24,10 +24,8 @@ def test_frequency_lists_and_band_grid():
             se.parse_frequency_list(bad)
     grid = se.band_grid((1000.0, 20000.0), (15000.0, 50000.0))
     assert grid == [(1000.0, 15000.0), (1000.0, 50000.0), (20000.0, 50000.0)]   # fmin < fmax only
-    assert se.band_grid(se.DEFAULT_FMINS_HZ, se.DEFAULT_FMAXS_HZ) and len(se.band_grid(se.DEFAULT_FMINS_HZ, se.DEFAULT_FMAXS_HZ)) == 16
-
-
-def test_stats():
+    assert len(se.band_grid(se.DEFAULT_FMINS_HZ, se.DEFAULT_FMAXS_HZ)) == 16
+    # statistics over the valid members only
     s = se.stats([1.0, 2.0, 3.0, np.nan, 10.0], valid=[True, True, True, True, False])
     assert s["n"] == 3 and s["min"] == 1.0 and s["max"] == 3.0 and s["median"] == 2.0
     assert s["p16"] == pytest.approx(np.percentile([1, 2, 3], 16)) and s["p84"] == pytest.approx(np.percentile([1, 2, 3], 84))

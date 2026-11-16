@@ -8,7 +8,11 @@ settings as the record's own fit.  The members' ``omega0``, ``fc`` and ``n``
 are summarised by their min, max, 16th / 84th percentiles and median over
 the valid members (``stats``) and again over the valid members whose corner
 was resolved inside their band (``stats_resolved``: a band whose fmin sits
-at fc pins the fit at the edge and would widen the spread); the seismic
+at fc pins the fit at the edge and would widen the spread).  The statistics
+are a range, not a point estimate: ``stats_resolved`` picks members by their
+own fc, so for a corner below about twice the larger fmins the survivors are
+the members that landed high and its median (and, less, its percentiles)
+are biased upward; the record's own fit is the estimate.  The seismic
 moment follows the plateau linearly for one
 set of source constants, so ``with_moment`` scales it from the record's own
 ``M0 / Omega0``.  Pure numerics; the PZT Spectrum view stores

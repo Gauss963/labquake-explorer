@@ -1,10 +1,12 @@
+import h5py
 import numpy as np
 import pytest
 
+from labquake_explorer.data.channels import channel_array
 from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data import sources as S
 from labquake_explorer.utils import tpc5
-from tests.synthetic import write_ni_npz, write_tpc5
+from tests.synthetic import load_manager, save_data, write_ni_npz, write_tpc5
 
 
 def pulse(t0, width=1e-4, amp=0.1):
@@ -26,7 +28,7 @@ def elsys(tmp_path):
     return path
 
 
-def test_tpc5_source_fields_blocks_and_history(elsys):
+def test_tpc5_source(elsys, tmp_path):
     src = S.Tpc5Source.open(elsys, ELSYS_MAP, time_offset=2.0)
     assert src.fields == ["pzt_1", "pressure_1", "lvdt"]
     assert src.channel_numbers == [1, 2, 3] and src.channel_names[0] == "A1 (0.A1)"
@@ -38,10 +40,7 @@ def test_tpc5_source_fields_blocks_and_history(elsys):
     assert d[1].mean() == pytest.approx(2.0, abs=1e-3)
     t2, d2 = src.time_history(decimation=4)
     assert d2.shape == (3, 1000) and t2[0] == pytest.approx(2.0 + 1.5 / 2000)
-
-
-def test_tpc5_read_window_on_run_clock(elsys):
-    src = S.Tpc5Source.open(elsys, ELSYS_MAP, time_offset=2.0)
+    # read_window on the run clock
     win = src.read_window(2.499, 2.503)
     assert win is not None and win.block == 2 and win.sample_rate == 200_000.0
     assert win.fields == ["pzt_1", "pressure_1", "lvdt"]
@@ -51,19 +50,32 @@ def test_tpc5_read_window_on_run_clock(elsys):
     win = src.read_window(2.0, 3.0, ["lvdt"])
     assert win.fields == ["lvdt"] and win.time[0] == pytest.approx(2.498, abs=1e-5) and win.time[-1] == pytest.approx(2.508, abs=1e-5)
     assert src.read_window(3.0, 3.01) is None
-    with pytest.raises(KeyError):
-        src.read_window(2.499, 2.503, ["nope"])
-
-
-def test_tpc5_event_window_uses_source_settings(elsys):
+    pytest.raises(KeyError, src.read_window, 2.499, 2.503, ["nope"])
+    # event_window uses the source's settings
     src = S.Tpc5Source.open(elsys, ELSYS_MAP, event_fields=["pzt_1"], event_window_s=(0.001, 0.002))
     win = src.event_window(0.5, pre=5.0, post=5.0)
     assert win.fields == ["pzt_1"]
     assert win.time.size == pytest.approx(0.003 * 200_000 + 1, abs=1)
     assert win.data.dtype == np.float32
-
-
-def test_tpc5_reference_round_trip(elsys, tmp_path):
+    # waveform keeps the whole block [0.498, 0.508] s, here on a run clock 10 s later
+    src = S.Tpc5Source.open(elsys, ELSYS_MAP, time_offset=10.0)
+    block = src.trigger_blocks[0]
+    for t, pre, post in ((10.505, 0.001, 0.001),      # in the post-trigger part, a window shorter than the block
+                         (10.52, 0.05, 0.05),         # after the block, which is the one in the window
+                         (10.47, 0.05, 0.05)):        # before it
+        win = src.waveform(t, pre, post)
+        assert win.block == 2 and win.time.size == block.n_samples == 2000
+        assert win.time[0] == pytest.approx(10.498, abs=1e-9)                 # the first pre-trigger sample
+        assert win.time[-1] == pytest.approx(10.498 + 1999 / 200_000, abs=1e-9)
+        assert win.trigger_time == pytest.approx(10.5)
+    assert src.waveform(10.9, 0.05, 0.05) is None
+    # read_record: by number or BlockInfo, event fields by default
+    narrow = S.Tpc5Source.open(elsys, ELSYS_MAP, event_fields=["pzt_1"])
+    rec = narrow.read_record(3)
+    assert rec.block == 3 and rec.fields == ["pzt_1"] and rec.data.shape == (1, 2000)
+    np.testing.assert_array_equal(rec.data, narrow.read_record(narrow.trigger_blocks[1]).data)
+    pytest.raises(KeyError, narrow.read_record, 9)
+    # the reference round trip through a saved file
     src = S.Tpc5Source.open(elsys, ELSYS_MAP, time_offset=2.389, event_fields=["pzt_1"],
                             event_window_s=(0.1, 0.5), meta={"clock_offset_method": "trigger"})
     ref = src.to_reference(tmp_path)
@@ -89,7 +101,7 @@ def test_tpc5_reference_round_trip(elsys, tmp_path):
     np.testing.assert_allclose(a.time, b.time)
 
 
-def test_ni_source(tmp_path):
+def test_ni_and_legacy_strain_sources(tmp_path):
     path = tmp_path / "T0001-raw-run1-20260101_000000.npz"
     write_ni_npz(path, {"n": lambda t: 3.5 + 0 * t, "s": lambda t: 0.7 + 0 * t, "e": lambda t: -0.5 - 2.0 * t},
                  fs=10_000.0, duration=2.0, trigger_sample_index=12_000)
@@ -110,9 +122,7 @@ def test_ni_source(tmp_path):
     assert isinstance(again, S.NINpzSource) and again.fields == src.fields and again.decimation == 5
     assert again.meta["input_range_v"] == 10.0
     np.testing.assert_array_equal(again.read_window(1.0, 1.001).data, win.data)
-
-
-def test_legacy_strain_source(tmp_path):
+    # the legacy strain layout reads its tpc5 on the run's clock
     path = tmp_path / "legacy.tpc5"
     write_tpc5(path, {"ch1": lambda t: 0.1 * t, "ch2": lambda t: 0.0 * t}, fs_continuous=1000.0,
                duration=2.0, trigger_times=())
@@ -127,16 +137,6 @@ def test_legacy_strain_source(tmp_path):
     assert win.data[0, 0] == pytest.approx(0.05, abs=2e-4)
     with pytest.raises(ValueError):
         S.open_source(run["strain"], tmp_path)   # needs the run for its clock
-
-
-def test_register_source_and_block_mean():
-    with pytest.raises(ValueError):
-        S.register_source(type("Bad", (S.Source,), {}))
-    x = np.arange(10.0)
-    np.testing.assert_array_equal(S.block_mean(x, 3), [1.0, 4.0, 7.0])
-    np.testing.assert_array_equal(S.block_mean(x, 1), x)
-    assert S.block_mean(np.arange(12.0).reshape(2, 6), 2).shape == (2, 3)
-    assert S.reference_format({"a": 1}) is None and S.reference_format(3) is None
 
 
 def test_tpc5_waveform_picks_the_block_overlapping_the_window_most(tmp_path):
@@ -165,7 +165,6 @@ def test_tpc5_waveform_picks_the_block_overlapping_the_window_most(tmp_path):
     win = S.Tpc5Source.open(single, ELSYS_MAP).waveform(1.0, 0.1, 0.2)
     assert win.block == 1 and win.time[0] == pytest.approx(0.9, abs=1e-3) and win.time[-1] == pytest.approx(1.2, abs=1e-3)
     assert win.trigger_time is None and "trigger_time" not in win.as_channel_array()
-    assert "block" not in S.NINpzSource.__dict__ or True
     win = S.Tpc5Source.open(single, ELSYS_MAP, event_window_s=(0.01, 0.02)).waveform(1.0, 0.1, 0.2)
     assert win.time[0] == pytest.approx(0.99, abs=1e-3) and win.time[-1] == pytest.approx(1.02, abs=1e-3)
 
@@ -199,11 +198,7 @@ def test_select_trigger_block_rule():
     assert pick(blocks, 1.30, 0.18, 0.18) is b3                              # b2 ends before the window
     assert pick(blocks, 2.25, 0.1, 0.1) is None                              # (c) nothing overlaps the window
     assert pick([], 1.0, 1.0, 1.0) is None
-
-
-def test_only_blocks_overlapping_the_window_are_candidates():
-    b2, b3, b4 = span(2, 1.00, 1.10), span(3, 1.05, 1.15), span(4, 2.00, 2.10)
-    blocks = [b2, b3, b4]
+    # only blocks overlapping the window are candidates
     assert S.overlapping_trigger_blocks(blocks, 1.07, 0.1, 0.1) == [b2, b3]
     assert S.overlapping_trigger_blocks([b4, b3, b2], 1.07, 0.1, 0.1) == [b3, b2]     # in their order
     assert S.overlapping_trigger_blocks(blocks, 1.5, 0.1, 0.1) == []
@@ -217,32 +212,7 @@ def test_only_blocks_overlapping_the_window_are_candidates():
     assert S.select_trigger_block(blocks, 1.02, -0.5, 0.6) is None                   # window [1.52, 1.62]: no block
 
 
-def test_tpc5_waveform_keeps_the_whole_block(tmp_path):
-    path = tmp_path / "whole.tpc5"
-    write_tpc5(path, ELSYS_SIGNALS, trigger_times=(0.5, 1.4), volt_range=12.0)   # blocks [0.498, 0.508], [1.398, 1.408]
-    src = S.Tpc5Source.open(path, ELSYS_MAP, time_offset=10.0)
-    block = src.trigger_blocks[0]
-    for t, pre, post in ((10.505, 0.001, 0.001),      # in the post-trigger part, a window shorter than the block
-                         (10.52, 0.05, 0.05),         # after the block, which is the one in the window
-                         (10.47, 0.05, 0.05)):        # before it
-        win = src.waveform(t, pre, post)
-        assert win.block == 2 and win.time.size == block.n_samples == 2000
-        assert win.time[0] == pytest.approx(10.498, abs=1e-9)                 # the first pre-trigger sample
-        assert win.time[-1] == pytest.approx(10.498 + 1999 / 200_000, abs=1e-9)
-        assert win.trigger_time == pytest.approx(10.5)
-    assert src.waveform(10.9, 0.05, 0.05) is None
-    # read_record: by number or BlockInfo, event fields by default
-    narrow = S.Tpc5Source.open(path, ELSYS_MAP, event_fields=["pzt_1"])
-    rec = narrow.read_record(3)
-    assert rec.block == 3 and rec.fields == ["pzt_1"] and rec.data.shape == (1, 2000)
-    np.testing.assert_array_equal(rec.data, narrow.read_record(narrow.trigger_blocks[1]).data)
-    with pytest.raises(KeyError):
-        narrow.read_record(9)
-
-
 def test_tpc5_open_refuses_layouts_it_cannot_read(tmp_path):
-    import h5py
-
     def fresh(name):
         path = tmp_path / name
         write_tpc5(path, ELSYS_SIGNALS, trigger_times=(0.5, 1.4), volt_range=12.0)
@@ -271,8 +241,7 @@ def test_tpc5_open_refuses_layouts_it_cannot_read(tmp_path):
         assert tpc5.layout_problems(f, channels=[1, 2]) == []
 
 
-def test_waveform_helpers_cover_both_layouts():
-    from labquake_explorer.data.channels import channel_array
+def test_waveform_helpers_registry_and_block_mean():
     t = np.linspace(0, 1, 11)
     new = channel_array(np.vstack([t, 2 * t]), ["pzt_1", "pzt_2"], unit="V", time=t, sample_rate=10.0, block=2)
     legacy = {"filename": "x.tpc5", "time_offset": 0.0, "time": t, "raw": np.zeros((3, 11)),
@@ -292,11 +261,13 @@ def test_waveform_helpers_cover_both_layouts():
     assert S.pick_waveform_block(event, prefer_keys=("strain",)) == "strain"
     assert S.pick_waveform_block({"time": t}) is None
     assert S.block_channel_labels(new) == ["pzt_1", "pzt_2"]
-
-
-def test_waveform_trigger_time_stored_or_looked_up():
-    from labquake_explorer.data.channels import channel_array
-    t = np.linspace(0, 1, 11)
+    pytest.raises(ValueError, S.register_source, type("Bad", (S.Source,), {}))
+    x = np.arange(10.0)
+    np.testing.assert_array_equal(S.block_mean(x, 3), [1.0, 4.0, 7.0])
+    np.testing.assert_array_equal(S.block_mean(x, 1), x)
+    assert S.block_mean(np.arange(12.0).reshape(2, 6), 2).shape == (2, 3)
+    assert S.reference_format({"a": 1}) is None and S.reference_format(3) is None
+    # trigger_time: stored, or looked up in the run's reference by block number
     stored = channel_array(np.zeros((1, 11)), ["pzt_1"], time=t, sample_rate=10.0, block=3, trigger_time=12.5)
     assert S.waveform_trigger_time(stored) == 12.5
     older = channel_array(np.zeros((1, 11)), ["pzt_1"], time=t, sample_rate=10.0, block=3)   # extracted before trigger_time was stored
@@ -307,3 +278,44 @@ def test_waveform_trigger_time_stored_or_looked_up():
     continuous = channel_array(np.zeros((1, 11)), ["eddy_1"], time=t, sample_rate=10.0)
     assert S.waveform_trigger_time(continuous, run, "waveform/ni") is None
     assert S.waveform_trigger_time({"original": {"time": t, "raw": np.zeros((1, 11))}}, run, "strain") is None
+
+
+def test_arrival_pick_sets_in_both_layouts(tmp_path):
+    rec = lambda k: {"picked_idx": [k, k + 1], "arrival_time": np.array([0.1, 0.2]), "rupture_speed": 1.0 * k}
+    # a waveform record: a version-1 record (or the keys from before 'arrivals') is the set 'default'
+    for block in ({"arrivals": {"version": 1, **rec(1)}}, {"picked_idx": [1, 2], "rupture_arrival_time": [0.1, 0.2]}):
+        assert S.arrival_sets(block) == ["default"] and S.current_arrival_set(block) == "default"
+        assert S.read_arrivals(block)["picked_idx"] == [1, 2]
+        S.write_arrivals(block, rec(5), set_name="peak")                  # upgrades, then adds a set
+        store = block["arrivals"]
+        assert store["version"] == 2 and store["current"] == "peak" and "picked_idx" not in block
+        assert S.arrival_sets(block) == ["default", "peak"]
+        assert S.read_arrivals(block)["rupture_speed"] == 5.0              # None: the set saved last
+        assert S.read_arrivals(block, set_name="default")["picked_idx"] == [1, 2]
+        assert S.read_arrivals(block, set_name="other") == {}
+        S.write_arrivals(block, {**rec(7), "rupture_speed": None})          # None: the current set again
+        assert "rupture_speed" not in store["sets"]["peak"] and store["sets"]["peak"]["picked_idx"] == [7, 8]
+    assert S.arrival_sets({}) == [] and S.current_arrival_set({}) is None and S.read_arrivals({}) == {}
+    for bad in ("", "  ", "a/b"):
+        with pytest.raises(ValueError, match="pick.set"):
+            S.write_arrivals({}, rec(1), set_name=bad)
+    # the PSU strain layout: 'default' stays in its historical places, other sets under strain['arrivals']
+    event = {"rupture_speed": 2.0}
+    strain = {"original": {"time": np.arange(5.0), "raw": np.zeros((2, 5)), "picked_idx": [3, 4],
+                           "rupture_arrival_time": [0.3, 0.4]}, "locations": [1.0, 2.0],
+              "arrivals": {"version": 1, "front_mode": "bilateral"}}
+    assert S.read_arrivals(strain, event) == {"picked_idx": [3, 4], "arrival_time": [0.3, 0.4], "locations": [1.0, 2.0],
+                                              "rupture_speed": 2.0, "front_mode": "bilateral"}
+    S.write_arrivals(strain, rec(9), event, set_name="peak")
+    assert strain["original"]["picked_idx"] == [3, 4] and event["rupture_speed"] == 2.0      # untouched
+    assert S.read_arrivals(strain, event)["rupture_speed"] == 9.0 and S.arrival_sets(strain) == ["default", "peak"]
+    S.write_arrivals(strain, {**rec(6), "locations": [5.0, 6.0]}, event, set_name="default")
+    assert strain["original"]["picked_idx"] == [6, 7] and strain["locations"] == [5.0, 6.0] and event["rupture_speed"] == 6
+    assert strain["arrivals"]["sets"]["default"] == {}          # a save replaces the set; no further keys here
+    assert S.current_arrival_set(strain) == "default"
+    # a file round trip keeps the sets and the current one
+    save_data({"runs": [{"events": [{"waveform": {"elsys": block}}]}]}, tmp_path / "sets.h5")
+    back = load_manager(tmp_path / "sets.h5").data["runs"][0]["events"][0]["waveform"]["elsys"]
+    assert S.current_arrival_set(back) == "peak" and S.arrival_sets(back) == ["default", "peak"]
+    assert list(S.read_arrivals(back, set_name="default")["picked_idx"]) == [1, 2]
+    assert not S.upgrade_arrivals(back)                                     # version 2 already

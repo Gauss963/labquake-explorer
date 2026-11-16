@@ -49,7 +49,7 @@ not pinned is given, and drawn on the zero line, as the bracket it lies in
 (``beyond`` the last sensor when it is open); markers mark only the edges
 that are pinned.
 
-The front is one line (``single``) or, by default, a hinge of two lines that
+The front is one line (``unilateral``) or, by default, a hinge of two lines that
 meet at a fitted apex (``bilateral``: at least four sensors; with fewer, two
 lines through the earliest sensor; one line when both sides run the same way).
 The text gives the apex and its time, where the fronts start (diverging) or
@@ -89,6 +89,7 @@ from labquake_explorer.data.settings import get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
+from labquake_explorer.ui.views.scroll_panel import ScrollPanel
 
 LIVE_DELAY_MS = 400                    # recompute this long after the last keystroke
 HANDLE_PICK_PX = 6                     # a press this close (pixels) to t_i or a window edge grabs it
@@ -255,7 +256,7 @@ def segment_text(seg: sprof.FrontSegment) -> str:
 def apex_text(fit: sprof.FrontFit) -> Optional[str]:
     """Where a bilateral front starts (two lines leaving the apex), or where its two
     fronts meet (two lines running into it), with the time there; for a front that
-    runs one way, its earliest point.  None without an apex (NaN, single mode) or
+    runs one way, its earliest point.  None without an apex (NaN, unilateral mode) or
     when no side moves."""
     if fit.mode != "bilateral" or not fit.segments:
         return None
@@ -435,10 +436,13 @@ class SlipDistributionView(EventView):
     def build_ui(self) -> None:
         self.grid_columnconfigure(2, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        left = ttk.Frame(self)
-        left.grid(row=0, column=0, rowspan=3, padx=5, pady=5, sticky="nsw")
-        fits = ttk.Frame(self)
-        fits.grid(row=0, column=1, rowspan=3, padx=5, pady=5, sticky="nsw")
+        # the two control columns scroll when the window is shorter than they are
+        self.left_panel = ScrollPanel(self)
+        self.left_panel.grid(row=0, column=0, rowspan=3, padx=5, pady=5, sticky="nsw")
+        left = self.left_panel.inner
+        self.fits_panel = ScrollPanel(self)
+        self.fits_panel.grid(row=0, column=1, rowspan=3, padx=5, pady=5, sticky="nsw")
+        fits = self.fits_panel.inner
 
         frame = ttk.LabelFrame(left, text="Event")
         frame.pack(fill="x", pady=(0, 4))
@@ -486,7 +490,7 @@ class SlipDistributionView(EventView):
         ttk.Button(buttons, text="Zoom to t_i", command=self.zoom_to_event_time).pack(side="left", padx=2)
         ttk.Button(buttons, text="Whole window", command=self.show_whole_window).pack(side="left", padx=2)
 
-        frame = ttk.LabelFrame(left, text="Slip rate")
+        frame = ttk.LabelFrame(left, text="Slip-rate filter (the tab shown is used)")
         frame.pack(fill="x", pady=4)
         self.reference_var = tk.StringVar(master=self,
                                           value=_text(cs.DEFAULT_REFERENCE_HALFWIDTH_S * 1e3))
@@ -509,27 +513,26 @@ class SlipDistributionView(EventView):
             self._shown[str(var)] = var.get()
         for var in self.settings_vars():
             self._shown[str(var)] = var.get()
-        ttk.Label(frame, text="filter (the tab shown is used):", foreground="#606060").grid(
-            row=0, column=0, columnspan=2, padx=4, sticky="w")
         self.rate_filter_notebook = ttk.Notebook(frame)
-        self.rate_filter_notebook.grid(row=1, column=0, columnspan=2, padx=4, pady=2, sticky="ew")
+        self.rate_filter_notebook.grid(row=0, column=0, columnspan=2, padx=4, pady=2, sticky="ew")
         tabs = {key: ttk.Frame(self.rate_filter_notebook) for key in cs.RATE_FILTERS}
         tab = tabs["lowpass"]
         ttk.Label(tab, text="Type:").grid(row=0, column=0, padx=4, pady=2, sticky="e")
         self.lowpass_type_combobox = ttk.Combobox(tab, width=11, state="readonly",
                                                   values=[LOWPASS_LABELS[t] for t in cs.LOWPASS_TYPES])
         self.lowpass_type_combobox.set(LOWPASS_LABELS[cs.DEFAULT_LOWPASS_TYPE])
-        self.lowpass_type_combobox.grid(row=0, column=1, padx=4, pady=2, sticky="w")
+        self.lowpass_type_combobox.grid(row=0, column=1, columnspan=3, padx=4, pady=2, sticky="w")
         self.lowpass_type_combobox.bind("<<ComboboxSelected>>", lambda e: self.on_filter_choice())
-        self.cutoff_entry = self._entry(tab, "Cutoff (Hz):", self.cutoff_var, 1, self.on_settings_edited)
-        self._entry(tab, "Order:", self.lowpass_order_var, 2, self.on_settings_edited, name="low-pass order")
-        ttk.Label(tab, text="on the slip, forwards and backwards:\nzero phase, -6 dB at the cutoff",
-                  foreground="#606060", justify="left").grid(row=3, column=0, columnspan=2, padx=4, sticky="w")
+        self.cutoff_entry = self._entry(tab, "Cutoff (Hz):", self.cutoff_var, 1, self.on_settings_edited, width=6)
+        self._entry_at(tab, "Order:", self.lowpass_order_var, 1, 2, self.on_settings_edited, name="low-pass order")
+        ttk.Label(tab, text="both directions: zero phase, -6 dB at the cutoff",
+                  foreground="#606060").grid(row=2, column=0, columnspan=4, padx=4, sticky="w")
         tab = tabs["savgol"]
-        self._entry(tab, "Window (ms):", self.savgol_window_var, 0, self.on_settings_edited, name="savgol window")
-        self._entry(tab, "Polynomial order:", self.savgol_order_var, 1, self.on_settings_edited, name="savgol order")
+        self._entry(tab, "Window (ms):", self.savgol_window_var, 0, self.on_settings_edited, name="savgol window",
+                    width=6)
+        self._entry_at(tab, "Order:", self.savgol_order_var, 0, 2, self.on_settings_edited, name="savgol order")
         ttk.Label(tab, text="derivative of the local polynomial", foreground="#606060").grid(
-            row=2, column=0, columnspan=2, padx=4, sticky="w")
+            row=1, column=0, columnspan=4, padx=4, sticky="w")
         tab = tabs["boxcar"]
         self.smoothing_entry = self._entry(tab, "Window (ms):", self.smoothing_var, 0, self.on_settings_edited,
                                            name="moving average window")
@@ -541,12 +544,14 @@ class SlipDistributionView(EventView):
         self.rate_filter_notebook.bind("<<NotebookTabChanged>>", lambda e: self.on_filter_choice())
         frame = ttk.LabelFrame(left, text="Event times t_i")
         frame.pack(fill="x", pady=4)
-        ttk.Label(frame, text="the tab shown sets every sensor's t_i;\na drag or a typed t_i overrides one sensor",
-                  foreground="#606060", justify="left").grid(row=0, column=0, columnspan=2, padx=4, sticky="w")
+        ttk.Label(frame, text="the tab shown sets every t_i; a drag or a\ntyped t_i overrides one sensor",
+                  foreground="#606060", justify="left").grid(row=0, column=0, columnspan=4, padx=4, sticky="w")
         self.t_i_notebook = ttk.Notebook(frame)
-        self.t_i_notebook.grid(row=1, column=0, columnspan=2, padx=4, pady=2, sticky="ew")
+        self.t_i_notebook.grid(row=1, column=0, columnspan=4, padx=4, pady=2, sticky="ew")
         tabs = {key: ttk.Frame(self.t_i_notebook) for key in T_I_TABS}
-        ttk.Label(tabs[cs.METHOD_MAX_RATE], text="each sensor at its largest filtered\nslip rate",
+        ttk.Label(tabs[cs.METHOD_MAX_RATE], text="each sensor at its largest filtered slip\nrate, "
+                  "searched +- around the reference:\nthe peak of the mean slip rate of all\nsensors near "
+                  "the event time",
                   foreground="#606060", justify="left").grid(row=0, column=0, columnspan=2, padx=4, sticky="w")
         tab = tabs[cs.METHOD_ONSET]
         self._entry(tab, "Threshold (% of peak):", self.onset_var, 0, self.on_settings_edited, name="onset")
@@ -567,32 +572,31 @@ class SlipDistributionView(EventView):
         ttk.Label(tab, text="dragging the red line moves it", foreground="#606060").grid(
             row=3, column=0, columnspan=3, padx=4, sticky="w")
         tab = tabs[cs.METHOD_BURST]
-        ttk.Label(tab, text="one t_i for every sensor at the AE burst; slip =\nlevel after - level before "
-                            "(no line extrapolation):", foreground="#606060", justify="left").grid(
-            row=0, column=0, columnspan=2, padx=4, sticky="w")
-        ttk.Radiobutton(tab, text="peak of the PZT envelope (a waveform field)", value="pzt_envelope",
-                        variable=self.burst_source_var, command=self.on_burst_source).grid(
-            row=1, column=0, columnspan=2, padx=4, sticky="w")
-        ttk.Radiobutton(tab, text="peak of the mean slip rate", value="peak_rate",
-                        variable=self.burst_source_var, command=self.on_burst_source).grid(
-            row=2, column=0, columnspan=2, padx=4, sticky="w")
-        self._entry(tab, "Half-width w (ms):", self.burst_halfwidth_var, 3, self.on_settings_edited, name="burst w")
-        self._entry(tab, "Level width (ms):", self.level_width_var, 4, self.on_settings_edited, name="level width")
-        self._entry(tab, "Search +- (ms):", self.burst_search_var, 5, self.on_settings_edited, name="burst search")
-        ttk.Label(tab, text="windows [t_i-w-d, t_i-w] and [t_i+w, t_i+w+d];\nchoose the waveform/<recorder> field "
-                            "for 2 MHz", foreground="#606060", justify="left").grid(
-            row=6, column=0, columnspan=2, padx=4, sticky="w")
+        ttk.Label(tab, text="one t_i at the AE burst; slip = level after\nminus level before, "
+                            "at the peak of the:", foreground="#606060", justify="left").grid(
+            row=0, column=0, columnspan=4, padx=4, sticky="w")
+        radios = ttk.Frame(tab)
+        radios.grid(row=1, column=0, columnspan=4, padx=2, sticky="w")
+        ttk.Radiobutton(radios, text="PZT envelope", value="pzt_envelope",
+                        variable=self.burst_source_var, command=self.on_burst_source).pack(side="left", padx=2)
+        ttk.Radiobutton(radios, text="mean slip rate", value="peak_rate",
+                        variable=self.burst_source_var, command=self.on_burst_source).pack(side="left", padx=2)
+        self._entry(tab, "w (ms):", self.burst_halfwidth_var, 2, self.on_settings_edited, name="burst w", width=6)
+        self._entry_at(tab, "d (ms):", self.level_width_var, 2, 2, self.on_settings_edited, name="level width")
+        self._entry(tab, "Search +- (ms):", self.burst_search_var, 3, self.on_settings_edited, name="burst search",
+                    width=6)
+        ttk.Label(tab, text="levels over [t_i-w-d, t_i-w] and [t_i+w, t_i+w+d];\n"
+                            "use a waveform/<recorder> field for 2 MHz", foreground="#606060", justify="left").grid(
+            row=4, column=0, columnspan=4, padx=4, sticky="w")
         for key in T_I_TABS:
             self.t_i_notebook.add(tabs[key], text=T_I_TAB_LABELS[key])
         self.t_i_notebook.bind("<<NotebookTabChanged>>", lambda e: self.on_t_i_tab_changed())
-        self._entry(frame, "Reference +- (ms):", self.reference_var, 2, self.on_settings_edited)
-        self._entry(frame, "Search +- (ms):", self.search_var, 3, self.on_settings_edited)
-        self._entry(frame, "Flag below (x rate noise):", self.snr_var, 4, self.on_settings_edited)
-        ttk.Label(frame, text="reference: peak of the mean slip rate of\nall sensors near the event time; each\n"
-                              "sensor's peak is searched around it.\nflag below: a weaker peak is flagged",
-                  foreground="#606060", justify="left").grid(row=5, column=0, columnspan=2, padx=4, sticky="w")
-        ttk.Button(frame, text="Re-pick all sensors", command=self.repick_all).grid(
-            row=6, column=0, columnspan=2, padx=4, pady=2, sticky="w")
+        self._entry(frame, "Reference +- (ms):", self.reference_var, 2, self.on_settings_edited, width=6)
+        self._entry_at(frame, "Search +-:", self.search_var, 2, 2, self.on_settings_edited, name="Search +- (ms):")
+        self._entry(frame, "Flag below (x noise):", self.snr_var, 3, self.on_settings_edited, width=6,
+                    name="Flag below (x rate noise):")
+        ttk.Button(frame, text="Re-pick all", command=self.repick_all).grid(
+            row=3, column=2, columnspan=2, padx=4, pady=2, sticky="w")
 
         frame = ttk.Frame(left)
         frame.pack(fill="x", pady=4)
@@ -605,6 +609,8 @@ class SlipDistributionView(EventView):
             fill="x", pady=2)
 
         self._build_fit_frames(fits)
+        self.left_panel.bind_children()
+        self.fits_panel.bind_children()
         self.make_figure(figsize=(8.5, 6), figure_kwargs={"layout": "constrained"},
                          row=0, column=2, padx=5, pady=5, sticky="nsew")
         gs = self.figure.add_gridspec(2, 2, width_ratios=(1.35, 1.0))
@@ -711,7 +717,7 @@ class SlipDistributionView(EventView):
         self.front_mode_combobox.set(DEFAULT_FRONT_MODE)
         self.front_mode_combobox.grid(row=0, column=1, padx=4, pady=2, sticky="w")
         self.front_mode_combobox.bind("<<ComboboxSelected>>", lambda e: self.on_front_settings())
-        ttk.Label(frame, text="single: one line; bilateral: two lines that\nmeet at a fitted apex",
+        ttk.Label(frame, text="unilateral: one line; bilateral: two lines\nthat meet at a fitted apex",
                   foreground="#606060", justify="left").grid(row=1, column=0, columnspan=2, padx=4, sticky="w")
         self.front_use_mb = self._use_menu(frame, 2)
         self.front_text_var = tk.StringVar(master=self, value="")
@@ -742,6 +748,11 @@ class SlipDistributionView(EventView):
     def _entry(self, master, label, var, row, callback, width=9, name=None):
         ttk.Label(master, text=label).grid(row=row, column=0, padx=4, pady=2, sticky="e")
         return self._entry_only(master, var, row, 1, name or label, callback, width)
+
+    def _entry_at(self, master, label, var, row, column, callback, width=6, name=None):
+        """A second label and entry on a row, from ``column``."""
+        ttk.Label(master, text=label).grid(row=row, column=column, padx=(8, 2), pady=2, sticky="e")
+        return self._entry_only(master, var, row, column + 1, name or label, callback, width)
 
     def _entry_only(self, master, var, row, column, name, callback, width=9):
         entry = ttk.Entry(master, textvariable=var, width=width)
@@ -894,7 +905,7 @@ class SlipDistributionView(EventView):
             self.restore_profile_params(profile.get("settings"))
         self.profile_use = _bools(profile.get("use") if isinstance(profile, dict) else None, n, True)
         if isinstance(front, dict):
-            mode = str(front.get("mode", DEFAULT_FRONT_MODE))
+            mode = sprof.front_mode_name(front.get("mode", DEFAULT_FRONT_MODE))
             self.front_mode_combobox.set(mode if mode in sprof.FRONT_MODES else DEFAULT_FRONT_MODE)
             self.front_use_auto = bool(np.asarray(front.get("use_auto", True)).ravel()[0])
             self.front_use = _bools(front.get("use"), n, True)

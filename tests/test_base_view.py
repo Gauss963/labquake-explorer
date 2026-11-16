@@ -1,9 +1,7 @@
-import tkinter as tk
-
 import numpy as np
 import pytest
 
-from labquake_explorer.ui.views.base import BaseView, EventView, RunView, event_list, nearest_sample
+from labquake_explorer.ui.views.base import EventView, RunView, event_list, nearest_sample
 
 
 def test_event_list_never_truth_tests_the_container():
@@ -59,7 +57,8 @@ class Simple(EventView):
         self.loads += 1
 
 
-def test_failed_construction_leaves_no_child(app):
+def test_view_lifecycles(app):
+    # a failed construction leaves no child window behind
     with pytest.raises(RuntimeError):
         Broken(app, 0, 0)
     assert app.child_windows == []
@@ -67,8 +66,6 @@ def test_failed_construction_leaves_no_child(app):
         BrokenRun(app, 0)
     assert app.child_windows == []
 
-
-def test_event_view_lifecycle(app):
     v = Simple(app, 0, 1)
     assert v.title() == "Simple - Event 1"
     assert v.loads == 1
@@ -83,19 +80,11 @@ def test_event_view_lifecycle(app):
     v.save_field("strain/original/note", "hi")
     assert app.data_manager.get_data("runs/[0]/events/[3]/strain/original/note") == "hi"
     assert v.figure_title() == "p0001 run00 event3"
-    v.on_close()
-    assert v not in app.child_windows
-
-
-def test_unregister_removes_duplicates(app):
-    v = BaseView(app, title="x")
+    # closing removes every registration, even a duplicate one
     app.child_windows.append(v)
-    assert app.child_windows.count(v) == 2
     v.on_close()
     assert v not in app.child_windows
 
-
-def test_run_view_lifecycle(app):
     class R(RunView):
         window_title = "R"
         result_key = "r"

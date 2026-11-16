@@ -352,3 +352,19 @@ def add_slip_array(event: dict, x_mm=SLIP_X_MM, x0_mm: float = 279.0, t0_s: floa
         "source": [f"eddy_{i + 1}" for i in range(x.size)],
     }
     return {"t_i": t_i, "slips_um": slips, "noise_um": noise.copy(), "x_mm": x}
+
+
+def save_data(data: dict, path) -> None:
+    """Write ``data`` to ``path`` as the explorer does."""
+    from labquake_explorer.data.data_manager import DataManager
+    dm = DataManager()
+    dm.data = data
+    dm.save_file(path)
+
+
+def load_manager(path):
+    """A DataManager with ``path`` loaded."""
+    from labquake_explorer.data.data_manager import DataManager
+    dm = DataManager()
+    dm.load_file(path)
+    return dm

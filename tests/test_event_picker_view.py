@@ -20,7 +20,7 @@ def view(app):
     v.on_close()
 
 
-def test_defaults(app, view):
+def test_browse_events_zoom_and_markers(app, view):
     truth = app.truth[0]
     n = len(truth.event_indices)
     assert view.title() == "Pick Events - run00"
@@ -34,6 +34,44 @@ def test_defaults(app, view):
     assert len(view.spans) == n == len(view.picker.markers)
     assert not view.extract_button.instate(["disabled"])
     assert view.status_var.get().startswith(f"{n} picks")
+    k = 1234
+    assert view.picker.nearest_index(truth.time[k], truth.shear_stress[k]) == k
+
+    # prev/next step the event, clamped at both ends
+    view.prev_button.invoke()
+    assert view.event_combo.get() == "0"
+    view.next_button.invoke()
+    assert view.event_combo.get() == "1"
+    lo, hi = view.ax.get_xlim()
+    assert lo < truth.event_times[1] < hi and hi - lo == pytest.approx(30.0, abs=0.05)
+    for _ in range(n + 2):
+        view.next_button.invoke()
+    assert view.event_combo.get() == str(n - 1)
+
+    # the event zoom survives a replot; a new X axis autoscales again
+    view.event_combo.set("1")
+    view.on_event_selected()
+    lo, hi = view.ax.get_xlim()
+    assert lo == pytest.approx(truth.event_times[1] - 15.0, abs=0.01)
+    assert hi == pytest.approx(truth.event_times[1] + 15.0, abs=0.01)
+    view.picker.add_point(view.picks[1] + 3)
+    assert view.ax.get_xlim() == (lo, hi)
+    view.x_combo.set("index")
+    view.plot()
+    assert view.ax.get_xlim() != (lo, hi)
+    view.show_whole_run()
+    lo, hi = view.ax.get_xlim()
+    assert lo < 1 and hi > len(truth.time) - 2
+
+    # markers follow the axes limits (what the toolbar's zoom, pan and home do)
+    marker = view.picker.markers[0]
+    w0 = marker.width
+    view.ax.set_xlim(lo, lo + (hi - lo) / 10)
+    assert view.picker.markers[0] is marker and marker.width == pytest.approx(w0 / 10, rel=0.01)
+    view.picker.add_point(view.picks[-1] + 10)        # a replot keeps watching the new axes
+    marker = view.picker.markers[0]
+    view.ax.set_xlim(lo, hi)
+    assert marker.width == pytest.approx(w0, rel=0.01)
 
 
 def test_opened_from_array_run_and_event_indices(app):
@@ -46,9 +84,19 @@ def test_opened_from_array_run_and_event_indices(app):
         v.on_close()
 
 
-def test_picks_stay_sorted_and_follow_edits(app, view):
-    truth = app.truth[0]
-    saved = list(truth.event_indices)
+def test_spinbox_ticks_and_pick_edits(app, view):
+    t = app.truth[0].time
+    idx = view.picks[0]
+    view.start_entry.event_generate("<<Increment>>")
+    view.end_entry.event_generate("<<Decrement>>")
+    assert view.start_var.get() == "-4.5" and view.end_var.get() == "4.5"
+    assert view.window_s() == (-4.5, 4.5)
+    span = view.spans[0]
+    assert span.get_x() == pytest.approx(t[idx] - 4.5, abs=2e-3)
+    assert span.get_x() + span.get_width() == pytest.approx(t[idx] + 4.5, abs=2e-3)
+
+    # picks stay sorted, follow edits, and stay unsaved
+    saved = list(app.truth[0].event_indices)
     first = view.picks[0]
     view.picker.add_point(5)                            # earlier than every existing pick
     assert view.picks[0] == 5 and view.event_combo.get() == "0"
@@ -65,55 +113,29 @@ def test_picks_stay_sorted_and_follow_edits(app, view):
     assert app.data_manager.get_data("runs/[0]/event_extraction/event_indices") == saved
 
 
-def test_zoom_survives_a_replot(app, view):
-    t_event = app.truth[0].event_times[1]
-    view.event_combo.set("1")
-    view.on_event_selected()
-    lo, hi = view.ax.get_xlim()
-    assert lo == pytest.approx(t_event - 15.0, abs=0.01) and hi == pytest.approx(t_event + 15.0, abs=0.01)
-    view.picker.add_point(view.picks[1] + 3)            # replots: the zoom must stay
-    assert view.ax.get_xlim() == (lo, hi)
-    view.x_combo.set("index")
-    view.plot()                                         # a new X axis autoscales again
-    assert view.ax.get_xlim() != (lo, hi)
-    view.show_whole_run()
-    lo, hi = view.ax.get_xlim()
-    assert lo < 1 and hi > len(app.truth[0].time) - 2
-
-
-def test_spinbox_ticks_redraw_the_windows(app, view):
-    t = app.truth[0].time
-    idx = view.picks[0]
-    view.start_entry.event_generate("<<Increment>>")
-    view.end_entry.event_generate("<<Decrement>>")
-    assert view.start_var.get() == "-4.5" and view.end_var.get() == "4.5"
-    assert view.window_s() == (-4.5, 4.5)
-    span = view.spans[0]
-    assert span.get_x() == pytest.approx(t[idx] - 4.5, abs=2e-3)
-    assert span.get_x() + span.get_width() == pytest.approx(t[idx] + 4.5, abs=2e-3)
-
-
-def test_prev_next_buttons_step_the_event(app, view):
-    n = len(view.picks)
-    view.prev_button.invoke()
-    assert view.event_combo.get() == "0"                # clamped at the first event
-    view.next_button.invoke()
-    assert view.event_combo.get() == "1"
-    lo, hi = view.ax.get_xlim()
-    assert lo < app.truth[0].event_times[1] < hi and hi - lo == pytest.approx(30.0, abs=0.05)
-    for _ in range(n + 2):
-        view.next_button.invoke()
-    assert view.event_combo.get() == str(n - 1)         # clamped at the last event
-
-
-def test_extract_saves_picks_and_uses_the_window(app, view):
+def test_extract(app, view, monkeypatch):
+    from tkinter import messagebox
+    from labquake_explorer.ui.views.event_picker_view import FIELDS_ALL, FIELDS_REFERENCE
     truth = app.truth[0]
+    # a bad window is reported
+    view.start_var.set("abc")
+    assert view.extract(confirm=False) == 0 and "numbers" in view.status_var.get()
+    view.start_var.set("3")
+    view.end_var.set("1")
+    assert view.extract(confirm=False) == 0 and "before" in view.status_var.get()
+    # cancelling the confirmation keeps the events
     view.start_var.set("-2")
     view.end_var.set("3")
+    monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **k: False)
+    before = app.data_manager.get_data("runs/[0]/events")
+    assert view.extract() == 0
+    assert app.data_manager.get_data("runs/[0]/events") is before
+
+    # extract saves the picks and uses the window
     view.picker.add_point(5)
+    assert view.fields_combo.get() == FIELDS_REFERENCE and view.waveform_fields() is None
     n = view.extract(confirm=False)
     assert n == len(truth.event_indices) + 1
-    assert app.data_manager.get_data("runs/[0]/event_extraction/event_indices") == view.picks
     events = app.data_manager.get_data("runs/[0]/events")
     assert len(events) == n
     e = events[2]                                       # the second original event
@@ -126,45 +148,26 @@ def test_extract_saves_picks_and_uses_the_window(app, view):
                      "y_field": "shear_stress", "n_events": n, "waveform_fields": "reference"}
     assert saved["event_indices"] is not view.picks
     assert f"{n} events extracted" in view.status_var.get()
-    v2 = EventPickerView(app, 0)                        # reopening restores the window
+
+    # the waveform channels box reaches the record; the synthetic run has no
+    # raw recorder, so no waveform and no error
+    view.fields_combo.set(FIELDS_ALL)
+    assert view.waveform_fields() == "all"
+    view.fields_combo.set("pzt_1, pzt_2")
+    assert view.waveform_fields() == ["pzt_1", "pzt_2"]
+    assert view.extract(confirm=False) == n and "extracted" in view.status_var.get()
+    assert app.data_manager.get_data("runs/[0]/event_extraction")["waveform_fields"] == ["pzt_1", "pzt_2"]
+    view.fields_combo.set(FIELDS_ALL)
+    view.extract(confirm=False)
+    assert app.data_manager.get_data("runs/[0]/event_extraction")["waveform_fields"] == "all"
+    # reopening restores the window and the channels choice
+    v2 = EventPickerView(app, 0)
     assert v2.start_var.get() == "-2" and v2.end_var.get() == "3"
+    assert v2.fields_combo.get() == FIELDS_ALL
     v2.on_close()
-
-
-def test_extract_asks_before_replacing(app, view, monkeypatch):
-    from tkinter import messagebox
-    monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **k: False)
-    before = app.data_manager.get_data("runs/[0]/events")
-    assert view.extract() == 0
-    assert app.data_manager.get_data("runs/[0]/events") is before
-
-
-def test_bad_window_is_reported(app, view):
-    view.start_var.set("abc")
-    assert view.extract(confirm=False) == 0 and "numbers" in view.status_var.get()
-    view.start_var.set("3")
-    view.end_var.set("1")
-    assert view.extract(confirm=False) == 0 and "before" in view.status_var.get()
-
-
-def test_without_picks(app):
-    run = app.data_manager.get_data("runs/[0]")
-    del run["event_extraction"]
-    v = EventPickerView(app, 0)
-    assert v.picks == [] and v.event_combo.get() == ""
-    assert v.extract_button.instate(["disabled"]) and v.extract(confirm=False) == 0
-    v.picker.add_point(100)
-    assert not v.extract_button.instate(["disabled"]) and v.event_combo.get() == "0"
-    v.save_picks()
-    assert app.data_manager.get_data("runs/[0]/event_extraction/event_indices") == [100]
-    v.on_close()
-
-
-def test_nearest_index_from_the_curve(app, view):
-    t = app.truth[0].time
-    y = app.truth[0].shear_stress
-    k = 1234
-    assert view.picker.nearest_index(t[k], y[k]) == k
+    assert EventPickerView.fields_text(["pzt_1", b"pzt_2"]) == "pzt_1, pzt_2"
+    assert EventPickerView.fields_text("reference") == FIELDS_REFERENCE
+    assert EventPickerView.fields_text(None) == FIELDS_REFERENCE
 
 
 # ------------------------------------------------------- real Tk mouse events
@@ -193,22 +196,7 @@ def shown(view):
     return view.canvas.get_tk_widget()
 
 
-def test_drag_right_after_editing_the_window(app, view):
-    t = app.truth[0].time
-    y = app.truth[0].shear_stress
-    widget = shown(view)
-    k = view.picks[0]
-    view.start_entry.focus_force()                    # the first canvas click moves the focus away
-    view.update()
-    x0, y0 = tk_xy(view, t[k], y[k])
-    x1, y1 = tk_xy(view, t[k + 300], y[k + 300])
-    tk_drag(widget, x0, y0, x1, y1)
-    moved = view.picks[0]
-    assert abs(moved - (k + 300)) < 60                # one screen pixel spans ~50 samples here
-    assert view.spans[0].get_x() == pytest.approx(t[moved] - 5, abs=2e-3)       # replotted on release
-
-
-def test_double_click_adds_and_right_double_click_removes(app, view):
+def test_mouse_double_clicks_and_drag(app, view):
     t = app.truth[0].time
     y = app.truth[0].shear_stress
     widget = shown(view)
@@ -231,20 +219,19 @@ def test_double_click_adds_and_right_double_click_removes(app, view):
     widget.update()
     assert len(view.picks) == n
 
+    # a drag right after editing the window: the first canvas click moves the focus away
+    k = view.picks[0]
+    view.start_entry.focus_force()
+    view.update()
+    x0, y0 = tk_xy(view, t[k], y[k])
+    x1, y1 = tk_xy(view, t[k + 300], y[k + 300])
+    tk_drag(widget, x0, y0, x1, y1)
+    moved = view.picks[0]
+    assert abs(moved - (k + 300)) < 60                # one screen pixel spans ~50 samples here
+    assert view.spans[0].get_x() == pytest.approx(t[moved] - 5, abs=2e-3)       # replotted on release
 
-def test_markers_follow_the_axes_limits(app, view):
-    marker = view.picker.markers[0]
-    w0 = marker.width
-    lo, hi = view.ax.get_xlim()
-    view.ax.set_xlim(lo, lo + (hi - lo) / 10)         # what the toolbar's zoom, pan and home do
-    assert view.picker.markers[0] is marker and marker.width == pytest.approx(w0 / 10, rel=0.01)
-    view.picker.add_point(view.picks[-1] + 10)        # a replot keeps watching the new axes
-    marker = view.picker.markers[0]
-    view.ax.set_xlim(lo, hi)
-    assert marker.width == pytest.approx(w0, rel=0.01)
 
-
-def test_form_starts_from_the_extraction_record(app):
+def test_form_starts_from_the_extraction_record_or_defaults(app):
     run = app.data_manager.get_data("runs/[0]")
     picks = [int(i) for i in run["event_extraction"]["event_indices"]]
     run["event_extraction"] = {"version": 1, "event_indices": picks[1:], "start_s": -2.0, "end_s": 3.0,
@@ -269,10 +256,16 @@ def test_form_starts_from_the_extraction_record(app):
     assert "event_indices" not in run and "event_window" not in run
     assert run["event_extraction"]["event_indices"] == picks and run["event_extraction"]["start_s"] == -1.0
     v.on_close()
-    # nothing saved at all: the defaults
+    # nothing saved at all: the defaults, Extract disabled until a pick exists
     del run["event_extraction"]
     v = EventPickerView(app, 0)
-    assert v.start_var.get() == "-5" and v.end_var.get() == "5" and v.picks == []
+    assert v.start_var.get() == "-5" and v.end_var.get() == "5"
+    assert v.picks == [] and v.event_combo.get() == ""
+    assert v.extract_button.instate(["disabled"]) and v.extract(confirm=False) == 0
+    v.picker.add_point(100)
+    assert not v.extract_button.instate(["disabled"]) and v.event_combo.get() == "0"
+    v.save_picks()
+    assert app.data_manager.get_data("runs/[0]/event_extraction/event_indices") == [100]
     v.on_close()
 
 
@@ -316,26 +309,3 @@ def test_converted_channel_of_a_dual_mode_file_is_drawn_over_the_whole_run(tmp_p
     inside = (v.time >= 0.5) & (v.time <= 2.4995)             # the Elsys continuous block on the run clock
     assert y.shape == v.time.shape and np.isfinite(y[inside]).all() and np.isnan(y[~inside]).all()
     v.on_close()
-
-
-def test_waveform_channels_box_reaches_the_extraction_and_is_restored(app, view):
-    from labquake_explorer.ui.views.event_picker_view import FIELDS_ALL, FIELDS_REFERENCE
-    assert view.fields_combo.get() == FIELDS_REFERENCE and view.waveform_fields() is None
-    view.fields_combo.set(FIELDS_ALL)
-    assert view.waveform_fields() == "all"
-    view.fields_combo.set("pzt_1, pzt_2")
-    assert view.waveform_fields() == ["pzt_1", "pzt_2"]
-    n = view.extract(confirm=False)                     # the synthetic run has no raw recorder: no waveform, no error
-    assert n == len(view.picks) and "extracted" in view.status_var.get()
-    saved = app.data_manager.get_data("runs/[0]/event_extraction")
-    assert saved["waveform_fields"] == ["pzt_1", "pzt_2"]
-    view.fields_combo.set(FIELDS_ALL)
-    view.extract(confirm=False)
-    assert app.data_manager.get_data("runs/[0]/event_extraction")["waveform_fields"] == "all"
-    v2 = EventPickerView(app, 0)                        # reopening restores the choice
-    try:
-        assert v2.fields_combo.get() == FIELDS_ALL
-        assert EventPickerView.fields_text(["pzt_1", b"pzt_2"]) == "pzt_1, pzt_2"
-        assert EventPickerView.fields_text("reference") == FIELDS_REFERENCE and EventPickerView.fields_text(None) == FIELDS_REFERENCE
-    finally:
-        v2.on_close()

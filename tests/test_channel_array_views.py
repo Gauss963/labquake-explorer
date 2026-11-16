@@ -23,8 +23,12 @@ def app_with_arrays(app):
     return app
 
 
-def test_event_analyzer_lists_and_uses_rows(app_with_arrays):
-    v = EventAnalyzerView(app_with_arrays, 0, 1)
+def test_views_use_channel_rows_and_fall_back_to_slip_1(app_with_arrays):
+    app = app_with_arrays
+    label = app.format_tree_label("slip", app.data_manager.get_data("runs/[0]/slip"))
+    assert label.startswith("slip: 2 channels x ") and label.endswith(" um")
+
+    v = EventAnalyzerView(app, 0, 1)
     fields = list(v.data_x_combo["values"])
     assert "slip/slip_1" in fields and "slip/slip_2" in fields and "displacement" in fields
     v.data_x_combo.set("slip/slip_2")
@@ -35,43 +39,32 @@ def test_event_analyzer_lists_and_uses_rows(app_with_arrays):
     assert v.result["x_field"] == "slip/slip_2"
     # the row is read back by path when the picks are applied to every event
     assert v.apply_to_all_events(confirm=False) == 4
-    assert app_with_arrays.data_manager.get_data("runs/[0]/events/[0]/event_analysis")["x_field"] == "slip/slip_2"
+    assert app.data_manager.get_data("runs/[0]/events/[0]/event_analysis")["x_field"] == "slip/slip_2"
     v.on_close()
 
-
-def test_run_signals_offers_rows(app_with_arrays):
-    v = RunSignalsView(app_with_arrays, 0)
+    v = RunSignalsView(app, 0)
     assert "slip/slip_1" in v.candidates and "raw_data/lvdt" in v.candidates
     v.select_signals(["slip/slip_1", "raw_data/lvdt"])
     v.plot()
     assert len(v.signal_lines) == 2
     v.on_close()
 
-
-def test_interevent_uses_rows(app_with_arrays):
-    v = InterEventView(app_with_arrays, 0)
+    v = InterEventView(app, 0)
     assert "slip/slip_2" in v.slip_combo["values"]
     v.slip_combo.set("slip/slip_2")
     v.compute()
-    truth = app_with_arrays.truth[0]
+    truth = app.truth[0]
     expected = 2.0 * (truth.slip + truth.creep_fraction * truth.lp_velocity * 12.0)
     assert v.result["slip_field"] == "slip/slip_2"
     assert v.result["slip_per_cycle"][1:] == pytest.approx([expected] * (len(v.result["slip_per_cycle"]) - 1), rel=1e-6)
     v.on_close()
 
-
-def test_tree_label_for_channel_array(app_with_arrays):
-    label = app_with_arrays.format_tree_label("slip", app_with_arrays.data_manager.get_data("runs/[0]/slip"))
-    assert label.startswith("slip: 2 channels x ") and label.endswith(" um")
-
-
-def test_views_fall_back_to_the_first_slip_channel(app_with_arrays):
-    """Files without a 'displacement' field (fault slip is slip/slip_1) still open the analyses."""
-    app = app_with_arrays
+    # files without a 'displacement' field (fault slip is slip/slip_1) still open the analyses
     run = app.data_manager.get_data("runs/[0]")
     del run["displacement"]
     for event in run["events"]:
         del event["displacement"]
+        event.pop("event_analysis")
     app.refresh_tree()
     v = EventAnalyzerView(app, 0, 1)
     assert v.item_x == "slip/slip_1" and v.data_x_combo.get() == "slip/slip_1"

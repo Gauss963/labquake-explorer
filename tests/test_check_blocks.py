@@ -6,12 +6,11 @@ import numpy as np
 import pytest
 
 from labquake_explorer.data import check_blocks as C
-from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data.event_processor import EventProcessor
 from labquake_explorer.data.sources import Tpc5Source
 from labquake_explorer.preprocessing import run_from_sources
 from labquake_explorer.utils import tpc5
-from tests.synthetic import write_tpc5
+from tests.synthetic import load_manager, save_data, write_tpc5
 
 FS_TRIGGER, PRE, POST = 20_000.0, 0.02, 0.08              # trigger blocks: 2000 samples, 20 ms before the trigger
 TRIGGERS = (0.30, 0.80, 1.10, 1.60, 2.30, 2.35)            # file clock, blocks 2..7
@@ -45,16 +44,12 @@ def make_experiment(folder, suffix=".h5", event_fields=None):
     run["events"] = EventProcessor(path).extract_events(run, indices, window=0.15, pre=-WINDOW[0], post=WINDOW[1])
     run["event_extraction"] = {"version": 1, "event_indices": indices, "start_s": WINDOW[0], "end_s": WINDOW[1],
                                "n_events": len(indices)}
-    dm = DataManager()
-    dm.data = {"name": "t0001", "runs": [run, {"name": "run2", "time": np.arange(3.0)}]}
-    dm.save_file(path)
+    save_data({"name": "t0001", "runs": [run, {"name": "run2", "time": np.arange(3.0)}]}, path)
     return path
 
 
 def edit(path, change):
-    """Load an experiment, apply ``change(data)`` and save it in place."""
-    dm = DataManager()
-    dm.load_file(path)
+    dm = load_manager(path)
     change(dm.data)
     dm.save_file(path)
 
@@ -73,7 +68,9 @@ def statuses(report):
 
 
 def test_events_extracted_by_the_reader_pass(tmp_path, capsys):
-    path = make_experiment(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = make_experiment(data_dir)
     report = C.check_file(path)
     assert report.skipped == [1]
     assert statuses(report) == ["OK", "OK", "OK", "OK", "NO BLOCK"]
@@ -98,6 +95,22 @@ def test_events_extracted_by_the_reader_pass(tmp_path, capsys):
     assert "not checked (no events or no tpc5 reference): runs 1" in out
     header = next(line for line in out.splitlines() if line.startswith("run  event"))
     assert header.split("  ")[0] == "run" and "missing blocks" in header and header.rstrip().endswith("flags")
+    # a copy away from its raw files cannot be checked, unless told where they are
+    moved = tmp_path / "copy" / path.name
+    moved.parent.mkdir()
+    shutil.copy2(path, moved)
+    report = C.check_file(moved)
+    assert statuses(report) == ["UNCHECKED"] * 5 and report.exit_code() == 2
+    assert C.main([str(moved)]) == 2
+    assert "cannot read" in capsys.readouterr().out
+    assert C.main([str(moved), "--base-dir", str(data_dir)]) == 0
+    assert C.main([str(tmp_path / "nope.h5")]) == 2
+    for name, content in (("bad.h5", b"not an hdf5 file"), ("bad.npz", b"not an npz file"), ("empty.npz", b"")):
+        bad = tmp_path / name
+        bad.write_bytes(content)
+        capsys.readouterr()
+        assert C.main([str(bad)]) == 2
+        assert capsys.readouterr().out.startswith(f"cannot read {bad}: ")
 
 
 EDGE_OFFSET = 2.388939
@@ -127,9 +140,7 @@ def test_a_block_touching_the_window_is_counted_as_the_reader_counts_it(tmp_path
     path = tmp_path / "t0001.h5"
     run["events"] = EventProcessor(path).extract_events(run, indices, window=0.15, pre=pre, post=post)
     run["event_extraction"] = {"version": 1, "event_indices": indices, "start_s": WINDOW[0], "end_s": WINDOW[1]}
-    dm = DataManager()
-    dm.data = {"name": "t0001", "runs": [run]}
-    dm.save_file(path)
+    save_data({"name": "t0001", "runs": [run]}, path)
     assert [e.get("waveform", {}).get("elsys", {}).get("block") for e in run["events"]] == [2, 3, None, None]
     report = C.check_file(path)
     assert statuses(report) == ["OK", "OK", "NO BLOCK", "NO BLOCK"]
@@ -177,9 +188,7 @@ def test_check_event_agrees_with_itself_and_the_reader_at_the_window_edges(tmp_p
 
 def test_fill_adds_the_missing_records_and_keeps_a_backup(tmp_path, capsys):
     path = make_experiment(tmp_path)
-    reference = DataManager()
-    reference.load_file(path)
-    extracted = reference.data["runs"][0]["events"]
+    extracted = load_manager(path).data["runs"][0]["events"]
 
     def old_reader(data):                       # the events outside every block got nothing
         drop_record(data, 1)
@@ -200,9 +209,7 @@ def test_fill_adds_the_missing_records_and_keeps_a_backup(tmp_path, capsys):
     backup = tmp_path / "t0001.before-fill.h5"
     assert statuses(C.check_file(backup))[1:3] == ["NOT LOADED", "NOT LOADED"]   # the file as it was
     assert statuses(C.check_file(path)) == ["OK", "OK", "OK", "OK", "NO BLOCK"]
-    again = DataManager()
-    again.load_file(path)
-    events = again.data["runs"][0]["events"]
+    events = load_manager(path).data["runs"][0]["events"]
     for j, label in ((1, "b3"), (2, "b5")):
         filled, original = events[j]["waveform"]["elsys"], extracted[j]["waveform"]["elsys"]
         assert set(filled) == set(original)
@@ -243,9 +250,7 @@ def test_fill_never_replaces_a_record_nor_an_existing_backup(tmp_path, capsys):
     assert backup.read_bytes() == b"an earlier copy"
     report = C.check_file(path)
     assert statuses(report) == ["WRONG BLOCK", "OK", "OK", "OK", "NO BLOCK"]
-    dm = DataManager()
-    dm.load_file(path)
-    events = dm.data["runs"][0]["events"]
+    events = load_manager(path).data["runs"][0]["events"]
     assert events[0]["waveform"]["elsys"]["block"] == 3                # left as it was
     assert events[2]["waveform"]["elsys"]["channels"] == ["pzt_1"]     # the reference's event_fields
     # a record that is present is never touched, even when asked to fill it
@@ -255,15 +260,7 @@ def test_fill_never_replaces_a_record_nor_an_existing_backup(tmp_path, capsys):
     assert added == 0 and messages == ["runs/[0]/events/[2]: already has waveform/elsys, left as it is"]
 
 
-def test_fill_without_backup(tmp_path, capsys):
-    path = make_experiment(tmp_path)
-    edit(path, lambda data: drop_record(data, 2))
-    assert C.main([str(path), "--fill", "--no-backup"]) == 0
-    assert not (tmp_path / "t0001.before-fill.h5").exists()
-    assert statuses(C.check_file(path))[2] == "OK"
-
-
-def test_truncated_record_is_flagged(tmp_path):
+def test_truncated_record_is_flagged_and_fill_without_backup(tmp_path, capsys):
     path = make_experiment(tmp_path)
 
     def trim(data):
@@ -276,6 +273,10 @@ def test_truncated_record_is_flagged(tmp_path):
     assert row.status == "OK" and row.truncated and report.n_truncated == 1
     assert row.flags == ["pre-trigger truncated (record: 1900 samples from -0.0250 s; block: 2000 from -0.0300 s)"]
     assert report.exit_code() == 1
+    edit(path, lambda data: drop_record(data, 2))
+    assert C.main([str(path), "--fill", "--no-backup"]) == 1       # filled, but the truncated record stays
+    assert not (tmp_path / "t0001.before-fill.h5").exists()
+    assert statuses(C.check_file(path))[2] == "OK"
 
 
 def test_layout_notes_and_other_measurement_groups(tmp_path, capsys):
@@ -312,8 +313,20 @@ def test_layout_notes_and_other_measurement_groups(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("suffix", [".h5", ".npz"])
-def test_split_file_note_leaves_out_other_runs(tmp_path, suffix):
+def test_csv_split_file_notes_and_window_fallback(tmp_path, capsys, suffix):
     path = make_experiment(tmp_path, suffix=suffix)
+    out_csv = tmp_path / "rows.csv"
+    assert C.main([str(path), "--csv", str(out_csv)]) == 0
+    assert f"wrote {out_csv}" in capsys.readouterr().out
+    with open(out_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert list(rows[0]) == list(C.CSV_COLUMNS) and len(rows) == 5
+    assert [r["status"] for r in rows] == ["OK", "OK", "OK", "OK", "NO BLOCK"]
+    assert [r["expected_block"] for r in rows] == ["b2", "b3", "b5", "b6", ""]
+    assert rows[1]["flags"] == "b3 crosses window start; b4 crosses window end"
+    assert rows[1]["loaded_block"] == "b3" and rows[1]["loaded_samples"] == "2000" and rows[4]["loaded_blocks"] == "0"
+    assert float(rows[0]["window_start_s"]) == pytest.approx(-0.15) and rows[0]["recorder"] == "elsys"
+    # the split-file note names only this run's siblings, not run10 nor the file another run reads
     for name in ("t0001_01_8MPa_run10.tpc5", "t0001_01_8MPa_run1_0002.tpc5", "t0001_01_8MPa_run1b.tpc5"):
         (tmp_path / name).write_bytes(b"")
 
@@ -329,50 +342,12 @@ def test_split_file_note_leaves_out_other_runs(tmp_path, suffix):
     assert C.sibling_files(raw, [tmp_path / "t0001_01_8MPa_run1b.tpc5"]) == [tmp_path / "t0001_01_8MPa_run1_0002.tpc5"]
     assert C.sibling_files(tmp_path / "t0001_01_8MPa_run10.tpc5") == []
 
-
-def test_npz_experiment_window_fallback_and_csv(tmp_path, capsys):
-    path = make_experiment(tmp_path, suffix=".npz")
-    out_csv = tmp_path / "rows.csv"
-    assert C.main([str(path), "--csv", str(out_csv)]) == 0
-    assert f"wrote {out_csv}" in capsys.readouterr().out
-    with open(out_csv, newline="") as f:
-        rows = list(csv.DictReader(f))
-    assert list(rows[0]) == list(C.CSV_COLUMNS) and len(rows) == 5
-    assert [r["status"] for r in rows] == ["OK", "OK", "OK", "OK", "NO BLOCK"]
-    assert [r["expected_block"] for r in rows] == ["b2", "b3", "b5", "b6", ""]
-    assert rows[1]["flags"] == "b3 crosses window start; b4 crosses window end"
-    assert rows[1]["loaded_block"] == "b3" and rows[1]["loaded_samples"] == "2000" and rows[4]["loaded_blocks"] == "0"
-    assert float(rows[0]["window_start_s"]) == pytest.approx(-0.15) and rows[0]["recorder"] == "elsys"
-
-    def no_window(data):                         # without the extraction record: each event's own time axis
+    def no_window(data):                     # without the extraction record: each event's own time axis
         del data["runs"][0]["event_extraction"]
     edit(path, no_window)
     report = C.check_file(path)
     assert statuses(report) == ["OK", "OK", "OK", "OK", "NO BLOCK"]
     assert report.rows[1].window[0] == pytest.approx(EVENTS[1] + OFFSET - 0.15, abs=1e-9)
-
-
-def test_raw_files_elsewhere_and_missing(tmp_path, capsys):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    path = make_experiment(data_dir)
-    moved = tmp_path / "copy" / path.name
-    moved.parent.mkdir()
-    shutil.copy2(path, moved)
-    report = C.check_file(moved)                                       # the raw file is not next to the copy
-    assert statuses(report) == ["UNCHECKED"] * 5 and report.exit_code() == 2
-    assert C.main([str(moved)]) == 2
-    assert "cannot read" in capsys.readouterr().out
-    assert C.main([str(moved), "--base-dir", str(data_dir)]) == 0
-    assert C.main([str(tmp_path / "nope.h5")]) == 2
-
-
-def test_unreadable_experiment_file(tmp_path, capsys):
-    for name, content in (("bad.h5", b"not an hdf5 file"), ("bad.npz", b"not an npz file"), ("empty.npz", b"")):
-        bad = tmp_path / name
-        bad.write_bytes(content)
-        assert C.main([str(bad)]) == 2
-        assert capsys.readouterr().out.startswith(f"cannot read {bad}: ")
 
 
 def test_file_without_trigger_blocks(tmp_path):
@@ -383,9 +358,7 @@ def test_file_without_trigger_blocks(tmp_path):
     indices = [index_at(run, 1.0), index_at(run, 2.5)]
     run["events"] = EventProcessor(path).extract_events(run, indices, window=0.15)
     run["event_extraction"] = {"version": 1, "event_indices": indices, "start_s": -0.15, "end_s": 0.15}
-    dm = DataManager()
-    dm.data = {"name": "t0001", "runs": [run]}
-    dm.save_file(path)
+    save_data({"name": "t0001", "runs": [run]}, path)
     report = C.check_file(path)                    # the continuous recorder's window: nothing to check against
     assert statuses(report) == ["NO BLOCK", "NO BLOCK"] and report.exit_code() == 0
     assert report.rows[0].flags == ["continuous record b1 loaded"] and report.rows[0].loaded_text.startswith("b1 ")

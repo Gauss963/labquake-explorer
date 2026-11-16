@@ -58,11 +58,13 @@ an open end):
   so (the cost then rises along it, so no range is given).
 
 :func:`fit_front` fits the event times ``t_i`` against ``x``: one line
-(``single``), or a hinge of two lines that meet at a free apex
+(``unilateral``), or a hinge of two lines that meet at a free apex
 (``bilateral``, a rupture spreading both ways from the apex).  The apparent
 front velocity is ``1 / slope``; its sign gives the direction (positive
 towards +x).  Given the sampling interval, a segment that the front crosses
-within one sample is marked as not resolved.
+within one sample is marked as not resolved.  Records saved before
+0.3.0 call the one line ``single``; :func:`front_mode_name` reads it as
+``unilateral``.
 """
 from __future__ import annotations
 
@@ -87,7 +89,16 @@ RACE_NFEV = 30                        # arrest-zone fits: every start first, and
 N_RACED = 3                           # N_RACED go on to MAX_NFEV
 N_POLISHED = {"quadratic": 10, "eaz": 8, "eaz_asymmetric": 12}      # best search points polished
 SINGULAR = 1e-6                       # s_min / s_max of the scaled Jacobian below which it is singular
-FRONT_MODES = ("single", "bilateral")
+FRONT_MODES = ("unilateral", "bilateral")
+FRONT_MODE_ALIASES = {"single": "unilateral"}     # the name before 0.3.0
+
+
+def front_mode_name(mode) -> str:
+    """A front mode as named now: ``single`` (records before 0.3.0) is ``unilateral``."""
+    if isinstance(mode, bytes):
+        mode = mode.decode()
+    text = str(np.asarray(mode).ravel()[0]) if not isinstance(mode, str) and np.size(mode) else str(mode)
+    return FRONT_MODE_ALIASES.get(text.strip(), text.strip())
 EXTENT = {"quadratic": (), "eaz": ("a", "lambda"),                   # the parameters that set the extent
           "eaz_asymmetric": ("a_minus", "a_plus", "lambda_minus", "lambda_plus")}
 # where a parameter the user holds or bounds may go: (low, high, low included)
@@ -1049,7 +1060,7 @@ def _one_line(mode: str, x, t, dt_s) -> FrontFit:
     return FrontFit(mode, True, "", [seg], split, seg.slope_s_per_mm * split + seg.intercept_s)
 
 
-def fit_front(x_mm, t_s, use: Optional[Sequence[bool]] = None, mode: str = "single",
+def fit_front(x_mm, t_s, use: Optional[Sequence[bool]] = None, mode: str = "unilateral",
               dt_s: Optional[float] = None) -> FrontFit:
     """Line(s) through the event times ``t_s`` (s) against the positions ``x_mm``.
 
@@ -1058,7 +1069,9 @@ def fit_front(x_mm, t_s, use: Optional[Sequence[bool]] = None, mode: str = "sing
     line through all of them.  With fewer sensors it keeps two lines through the
     earliest one.  ``dt_s`` is the sampling interval of the times: a segment
     that the front crosses within less than one sample is not resolved.
+    ``single`` is accepted for ``unilateral``.
     """
+    mode = front_mode_name(mode)
     if mode not in FRONT_MODES:
         raise ValueError(f"unknown mode {mode!r}; use one of {FRONT_MODES}")
     x = np.asarray(x_mm, dtype=float).ravel()
@@ -1078,7 +1091,7 @@ def fit_front(x_mm, t_s, use: Optional[Sequence[bool]] = None, mode: str = "sing
         return FrontFit(mode, False, "no sensors selected")
     if np.unique(xk).size < 2:
         return FrontFit(mode, False, "needs at least two sensors at different positions")
-    if mode == "single":
+    if mode == "unilateral":
         return FrontFit(mode, True, "", [_segment(xk, tk, dt_s)])
     if xk.size >= 4 and np.unique(xk).size >= 4:
         x0, t0, s_minus, s_plus = _hinge(xk, tk)
@@ -1100,6 +1113,6 @@ def fit_front(x_mm, t_s, use: Optional[Sequence[bool]] = None, mode: str = "sing
     return FrontFit(mode, True, "", segments, split, float(tk[first]))
 
 
-__all__ = ["MODELS", "MODEL_LABELS", "PARAMETERS", "LAMBDA_BOUNDS", "FRONT_MODES", "quadratic_masked",
+__all__ = ["MODELS", "MODEL_LABELS", "PARAMETERS", "LAMBDA_BOUNDS", "FRONT_MODES", "FRONT_MODE_ALIASES", "front_mode_name", "quadratic_masked",
            "eaz_joint", "eaz_half", "eaz_profile", "eaz_asymmetric_profile", "evaluate", "ProfileFit",
            "fit_profile", "FrontSegment", "FrontFit", "fit_front"]

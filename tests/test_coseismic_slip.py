@@ -25,7 +25,7 @@ def run(event, **kwargs):
                            channels=s["channels"], x_mm=s["positions"]["x"], **kwargs)
 
 
-def test_default_windows_and_validation():
+def test_default_windows_and_setting_validation():
     assert cs.default_fit_windows(-5.0, 5.0) == ((-3.75, -1.25), (1.25, 3.75))
     assert cs.default_fit_windows(-2.0, 6.0) == ((-1.5, -0.5), (1.5, 4.5))
     for bad in ((1.0, 5.0), (-5.0, -1.0), (0.0, 5.0)):
@@ -35,6 +35,16 @@ def test_default_windows_and_validation():
     for bad in ((-1, -2), (0, 0), ("a", 1), (1,), (float("nan"), 1)):
         with pytest.raises(ValueError):
             cs.check_window(bad)
+    event, _ = make_event()
+    for kwargs in ({"rate_smoothing_s": -1}, {"search_halfwidth_s": 0}, {"rate_snr": -2},
+                   {"rate_smoothing_s": float("nan")}):
+        with pytest.raises(ValueError):
+            run(event, **kwargs)
+    s = event["slip"]
+    with pytest.raises(ValueError):
+        cs.analyze_slip(event["time"], s["data"][:, :-1], EVENT_TIME, -5.0, 5.0)
+    with pytest.raises(ValueError):
+        cs.analyze_slip(event["time"], s["data"], EVENT_TIME, -5.0, 5.0, channels=["a"])
 
 
 def test_fit_line_and_rate_helpers():
@@ -91,10 +101,10 @@ def test_manual_times_and_fallback():
         run(event, methods=["manual"] * 3)
 
 
-def test_windows_one_pair_or_per_sensor_and_clipping():
+def test_windows_one_pair_or_per_sensor_clipped_and_relative_to_the_event_time():
     event, truth = make_event()
-    res = run(event, fit_before_s=(-2.0, -0.5), fit_after_s=(0.5, 2.0))
-    assert all(s.before.window == (-2.0, -0.5) and s.after.window == (0.5, 2.0) for s in res.sensors)
+    base = run(event, fit_before_s=(-2.0, -0.5), fit_after_s=(0.5, 2.0))
+    assert all(s.before.window == (-2.0, -0.5) and s.after.window == (0.5, 2.0) for s in base.sensors)
     per = [(-1.0 - 0.1 * i, -0.2) for i in range(8)]
     res = run(event, fit_before_s=per)
     assert [s.before.window for s in res.sensors] == [pytest.approx(w) for w in per]
@@ -107,34 +117,24 @@ def test_windows_one_pair_or_per_sensor_and_clipping():
         run(event, fit_before_s=[(-1, -0.5)] * 3)
     with pytest.raises(ValueError):
         run(event, fit_before_s=(-0.5, -1.0))
+    # the windows are relative to the event time, not to t_i
+    moved = run(event, methods="manual", t_shift_s=[s.t_shift_s + 0.1 for s in base.sensors],
+                fit_before_s=(-2.0, -0.5), fit_after_s=(0.5, 2.0))
+    for a, b in zip(base.sensors, moved.sensors):
+        assert b.fit_before_s == a.fit_before_s == (-2.0, -0.5)       # the windows stay put
+        assert b.before.n == a.before.n and b.before.used == a.before.used
+        assert b.before.slope == pytest.approx(a.before.slope)          # the same lines, evaluated at the new t_i
+        assert b.before.value == pytest.approx(a.before.value + 0.1 * a.before.slope)
+        assert b.after.value == pytest.approx(a.after.value + 0.1 * a.after.slope)
+    # a window that reaches past t_i is fitted and flagged
+    late = run(event, fit_before_s=(-2.0, 1.0), fit_after_s=(-0.5, 2.0))
+    assert all(cs.FLAG_BEFORE_OVERLAP in s.flags and cs.FLAG_AFTER_OVERLAP in s.flags for s in late.sensors)
+    assert not any(cs.FLAG_BEFORE_OVERLAP in s.flags for s in base.sensors)
 
 
-def test_settings_validation():
-    event, _ = make_event()
-    for kwargs in ({"rate_smoothing_s": -1}, {"search_halfwidth_s": 0}, {"rate_snr": -2},
-                   {"rate_smoothing_s": float("nan")}):
-        with pytest.raises(ValueError):
-            run(event, **kwargs)
-    s = event["slip"]
-    with pytest.raises(ValueError):
-        cs.analyze_slip(event["time"], s["data"][:, :-1], EVENT_TIME, -5.0, 5.0)
-    with pytest.raises(ValueError):
-        cs.analyze_slip(event["time"], s["data"], EVENT_TIME, -5.0, 5.0, channels=["a"])
-
-
-def test_reference_time_near_the_event_time():
-    t = np.arange(0.0, 10.0, 0.001)
-    rate = np.zeros((2, t.size))
-    rate[:, np.argmin(np.abs(t - 6.0))] = 100.0           # a neighbouring event 1 s later: ignored
-    rate[:, np.argmin(np.abs(t - 5.4))] = 50.0
-    assert cs.reference_time(t, rate, 5.0) == pytest.approx(5.4)
-    assert cs.reference_time(t, rate, 5.0, halfwidth_s=1.5) == pytest.approx(6.0)
-    assert cs.reference_time(t, np.full((2, t.size), np.nan), 5.0) == 5.0
-
-
-def test_a_neighbouring_event_does_not_capture_the_picks():
-    """Real run 5 event 7 of t0207: the next event 1.1 s later is larger, and a
-    reference searched over +-1.25 s jumped to it, copying its slips."""
+def test_a_neighbouring_event_does_not_capture_the_reference():
+    # real run 5 event 7 of t0207: the next event 1.1 s later is larger, and a
+    # reference searched over +-1.25 s jumped to it, copying its slips
     event, truth = make_event()
     s = event["slip"]
     t = event["time"]
@@ -148,6 +148,13 @@ def test_a_neighbouring_event_does_not_capture_the_picks():
     assert wide.t_ref == pytest.approx(EVENT_TIME + 1.1, abs=0.01)     # what the old +-1.25 s search did
     with pytest.raises(ValueError):
         run(event, reference_halfwidth_s=0.0)
+    t = np.arange(0.0, 10.0, 0.001)
+    rate = np.zeros((2, t.size))
+    rate[:, np.argmin(np.abs(t - 6.0))] = 100.0           # a neighbouring event 1 s later: ignored
+    rate[:, np.argmin(np.abs(t - 5.4))] = 50.0
+    assert cs.reference_time(t, rate, 5.0) == pytest.approx(5.4)
+    assert cs.reference_time(t, rate, 5.0, halfwidth_s=1.5) == pytest.approx(6.0)
+    assert cs.reference_time(t, np.full((2, t.size), np.nan), 5.0) == 5.0
 
 
 def test_nan_samples_stay_local():
@@ -172,7 +179,6 @@ def test_nan_samples_stay_local():
 
 def test_small_inputs():
     event, truth = make_event()
-    s = event["slip"]
     # a search covering one sample is at its own edge
     res = run(event, search_halfwidth_s=0.0002)
     assert all(cs.FLAG_EDGE in x.flags for x in res.sensors)
@@ -218,32 +224,11 @@ def test_record_is_json_like_and_round_trips(tmp_path):
     assert cs.restore_inputs(loaded, rec["channels"][:-1]) is None
     assert cs.restore_inputs({"channels": rec["channels"]}, rec["channels"]) is None
     assert cs.restore_inputs(None, rec["channels"]) is None
-
-
-def test_windows_are_relative_to_the_event_time():
-    event, truth = make_event()
-    base = run(event, fit_before_s=(-2.0, -0.5), fit_after_s=(0.5, 2.0))
-    moved = run(event, methods="manual", t_shift_s=[s.t_shift_s + 0.1 for s in base.sensors],
-                fit_before_s=(-2.0, -0.5), fit_after_s=(0.5, 2.0))
-    for a, b in zip(base.sensors, moved.sensors):
-        assert b.fit_before_s == a.fit_before_s == (-2.0, -0.5)       # the windows stay put
-        assert b.before.n == a.before.n and b.before.used == a.before.used
-        assert b.before.slope == pytest.approx(a.before.slope)          # the same lines, evaluated at the new t_i
-        assert b.before.value == pytest.approx(a.before.value + 0.1 * a.before.slope)
-        assert b.after.value == pytest.approx(a.after.value + 0.1 * a.after.slope)
-    # a window that reaches past t_i is fitted and flagged
-    late = run(event, fit_before_s=(-2.0, 1.0), fit_after_s=(-0.5, 2.0))
-    assert all(cs.FLAG_BEFORE_OVERLAP in s.flags and cs.FLAG_AFTER_OVERLAP in s.flags for s in late.sensors)
-    assert not any(cs.FLAG_BEFORE_OVERLAP in s.flags for s in base.sensors)
-
-
-def test_version_1_records_had_windows_relative_to_t_i():
-    event, truth = make_event()
+    # version 1 kept the windows relative to t_i
     rec = run(event, methods="manual", t_shift_s=0.02).as_dict()
     rec["version"] = 1
-    rec["fit_before_s"] = [[-3.75, -1.25]] * 8          # relative to t_i, as version 1 stored them
-    inputs = cs.restore_inputs(rec, rec["channels"])
-    assert all(w == pytest.approx((-3.73, -1.23)) for w in inputs["fit_before_s"])
+    rec["fit_before_s"] = [[-3.75, -1.25]] * 8
+    assert all(w == pytest.approx((-3.73, -1.23)) for w in cs.restore_inputs(rec, rec["channels"])["fit_before_s"])
     rec["version"] = 2
     assert cs.restore_inputs(rec, rec["channels"])["fit_before_s"][0] == (-3.75, -1.25)
 
@@ -265,7 +250,7 @@ def test_rate_filters_cut_the_noise_and_keep_the_picks(rate_filter, kwargs):
     assert cs.restore_inputs(rec, rec["channels"])["rate_filter"] == rate_filter
 
 
-def test_rate_filter_gaps_and_validation():
+def test_rate_filter_gaps_ends_and_validation():
     t = np.arange(0.0, 2.0, 0.0005)
     d = np.where(t > 1.0, 10.0, 0.0) + 0.01 * np.sin(40 * t)
     d[1000:1010] = np.nan
@@ -276,6 +261,11 @@ def test_rate_filter_gaps_and_validation():
         cs.slip_rate(t, d, 0.01, "lowpass", 1500.0)
     with pytest.raises(ValueError, match="unknown rate filter"):
         cs.slip_rate(t, d, 0.01, "median")
+    # the moving average's end samples average fewer samples: some more scatter, not the one-sample difference
+    d = 5.0 * t + np.random.default_rng(2).normal(0.0, 0.2, t.size)       # 5 um/s and noise
+    rate = cs.slip_rate(t, d, 0.01, "boxcar")
+    spread = np.max(np.abs(rate[100:-100] - 5.0))
+    assert np.max(np.abs(rate[:20] - 5.0)) < 2.0 * spread and np.max(np.abs(rate[-20:] - 5.0)) < 2.0 * spread
     event, _ = make_event()
     rec = run(event).as_dict()
     assert rec["rate_filter"] == cs.DEFAULT_RATE_FILTER == "lowpass" and rec["rate_cutoff_hz"] == 50.0
@@ -306,16 +296,6 @@ def test_lowpass_type_and_orders():
     rec = run(event, rate_lowpass_type="bessel", rate_lowpass_order=2).as_dict()
     inputs = cs.restore_inputs(rec, rec["channels"])
     assert (inputs["rate_lowpass_type"], inputs["rate_lowpass_order"], inputs["rate_savgol_order"]) == ("bessel", 2, 2)
-
-
-def test_moving_average_ends_are_as_quiet_as_the_rest():
-    t = np.arange(0.0, 4.0, 0.0005)
-    d = 5.0 * t + np.random.default_rng(2).normal(0.0, 0.2, t.size)       # 5 um/s and noise
-    rate = cs.slip_rate(t, d, 0.01, "boxcar")
-    interior = rate[100:-100]
-    spread = np.max(np.abs(interior - 5.0))
-    # the end samples average fewer samples, so allow some more scatter, but not the one-sample difference
-    assert np.max(np.abs(rate[:20] - 5.0)) < 2.0 * spread and np.max(np.abs(rate[-20:] - 5.0)) < 2.0 * spread
 
 
 def test_onset_step_and_shared_event_times():

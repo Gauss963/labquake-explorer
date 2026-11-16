@@ -898,24 +898,110 @@ def waveform_trigger_time(block, run: Optional[Mapping] = None, key: Optional[st
 
 
 ARRIVALS_KEY = "arrivals"
-ARRIVALS_VERSION = 1
+ARRIVALS_VERSION = 2
+DEFAULT_ARRIVAL_SET = "default"
+_ARRIVAL_SETS = "sets"
+_ARRIVAL_CURRENT = "current"
 _ARRIVAL_FLAGS = ("enabled_channels", "fitting_channels", "locations")
+_LEGACY_ARRIVAL_KEYS = ("picked_idx", "arrival_time", "rupture_speed") + _ARRIVAL_FLAGS
 
 
-def read_arrivals(block, event: Optional[Mapping] = None) -> dict:
+def arrival_set_name(name) -> str:
+    """A validated pick-set name: stripped, non-empty, without ``/`` (an HDF5
+    group name).  Raises ValueError."""
+    text = str(name if name is not None else "").strip()
+    if not text:
+        raise ValueError("the pick set needs a name")
+    if "/" in text:
+        raise ValueError("a pick-set name cannot contain '/'")
+    return text
+
+
+def _arrival_store(block) -> Optional[Mapping]:
+    store = block.get(ARRIVALS_KEY) if isinstance(block, Mapping) else None
+    return store if isinstance(store, Mapping) else None
+
+
+def _stored_arrival_sets(block) -> dict:
+    """``{name: record}`` as stored: a version-2 store's ``sets``; a version-1
+    record (or, in the PSU layout, version-1 extra keys) as the set ``default``."""
+    store = _arrival_store(block)
+    if store is None:
+        return {}
+    sets = store.get(_ARRIVAL_SETS)
+    if isinstance(sets, Mapping):
+        return {str(k): v for k, v in sets.items() if isinstance(v, Mapping)}
+    return {DEFAULT_ARRIVAL_SET: {k: v for k, v in store.items() if k != "version"}}
+
+
+def _legacy_default_exists(block) -> bool:
+    original = block.get("original") if isinstance(block, Mapping) else None
+    return isinstance(original, Mapping) and ("picked_idx" in original or "rupture_arrival_time" in original)
+
+
+def _pre_store_record(block) -> dict:
+    """A waveform record's picks kept among its data keys, before ``arrivals`` existed."""
+    out = {key: block[key] for key in ("picked_idx",) + _ARRIVAL_FLAGS if key in block}
+    if "rupture_arrival_time" in block:
+        out["arrival_time"] = block["rupture_arrival_time"]
+    return out
+
+
+def arrival_sets(block) -> list:
+    """The pick sets saved with a record, ``default`` first, the rest sorted."""
+    if not isinstance(block, Mapping):
+        return []
+    names = set(_stored_arrival_sets(block))
+    if _is_legacy_block(block) and _legacy_default_exists(block):
+        names.add(DEFAULT_ARRIVAL_SET)
+    if not _is_legacy_block(block) and _arrival_store(block) is None and _pre_store_record(block):
+        names.add(DEFAULT_ARRIVAL_SET)
+    return ([DEFAULT_ARRIVAL_SET] if DEFAULT_ARRIVAL_SET in names else []) + sorted(names - {DEFAULT_ARRIVAL_SET})
+
+
+def current_arrival_set(block) -> Optional[str]:
+    """The record's current pick set (the one saved last), else ``default`` when
+    it exists, else the first set; None without any."""
+    names = arrival_sets(block)
+    store = _arrival_store(block)
+    current = store.get(_ARRIVAL_CURRENT) if store is not None else None
+    if current is not None:
+        if isinstance(current, bytes):
+            current = current.decode()
+        elif not isinstance(current, str):
+            current = str(np.asarray(current).ravel()[0])
+        if current in names:
+            return current
+    if DEFAULT_ARRIVAL_SET in names:
+        return DEFAULT_ARRIVAL_SET
+    return names[0] if names else None
+
+
+def read_arrivals(block, event: Optional[Mapping] = None, set_name: Optional[str] = None) -> dict:
     """Pick Arrivals' results for a record, normalised to ``picked_idx``,
     ``arrival_time`` (s, per channel), ``enabled_channels``, ``fitting_channels``,
-    ``locations`` (mm) and ``rupture_speed`` (m/s); only the keys that exist.
+    ``locations`` (mm), ``rupture_speed`` (m/s) and the further keys the view
+    saves; only the keys that exist, ``{}`` for a set the record does not have.
 
-    A waveform record keeps them under ``block['arrivals']``.  The PSU strain
-    layout keeps them spread over ``strain/original`` (``picked_idx``,
-    ``rupture_arrival_time``), ``strain`` (the flags and locations) and
-    ``event['rupture_speed']``, which is why ``event`` can be passed.
+    A record keeps named pick sets (``block['arrivals']``, version 2:
+    ``{"version", "current", "sets": {name: record}}``); ``set_name`` None
+    reads the current one, so readers that know nothing of sets (the CZM
+    fitter's ``Cf``, PZT Spectrum's "picked arrival") take the set saved last.
+    A version-1 record is the set ``default``.  The PSU strain layout keeps
+    its ``default`` set in its historical places (``strain/original``:
+    ``picked_idx``, ``rupture_arrival_time``; ``strain``: the flags and
+    locations; ``event['rupture_speed']``, which is why ``event`` can be
+    passed), its further keys and the other sets in ``strain['arrivals']``.
     """
-    out: dict = {}
     if not isinstance(block, Mapping):
-        return out
-    if _is_legacy_block(block):
+        return {}
+    name = current_arrival_set(block) if set_name is None else arrival_set_name(set_name)
+    if name is None:
+        return {}
+    stored = _stored_arrival_sets(block)
+    legacy = _is_legacy_block(block)
+    if legacy and name == DEFAULT_ARRIVAL_SET:
+        out = {k: v for k, v in stored.get(name, {}).items() if k not in _LEGACY_ARRIVAL_KEYS}
         original = block["original"]
         if "picked_idx" in original:
             out["picked_idx"] = original["picked_idx"]
@@ -927,24 +1013,56 @@ def read_arrivals(block, event: Optional[Mapping] = None) -> dict:
         if isinstance(event, Mapping) and event.get("rupture_speed") is not None:
             out["rupture_speed"] = event["rupture_speed"]
         return out
-    stored = block.get(ARRIVALS_KEY)
-    if isinstance(stored, Mapping):
-        out.update({k: v for k, v in stored.items() if k != "version"})
-        return out
-    for key in ("picked_idx",) + _ARRIVAL_FLAGS:          # records written before 'arrivals' existed
-        if key in block:
-            out[key] = block[key]
-    if "rupture_arrival_time" in block:
-        out["arrival_time"] = block["rupture_arrival_time"]
-    return out
+    if name in stored:
+        return dict(stored[name])
+    if not legacy and name == DEFAULT_ARRIVAL_SET and _arrival_store(block) is None:
+        return _pre_store_record(block)
+    return {}
 
 
-def write_arrivals(block, arrivals: Mapping, event=None) -> None:
-    """Store Pick Arrivals' results with the record (the inverse of
-    :func:`read_arrivals`).  A missing or None ``rupture_speed`` means the
-    picks define no line and removes any stored speed."""
+def upgrade_arrivals(block) -> bool:
+    """Bring a record's picks to the version-2 store in place: a version-1
+    record (or the keys kept among the record's data before ``arrivals``
+    existed) becomes the set ``default``.  True when something changed."""
+    if not isinstance(block, dict):
+        return False
+    store = _arrival_store(block)
+    legacy = _is_legacy_block(block)
+    if store is None and (legacy or not _pre_store_record(block)):
+        return False
+    if store is not None and isinstance(store.get(_ARRIVAL_SETS), Mapping) \
+            and store.get("version") == ARRIVALS_VERSION:
+        return False
+    if store is None:                                  # picks among the record's data keys
+        sets = {DEFAULT_ARRIVAL_SET: _pre_store_record(block)}
+        for key in ("picked_idx", "rupture_arrival_time") + _ARRIVAL_FLAGS:
+            block.pop(key, None)
+    else:
+        sets = {k: dict(v) for k, v in _stored_arrival_sets(block).items()}
+    current = DEFAULT_ARRIVAL_SET if DEFAULT_ARRIVAL_SET in sets or (legacy and _legacy_default_exists(block)) \
+        else next(iter(sets), DEFAULT_ARRIVAL_SET)
+    block[ARRIVALS_KEY] = {"version": ARRIVALS_VERSION, _ARRIVAL_CURRENT: current, _ARRIVAL_SETS: sets}
+    return True
+
+
+def write_arrivals(block, arrivals: Mapping, event=None, set_name: Optional[str] = None) -> None:
+    """Store Pick Arrivals' results with the record as the pick set ``set_name``
+    (None: the current set, else ``default``) and make it the current set (the
+    inverse of :func:`read_arrivals`).  A missing or None ``rupture_speed``
+    means the picks define no line and removes any stored speed.  In the PSU
+    layout the ``default`` set goes to its historical places and its further
+    keys, like every other set, to ``strain['arrivals']``."""
+    name = arrival_set_name(set_name) if set_name is not None else (current_arrival_set(block) or DEFAULT_ARRIVAL_SET)
+    upgrade_arrivals(block)
+    store = block.get(ARRIVALS_KEY)
+    if not isinstance(store, dict) or not isinstance(store.get(_ARRIVAL_SETS), dict):
+        store = {"version": ARRIVALS_VERSION, _ARRIVAL_SETS: {}}
+        block[ARRIVALS_KEY] = store
     speed = arrivals.get("rupture_speed")
-    if _is_legacy_block(block):
+    record = {k: v for k, v in arrivals.items() if k != "rupture_speed" and v is not None}
+    if speed is not None:
+        record["rupture_speed"] = float(speed)
+    if _is_legacy_block(block) and name == DEFAULT_ARRIVAL_SET:
         original = block["original"]
         if "picked_idx" in arrivals:
             original["picked_idx"] = arrivals["picked_idx"]
@@ -958,14 +1076,10 @@ def write_arrivals(block, arrivals: Mapping, event=None) -> None:
                 event.pop("rupture_speed", None)
             else:
                 event["rupture_speed"] = float(speed)
-        return
-    record = {"version": ARRIVALS_VERSION}
-    record.update({k: v for k, v in arrivals.items() if k != "rupture_speed" and v is not None})
-    if speed is not None:
-        record["rupture_speed"] = float(speed)
-    block[ARRIVALS_KEY] = record
-    for key in ("picked_idx", "rupture_arrival_time") + _ARRIVAL_FLAGS:   # the layout before 'arrivals'
-        block.pop(key, None)
+        record = {k: v for k, v in record.items() if k not in _LEGACY_ARRIVAL_KEYS}
+    store[_ARRIVAL_SETS][name] = record
+    store[_ARRIVAL_CURRENT] = name
+    store["version"] = ARRIVALS_VERSION
 
 
 def pick_waveform_block(event: Mapping, prefer_fields: Sequence[str] = (),
@@ -994,4 +1108,5 @@ __all__ = ["SOURCE_FORMATS", "WAVEFORM", "register_source", "Source", "Window", 
            "overlapping_trigger_blocks", "NINpzSource", "LegacyTpc5Source", "short_label", "block_mean", "is_legacy_strain", "reference_format",
            "run_sources", "open_source", "is_waveform_block", "waveform_blocks", "waveform_block", "waveform_time",
            "waveform_data", "waveform_channels", "waveform_store", "waveform_trigger_time", "pick_waveform_block",
-           "block_channel_labels", "ARRIVALS_KEY", "read_arrivals", "write_arrivals"]
+           "block_channel_labels", "ARRIVALS_KEY", "ARRIVALS_VERSION", "DEFAULT_ARRIVAL_SET", "arrival_set_name",
+           "arrival_sets", "current_arrival_set", "read_arrivals", "upgrade_arrivals", "write_arrivals"]

@@ -86,6 +86,7 @@ from labquake_explorer.data.settings import delete_setting, get_setting, set_set
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
+from labquake_explorer.ui.views.scroll_panel import ScrollPanel
 from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
                                             waveform_channels, waveform_data, waveform_time, waveform_trigger_time)
 
@@ -340,10 +341,13 @@ class PZTSpectrumView(EventView):
         self.grid_columnconfigure(2, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self)
-        left.grid(row=0, column=0, padx=5, pady=5, sticky="nsw")
-        middle = ttk.Frame(self)
-        middle.grid(row=0, column=1, padx=5, pady=5, sticky="nsw")
+        # the two control columns scroll when the window is shorter than they are
+        self.left_panel = ScrollPanel(self)
+        self.left_panel.grid(row=0, column=0, padx=5, pady=5, sticky="nsw")
+        left = self.left_panel.inner
+        self.middle_panel = ScrollPanel(self)
+        self.middle_panel.grid(row=0, column=1, padx=5, pady=5, sticky="nsw")
+        middle = self.middle_panel.inner
 
         self._build_selection(left)
         self._build_window_frame(left)
@@ -353,6 +357,8 @@ class PZTSpectrumView(EventView):
         self._build_buttons(left)
         self._build_results_frame(middle)
         self._build_source_frame(middle)
+        self.left_panel.bind_children()
+        self.middle_panel.bind_children()
 
         figure_frame = ttk.Frame(self)
         figure_frame.grid(row=0, column=2, padx=5, pady=5, sticky="nsew")

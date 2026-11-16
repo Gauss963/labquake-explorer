@@ -3,9 +3,12 @@ import pytest
 
 from labquake_explorer.data import migrate as M
 from labquake_explorer.data.channels import channel_array, positions_table
-from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data.sources import read_arrivals
-from tests.synthetic import make_experiment
+from tests.synthetic import add_strain, load_manager, make_experiment, save_data as save
+
+
+def load(path):
+    return load_manager(path).data
 
 
 def old_style_experiment():
@@ -61,9 +64,11 @@ def old_style_experiment():
     return data, truth
 
 
-def test_upgrade_brings_runs_and_events_up_to_date():
+def test_upgrade_brings_runs_and_events_up_to_date(tmp_path):
     data, truth = old_style_experiment()
     picks = list(data["runs"][0]["event_indices"])
+    path = tmp_path / "old.h5"
+    save(data, path)
     notes = M.upgrade_experiment(data)
     run = data["runs"][0]
     assert notes and all(isinstance(n, str) for n in notes)
@@ -90,7 +95,7 @@ def test_upgrade_brings_runs_and_events_up_to_date():
     arrivals = read_arrivals(e0["waveform"]["elsys"])
     assert arrivals["picked_idx"] == [100, 200] and arrivals["fitting_channels"] == [True, False]
     assert arrivals["rupture_speed"] == 1500.0 and "rupture_speed" not in e0
-    assert "picked_idx" not in e0["waveform"]["elsys"] and e0["waveform"]["elsys"]["arrivals"]["version"] == 1
+    assert "picked_idx" not in e0["waveform"]["elsys"] and e0["waveform"]["elsys"]["arrivals"]["version"] == 2
     assert "pzt_spectrum" not in e0
     moved = e0["waveform"]["elsys"]["spectrum"]
     assert moved["version"] == 2 and "channels" not in moved
@@ -98,39 +103,10 @@ def test_upgrade_brings_runs_and_events_up_to_date():
     assert e1["waveform"]["ni"]["data"].shape == (1, 50) and "trigger_time" not in e1["waveform"]["ni"]
     # a second pass changes nothing
     assert M.upgrade_experiment(data) == []
-
-
-def test_current_layout_is_left_alone():
-    data, truth = make_experiment(n_runs=1)
-    assert M.upgrade_experiment(data) == []
-
-
-def test_psu_strain_layout_is_kept():
-    from tests.synthetic import add_strain
-    data, truth = make_experiment(n_runs=1)
-    run = data["runs"][0]
-    run["strain"] = {"filename": "legacy.tpc5", "time_offset": 0.0, "time": np.arange(10.0), "raw": np.zeros((2, 10))}
-    for event in run["events"]:
-        add_strain(event, n_channels=4)
-    before = {k: type(v) for k, v in run["events"][0]["strain"].items()}
-    notes = M.upgrade_experiment(data)
-    assert notes == [] or all("strain" not in n for n in notes)
-    assert {k: type(v) for k, v in run["events"][0]["strain"].items()} == before
-    assert "strain" in run
-
-
-def test_upgrade_file_keeps_a_copy(tmp_path):
-    data, truth = old_style_experiment()
-    path = tmp_path / "old.h5"
-    dm = DataManager()
-    dm.data = data
-    dm.save_file(path)
-    notes = M.upgrade_file(path)
-    assert notes
+    # the same through the file tool, which keeps a copy of the file as it was
+    assert M.upgrade_file(path)
     assert (tmp_path / "old.before-upgrade.h5").exists()
-    again = DataManager()
-    again.load_file(path)
-    run = again.get_data("runs/[0]")
+    run = load(path)["runs"][0]
     assert "file" not in run and "waveform" in run["events"][0] and "elsys" not in run["events"][0]
     assert run["events"][0]["waveform"]["elsys"]["trigger_time"] == pytest.approx(13.98)
     assert M.upgrade_file(path) == []                         # already up to date: no write, no second copy
@@ -161,23 +137,30 @@ def test_recalibrate_lp_displacement_from_volts(tmp_path):
     assert M.recalibrate_lp_displacement(data, -5040.0) == []                   # already in micrometres
     # through the file tool, with the flag, keeping the first backup only
     path = tmp_path / "exp.h5"
-    dm = DataManager(); dm.data = data; dm.save_file(path)
     data2, _ = make_experiment(n_runs=1)
     data2["runs"][0]["units"] = {"LP_displacement": "V"}
-    dm2 = DataManager(); dm2.data = data2; dm2.save_file(path)
+    save(data2, path)
     copy = tmp_path / "exp.before-upgrade.h5"
     copy.write_bytes(b"first original")
     assert M.main([str(path), "--lvdt-um-per-v=-5040"]) == 0
     assert copy.read_bytes() == b"first original"                            # never overwritten
-    again = DataManager(); again.load_file(path)
-    assert again.get_data("runs/[0]/units")["LP_displacement"] == "um"
+    assert load(path)["runs"][0]["units"]["LP_displacement"] == "um"
 
 
-def test_fault_geometry_moves_into_analysis():
+def test_current_layout_kept_and_fault_geometry_moved_into_analysis():
     data, _ = make_experiment()
+    assert M.upgrade_experiment(data) == []                               # the current layout is left alone
+    # so is the PSU strain layout
+    run = data["runs"][0]
+    run["strain"] = {"filename": "legacy.tpc5", "time_offset": 0.0, "time": np.arange(10.0), "raw": np.zeros((2, 10))}
+    for event in run["events"]:
+        add_strain(event, n_channels=4)
+    before = {k: type(v) for k, v in run["events"][0]["strain"].items()}
     data["patch_x_mm"] = [187.5, 312.5]
     data["fault"] = {"ends_x_mm": np.array([0.0, 500.0]), "patch_x_mm": [1.0, 2.0]}   # the top-level copy wins
     notes = M.upgrade_experiment(data)
+    assert all("strain" not in n for n in notes) and "strain" in run
+    assert {k: type(v) for k, v in run["events"][0]["strain"].items()} == before
     assert data["analysis"]["fault"] == {"patch_x_mm": [187.5, 312.5], "ends_x_mm": [0.0, 500.0]}
     assert "patch_x_mm" not in data and "fault" not in data
     assert any("patch_x_mm -> analysis/fault/patch_x_mm" in n for n in notes)
@@ -195,30 +178,21 @@ def test_write_fault_geometry_in_place(tmp_path, suffix):
     data, _ = make_experiment()
     data["fault"] = "one-dimensional PMMA fault, 500 mm long"
     data["patch_x_mm"] = [187.5, 312.5]
-    dm = DataManager()
-    dm.data = data
     path = tmp_path / f"exp{suffix}"
-    dm.save_file(path)
-    before = {"runs": len(data["runs"]), "events": len(data["runs"][0]["events"])}
+    save(data, path)
+    fault = lambda d, key: np.asarray(d["analysis"]["fault"][key]).tolist()
     notes = M.write_fault_geometry(path, ends_x_mm=(0, 500))
     assert any("patch_x_mm -> analysis/fault/patch_x_mm" in n for n in notes)
     assert any("ends_x_mm = [0.0, 500.0]" in n for n in notes)
-    dm2 = DataManager()
-    dm2.load_file(path)
-    assert np.asarray(dm2.data["analysis"]["fault"]["patch_x_mm"]).tolist() == [187.5, 312.5]
-    assert np.asarray(dm2.data["analysis"]["fault"]["ends_x_mm"]).tolist() == [0.0, 500.0]
-    assert "patch_x_mm" not in dm2.data and dm2.data["fault"] == "one-dimensional PMMA fault, 500 mm long"
-    assert len(dm2.data["runs"]) == before["runs"] and len(dm2.data["runs"][0]["events"]) == before["events"]
+    back = load(path)
+    assert fault(back, "patch_x_mm") == [187.5, 312.5] and fault(back, "ends_x_mm") == [0.0, 500.0]
+    assert "patch_x_mm" not in back and back["fault"] == "one-dimensional PMMA fault, 500 mm long"
+    assert len(back["runs"]) == len(data["runs"]) and len(back["runs"][0]["events"]) == len(data["runs"][0]["events"])
     assert M.write_fault_geometry(path, patch_x_mm=[187.5, 312.5], ends_x_mm=[0, 500]) == []   # already so
-    notes = M.write_fault_geometry(path, patch_x_mm=[50, 450])
-    assert notes == ["analysis/fault/patch_x_mm = [50.0, 450.0]"]
-    dm3 = DataManager()
-    dm3.load_file(path)
-    assert np.asarray(dm3.data["analysis"]["fault"]["patch_x_mm"]).tolist() == [50.0, 450.0]
+    assert M.write_fault_geometry(path, patch_x_mm=[50, 450]) == ["analysis/fault/patch_x_mm = [50.0, 450.0]"]
+    assert fault(load(path), "patch_x_mm") == [50.0, 450.0]
     assert M.main([str(path), "--ends-x-mm=0,400"]) == 0
-    dm4 = DataManager()
-    dm4.load_file(path)
-    assert np.asarray(dm4.data["analysis"]["fault"]["ends_x_mm"]).tolist() == [0.0, 400.0]
+    assert fault(load(path), "ends_x_mm") == [0.0, 400.0]
     with pytest.raises(ValueError, match="two numbers"):
         M.write_fault_geometry(path, patch_x_mm=[1.0])
 
@@ -239,3 +213,12 @@ def test_flat_pzt_settings_and_version_1_stores_upgrade_to_result_sets():
     assert any("version 2" in n for n in notes)
     assert event["waveform"]["elsys"]["spectrum"] == {"version": 2, "sets": {"default": {"channels": {"ch0": {"channel": 0}}}}}
     assert M.upgrade_event(event, {}, "e") == []
+
+
+def test_version_1_arrivals_become_the_default_pick_set():
+    record = channel_array(np.zeros((2, 5)), ["a", "b"], time=np.arange(5.0), sample_rate=1.0, trigger_time=1.0)
+    record["arrivals"] = {"version": 1, "picked_idx": [1, 2]}
+    event = {"event_time": 1.0, "waveform": {"elsys": record}}
+    assert M.upgrade_event(event, {}, "e") == ["e: waveform/elsys/arrivals upgraded to version 2 (pick set default)"]
+    assert record["arrivals"] == {"version": 2, "current": "default", "sets": {"default": {"picked_idx": [1, 2]}}}
+    assert M.upgrade_event(event, {}, "e") == []                        # nothing left to do

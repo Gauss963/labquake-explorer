@@ -14,7 +14,12 @@ metadata the preprocessing wrote (``name``, ``date``, ``sample``, ``fault``,
   and per-sensor tables per result set (``sets[<name>]['settings']``,
   ``sets[<name>]['sensors']``) and the set last saved (``current_set``);
   files written before result sets keep flat ``settings``/``sensors``, read
-  as the set ``default`` and moved on the next save.
+  as the set ``default`` and moved on the next save;
+* ``analysis['pick_arrivals']['sets'][<set>]['records'][<recorder>]``: what
+  the Pick Arrivals view last saved in that pick set on that kind of record
+  (``filter``, ``auto_pick``, ``front_mode``, and the channels ``shown`` and
+  ``fit`` by name), which an event without picks in the set starts from,
+  and ``current_set``, the set saved last, which a new window opens on.
 
 Values are read with :func:`get_setting` and written with :func:`set_setting`,
 which creates the dicts on the way.

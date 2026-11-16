@@ -54,11 +54,6 @@ def test_eaz_limits_and_asymmetric_form():
     assert sp.eaz_half(np.array([1.0]), 1.0, 0.0, 0.5).tolist() == [0.0]
 
 
-def test_quadratic_mask():
-    y = sp.quadratic_masked(X, -524.0, 5.0, -0.01)
-    assert np.all(y >= 0) and y[0] == 0.0 and y[4] > 0
-
-
 @pytest.mark.parametrize("true", [
     {"D": 110.0, "xc": 300.0, "a": 260.0, "lambda": 0.6},
     {"D": 80.0, "xc": 240.0, "a": 180.0, "lambda": 0.4},
@@ -73,6 +68,7 @@ def test_eaz_fit_recovers_the_parameters(true):
     assert fit.tips_mm == pytest.approx((true["xc"] - true["a"], true["xc"] + true["a"]), rel=0.02)
     assert fit.peak_x_mm == pytest.approx(true["xc"], rel=0.01) and fit.peak == pytest.approx(true["D"], rel=0.01)
     np.testing.assert_allclose(fit.evaluate(X), sp.eaz_profile(X, *fit.params.values()))
+    assert fit.unresolved == [] and fit.ranges == {}                    # well sampled: nothing unresolved
 
 
 def test_eaz_asymmetric_fit_recovers_the_parameters():
@@ -86,6 +82,8 @@ def test_eaz_asymmetric_fit_recovers_the_parameters():
 
 
 def test_quadratic_fit_with_zero_sensors_outside_the_rupture():
+    y = sp.quadratic_masked(X, -524.0, 5.0, -0.01)
+    assert np.all(y >= 0) and y[0] == 0.0 and y[4] > 0
     rng = np.random.default_rng(1)
     y = np.maximum(0, 100 - 0.01 * (X - 250) ** 2) + rng.normal(0, 0.1, X.size)
     fit = sp.fit_profile(X, y, model="quadratic")
@@ -93,7 +91,7 @@ def test_quadratic_fit_with_zero_sensors_outside_the_rupture():
     assert fit.params["c2"] == pytest.approx(-0.01, rel=0.01)
     assert fit.tips_mm == pytest.approx((150.0, 350.0), abs=1.0)
     assert fit.peak_x_mm == pytest.approx(250.0, abs=0.5) and fit.peak == pytest.approx(100.0, abs=0.5)
-    assert fit.evaluate(X)[[0, 1, 6, 7]].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert fit.evaluate(X)[[0, 1, 6, 7]].tolist() == [0.0, 0.0, 0.0, 0.0] and fit.unresolved == []
     # an ordinary parabola that stays positive is fitted exactly too
     y2 = 100 - 0.0008 * (X - 250) ** 2
     fit2 = sp.fit_profile(X, y2, model="quadratic")
@@ -124,21 +122,17 @@ def test_fit_options_and_failures():
     with pytest.raises(ValueError):
         sp.fit_profile(X, y[:-1], model="eaz")
     assert np.isnan(sp.fit_profile(X[:3], y[:3], model="eaz").evaluate(X)).all()
-
-
-def test_fit_record_is_json_like():
-    fit = sp.fit_profile(X, sp.eaz_profile(X, 100, 280, 250, 0.5), model="eaz")
-    d = fit.as_dict()
+    d = sp.fit_profile(X, y, model="eaz").as_dict()
     json.dumps(d)
     assert d["model"] == "eaz" and set(d["params"]) == {"D", "xc", "a", "lambda"}
     assert {"r2", "rms_um", "tips_mm", "peak_x_mm", "peak_um", "n", "weighted", "valid", "reason", "at_bounds"} <= set(d)
 
 
-def test_front_single_and_bilateral():
+def test_front_unilateral_and_bilateral():
     t = 0.02 + np.abs(X - 279.0) * 1e-3 / 50.0
-    single = sp.fit_front(X[4:], t[4:])
-    assert single.valid and single.segments[0].velocity_m_s == pytest.approx(50.0)
-    assert single.segments[0].r2 == pytest.approx(1.0)
+    one = sp.fit_front(X[4:], t[4:])
+    assert one.valid and one.segments[0].velocity_m_s == pytest.approx(50.0)
+    assert one.segments[0].r2 == pytest.approx(1.0)
     both = sp.fit_front(X, t, mode="bilateral")
     assert both.split_x_mm == 279.0 and len(both.segments) == 2
     left, right = both.segments
@@ -246,14 +240,6 @@ def test_analytic_jacobians_match_differences():
 
 
 # ---------------------------------------------------------- identifiability
-def test_well_sampled_fits_have_nothing_unresolved():
-    for true in ((110.0, 300.0, 260.0, 0.6), (80.0, 240.0, 180.0, 0.4)):
-        fit = sp.fit_profile(X, sp.eaz_profile(X, *true), model="eaz")
-        assert fit.unresolved == [] and fit.ranges == {}
-    fit = sp.fit_profile(X, sp.eaz_profile(X, 100.0, 280.0, 250.0, 0.5), model="quadratic")
-    assert fit.unresolved == []
-
-
 def test_lambda_is_free_when_no_sensor_is_within_the_joint():
     # r_joint is 3.4 mm, the nearest sensor 31 mm from xc: the sensors see only the 3/2 tip part
     fit = sp.fit_profile(X, sp.eaz_profile(X, 100.0, 248.0, 230.0, 0.1), model="eaz")
@@ -340,7 +326,7 @@ def test_bilateral_hinge_is_exact(x0, v_minus, v_plus):
     assert d["t0_s"] == fit.t0_s and {"resolved", "min_speed_m_s"} <= set(d["segments"][0])
 
 
-def test_bilateral_hinge_with_ties_and_one_way_fronts():
+def test_bilateral_hinge_with_ties_one_way_fronts_and_three_sensors():
     t_ms = np.array([3.0, 2.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0])     # 62 m/s both ways, two sensors tied first
     fit = sp.fit_front(X, t_ms * 1e-3, mode="bilateral")
     assert fit.split_x_mm == pytest.approx(248.0)
@@ -355,9 +341,7 @@ def test_bilateral_hinge_with_ties_and_one_way_fronts():
     assert one_way.split_x_mm == 31.0 and one_way.t0_s == pytest.approx(0.01)
     flat = sp.fit_front(X, np.full(8, 0.1), mode="bilateral")
     assert len(flat.segments) == 1 and flat.segments[0].velocity_m_s == math.inf and math.isnan(flat.split_x_mm)
-
-
-def test_bilateral_with_three_sensors_keeps_two_lines_through_the_earliest():
+    # three sensors: two lines through the earliest
     x = np.array([217.0, 279.0, 341.0])
     fit = sp.fit_front(x, np.array([77.0, 75.0, 75.5]) * 1e-3, mode="bilateral")      # real run 0 event 10
     assert fit.split_x_mm == 279.0 and fit.t0_s == pytest.approx(0.075)
@@ -399,3 +383,11 @@ def test_unusable_held_values_and_bounds(kwargs, reason):
     assert not fit.valid and reason in fit.reason
     with pytest.raises(ValueError, match="no parameter"):
         sp.fit_profile(X, sp.eaz_profile(X, 100.0, 270.0, 230.0, 0.6), model="eaz", fixed={"c0": 1.0})
+
+
+def test_single_is_read_as_unilateral():
+    assert sp.FRONT_MODES == ("unilateral", "bilateral")
+    assert sp.front_mode_name("single") == "unilateral" and sp.front_mode_name(np.array("single")) == "unilateral"
+    assert sp.front_mode_name(b"bilateral") == "bilateral"
+    fit = sp.fit_front([0.0, 100.0, 200.0], [0.0, 1e-4, 2e-4], mode="single")       # records before 0.3.0
+    assert fit.mode == "unilateral" and fit.valid and len(fit.segments) == 1

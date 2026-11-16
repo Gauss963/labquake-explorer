@@ -32,14 +32,12 @@ def test_register_action_orders_by_order_then_registration(isolated_registry):
     assert A.actions_for(EVENT)[0].run(None, None) == "a"
 
 
-def test_register_view_requires_from_context(isolated_registry):
+def test_register_view_builds_from_context(isolated_registry):
     with pytest.raises(TypeError):
         @A.register_view("X", kinds=[EVENT])
         class NoFactory:
             pass
 
-
-def test_register_view_builds_from_context(isolated_registry):
     made = []
 
     @A.register_view("Open", kinds=[EVENT, RUN])
@@ -51,19 +49,16 @@ def test_register_view_builds_from_context(isolated_registry):
 
     assert V.menu_label == "Open"
     assert V.menu_kinds == frozenset({EVENT, RUN})
-    action = A.actions_for(RUN)[0]
-    assert action.run("app", "ctx") == "view"
+    assert A.actions_for(RUN)[0].run("app", "ctx") == "view"
     assert made == [("app", "ctx")]
 
 
-def test_unknown_kind_rejected(isolated_registry):
+def test_unknown_kind_rejected_and_add_action_replaces_by_name(isolated_registry):
     with pytest.raises(ValueError):
         A.register_action("bad", kinds=["nope"])
     with pytest.raises(ValueError):
         A.register_action("bad", kinds=[])
 
-
-def test_add_action_replaces_by_name(isolated_registry):
     def f(app, ctx):
         return 1
 
