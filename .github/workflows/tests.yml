@@ -1,8 +1,10 @@
 name: tests
 
+# Every push to a branch of this repository (or of a fork with Actions enabled), and
+# pull requests that come from a fork; a pull request from a branch of this repository
+# is already tested by its pushes.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +17,7 @@ concurrency:
 
 jobs:
   pytest:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     name: ${{ matrix.os }}, Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45

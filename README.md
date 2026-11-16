@@ -75,7 +75,7 @@ Tests use synthetic stick-slip runs with known answers and run headlessly:
 python -m pytest tests -q
 ```
 
-GitHub Actions runs them on every pull request and on every push to `main`
+GitHub Actions runs them on every push and on pull requests from forks
 (`.github/workflows/tests.yml`: Linux, macOS and Windows), one pytest process
 per test file:
 
