@@ -21,7 +21,8 @@ def test_exact_power_law_recovered():
     assert fit.log10_coefficient == pytest.approx(np.log10(4.0), abs=1e-10)
     assert fit.r2 == pytest.approx(1.0)
     assert fit(8.0) == pytest.approx(4.0 * 8.0 ** (-1.0 / 3.0), rel=1e-9)
-    assert np.isfinite(fit.exponent_stderr) and fit.exponent_stderr == pytest.approx(0.0, abs=1e-9)
+    # zero to rounding: 1.5e-9 with numpy 2.5 on x86, less elsewhere
+    assert np.isfinite(fit.exponent_stderr) and fit.exponent_stderr == pytest.approx(0.0, abs=1e-7)
     assert fit.exponent_rma == pytest.approx(-1.0 / 3.0, abs=1e-10)     # RMA coincides with OLS on exact data
     d = fit_power_law([1.0, 10.0, 100.0, 1000.0], 2.0 * np.array([1.0, 10.0, 100.0, 1000.0]) ** 1.5).as_dict()
     assert set(d) == FIELDS and d["valid"] is True
