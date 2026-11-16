@@ -410,7 +410,7 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.save_parameters()
         saved = event["czm_parms"]
         assert set(saved) == EXPECTED_KEYS | {"channel", "sensor", "unit", "E", "nu", "C_s", "C_d", "tau_p",
-                                              "fit_components", "x_base", "model", "reference"}
+                                              "fit_components", "x_base", "model", "reference", "model_choice"}
         assert saved["model"] == "sub-Rayleigh" and saved["reference"] == "fit end"
         assert saved["sensor"] == "rosette_1" and saved["channel"] == "rosette_1_sigma_xy"
         assert saved["unit"] == "MPa" and saved["strain_gauge"] == 2
@@ -942,5 +942,68 @@ def test_reference_defaults_to_fit_end(app_with_strain):
         assert list(v.reference_box["values"]) == ["fit end", "background"]
         v.set_event(1)                                                       # a record in volts has no such choice
         assert not v.to_background() and not v.fit_frame.winfo_manager()
+    finally:
+        v.on_close()
+
+
+def test_model_box_keeps_cf_in_the_chosen_models_range(app_with_strain):
+    from labquake_explorer.ui.views.czm_fitter_view import CF_LIMIT, MODELS
+    from labquake_explorer.utils.cohesive_crack import rayleigh_speed
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    medium = supershear_record(app_with_strain, event, speed=2000.0)       # 1.2 C_s
+    c_r = rayleigh_speed(medium["C_s"], medium["C_d"])
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.model_var.get() == "auto" and list(v.model_box["values"]) == list(MODELS) == ["auto", "sub-Rayleigh", "supershear"]
+        v.gauge_combobox.set("shear_2")
+        assert v.auto_fit() is not None and medium["C_s"] < v.Cf.get() < medium["C_d"]
+        measured = v.Cf.get()
+
+        v.model_var.set("sub-Rayleigh")                                      # the front is supershear: Cf goes below C_R
+        v.on_model_selected()
+        assert v.Cf.get() == pytest.approx(CF_LIMIT * c_r)
+        assert "sub-Rayleigh model chosen" in v.result_var.get() and "sub-Rayleigh model" in v.result_text()
+        assert np.isfinite(drawn(v.axs[0], "CZM")).all()                      # that model is drawn
+        v.Cf.set(2000.0)                                                     # typed back above the range: kept in it
+        v.update_plot()
+        assert v.Cf.get() == pytest.approx(CF_LIMIT * c_r)
+        v.Cf.set(0.5 * c_r)                                                  # inside the range: left alone
+        v.update_plot()
+        assert v.Cf.get() == pytest.approx(0.5 * c_r)
+        assert v.auto_fit() is not None and v.Cf.get() == pytest.approx(CF_LIMIT * c_r)   # Auto keeps to the choice
+        v.save_parameters()
+        assert event["czm_parms"]["model_choice"] == "sub-Rayleigh" and event["czm_parms"]["model"] == "sub-Rayleigh"
+
+        v.model_var.set("supershear")                                        # back to the measured speed, in its range
+        v.on_model_selected()
+        assert v.Cf.get() == pytest.approx(measured, rel=1e-6) and "supershear model" in v.result_text()
+        v.Cf.set(1000.0)                                                     # below C_s: moved to the lower edge
+        v.update_plot()
+        assert v.Cf.get() == pytest.approx(medium["C_s"] / CF_LIMIT)
+        v.Cf.set(2 * medium["C_d"])
+        v.update_plot()
+        assert v.Cf.get() == pytest.approx(CF_LIMIT * medium["C_d"])
+
+        v.model_var.set("auto")                                              # the model follows Cf again
+        v.on_model_selected()
+        assert v.Cf.get() == pytest.approx(measured, rel=1e-6)
+        v.Cf.set(0.5 * c_r)
+        v.update_plot()
+        assert v.Cf.get() == pytest.approx(0.5 * c_r) and "sub-Rayleigh model" in v.result_text()
+    finally:
+        v.on_close()
+    # the choice comes back with the saved parameters, and an experiment can set its default
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.model_var.get() == "sub-Rayleigh" and v.Cf.get() <= CF_LIMIT * c_r * (1 + 1e-9)
+    finally:
+        v.on_close()
+    event.pop("czm_parms")
+    app_with_strain.data_manager.data["analysis"]["czm"] = {"model": "supershear"}
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.model_var.get() == "supershear" and medium["C_s"] < v.Cf.get() < medium["C_d"]
+        v.set_event(1)                                                       # a record in volts has no such choice
+        assert v.model_choice() == "auto" and not v.fit_frame.winfo_manager()
     finally:
         v.on_close()

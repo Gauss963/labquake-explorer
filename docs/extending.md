@@ -339,6 +339,14 @@ and `C_d` the supershear solution with the same cohesive zone
 above `C_d`, no steady solution exists and nothing is drawn. When it saves
 the extra keys, `czm_parms` records which as `model`.
 
+For a stress record the `Model` box can fix the solution instead (`auto`,
+`sub-Rayleigh`, `supershear`; an experiment's default is
+`analysis['czm']['model']`, the choice is saved as `model_choice`). A chosen
+model keeps `Cf` in its own speed range: below `C_R` for `sub-Rayleigh`,
+between `C_s` and `C_d` for `supershear`; a measured speed outside it is moved
+to the nearest edge (0.98 of the way in) and the result line says so. `auto`
+takes `Cf` back from the measured speed.
+
 Where the model's zero of `sigma_xy` is taken in a stress record is a
 choice (`Model zero` box; an experiment's default is
 `analysis['czm']['reference']`, the choice is saved as `reference`):

@@ -57,7 +57,14 @@ Which model.  Below the Rayleigh speed the steady sub-Rayleigh solution
 the shear and longitudinal wave speeds the steady supershear solution with
 the same cohesive zone (``SupershearCohesiveCrack``); between the Rayleigh
 and shear speeds, and above the longitudinal speed, no steady solution
-exists and no model is drawn.  The result line names the model in use.  A component the
+exists and no model is drawn.  The result line names the model in use.  The
+``Model`` box of a stress record can fix it instead of letting it follow
+``Cf``: ``sub-Rayleigh`` keeps ``Cf`` below the Rayleigh speed, ``supershear``
+between the shear and longitudinal speeds (a measured speed outside the
+chosen range is moved to its nearest edge, and the result line says so);
+``auto`` takes ``Cf`` back from the measured speed.  An experiment sets its
+default with ``analysis['czm']['model']``; the choice is saved as
+``model_choice``.  A component the
 record flags as not valid (``valid``, from the conversion: an input it uses
 was railed) is drawn grey and left out of every fit.
 
@@ -105,6 +112,12 @@ BACKGROUND_HINT = ("grey band: background, its mean is removed from the data and
 #   'background' the level before the front (the background window); the fit window is background end .. fit end
 REFERENCES = ("fit end", "background")
 REFERENCE_SETTING = ("czm", "reference")                           # analysis['czm']['reference']: an experiment's default
+# which cohesive-zone solution a stress record is compared with:
+#   'auto'          the one that exists at Cf: sub-Rayleigh below C_R, supershear between C_s and C_d
+#   'sub-Rayleigh'  the sub-Rayleigh one: Cf is kept below C_R
+#   'supershear'    the supershear one: Cf is kept between C_s and C_d
+MODELS = ("auto", "sub-Rayleigh", "supershear")
+MODEL_SETTING = ("czm", "model")                                  # analysis['czm']['model']: an experiment's default
 CLEAR_FRONT = 8.0                                                 # Auto wants a front this many times the noise
 CF_LIMIT = 0.98                                                   # Auto keeps Cf this far inside a model's speed range
 
@@ -229,6 +242,12 @@ class CZMFitterView(EventView):
                                           width=11, state="readonly")
         self.reference_box.pack(side=tk.LEFT)
         self.reference_box.bind("<<ComboboxSelected>>", self.update_plot)
+        ttk.Label(self.fit_frame, text="Model:").pack(side=tk.LEFT, padx=(12, 2))
+        self.model_var = tk.StringVar(master=self, value=MODELS[0])           # see MODELS
+        self.model_box = ttk.Combobox(self.fit_frame, textvariable=self.model_var, values=list(MODELS),
+                                      width=12, state="readonly")
+        self.model_box.pack(side=tk.LEFT)
+        self.model_box.bind("<<ComboboxSelected>>", self.on_model_selected)
         self.fit_frame.grid_remove()
 
         # Filter controls
@@ -378,6 +397,9 @@ class CZMFitterView(EventView):
             wanted = get_setting(self.data_manager.data, *REFERENCE_SETTING)
             wanted = wanted.decode() if isinstance(wanted, bytes) else wanted
             self.reference_var.set(wanted if wanted in REFERENCES else REFERENCES[0])
+            wanted = get_setting(self.data_manager.data, *MODEL_SETTING)
+            wanted = wanted.decode() if isinstance(wanted, bytes) else wanted
+            self.model_var.set(wanted if wanted in MODELS else MODELS[0])
         self.load_medium()
         default_gauge = self.default_gauge()
 
@@ -413,6 +435,10 @@ class CZMFitterView(EventView):
             saved = saved.decode() if isinstance(saved, bytes) else saved
             if self.stress_mode and saved in REFERENCES:
                 self.reference_var.set(saved)
+            saved = params.get('model_choice')
+            saved = saved.decode() if isinstance(saved, bytes) else saved
+            if self.stress_mode and saved in MODELS:
+                self.model_var.set(saved)
         else:
             self._set_default_parameters()
             self.line_positions = []
@@ -767,6 +793,7 @@ class CZMFitterView(EventView):
 
     # ----------------------------------------------------------------- plot
     def update_plot(self, event=None):
+        self.keep_to_model()
         line_positions = self.current_line_positions()
 
         xlim_temp = self.axs[0].get_xlim()
@@ -1346,6 +1373,18 @@ class CZMFitterView(EventView):
         c_r = rayleigh_speed(self.C_s, self.C_d)
         low, high = CF_LIMIT * c_r, self.C_s / CF_LIMIT           # the edges of the two ranges facing the gap
         top = CF_LIMIT * self.C_d
+        choice = self.model_choice()
+        if choice == "sub-Rayleigh":                              # the Model box: that model's range only
+            return (speed, "") if speed <= low else (low, (
+                f"sub-Rayleigh model chosen, {speed:.0f} m/s is above its range: "
+                f"Cf kept at {CF_LIMIT:g} C_R = {low:.0f} m/s"))
+        if choice == "supershear":
+            if high <= speed <= top:
+                return speed, ""
+            return (high, (f"supershear model chosen, {speed:.0f} m/s is below its range: "
+                           f"Cf kept at C_s / {CF_LIMIT:g} = {high:.0f} m/s")) if speed < high else (top, (
+                f"supershear model chosen, {speed:.0f} m/s is above C_d = {self.C_d:.0f} m/s: "
+                f"Cf kept at {CF_LIMIT:g} C_d = {top:.0f} m/s"))
         if speed <= low or high <= speed <= top:
             return speed, ""
         if speed > top:
@@ -1355,6 +1394,38 @@ class CZMFitterView(EventView):
                          f"Cf kept at {CF_LIMIT:g} C_R (sub-Rayleigh model)")
         return high, (f"between C_R = {c_r:.0f} and C_s = {self.C_s:.0f} m/s, where no steady solution exists: "
                       f"Cf kept at C_s / {CF_LIMIT:g} (supershear model)")
+
+    def model_choice(self) -> str:
+        """The Model box of a stress record (see ``MODELS``); 'auto' for a record in volts."""
+        choice = self.model_var.get() if self.stress_mode else MODELS[0]
+        return choice if choice in MODELS else MODELS[0]
+
+    def keep_to_model(self) -> None:
+        """With a model chosen in the Model box, ``Cf`` stays in that model's
+        speed range: a value outside it is moved to the nearest edge, with a
+        note in the result line."""
+        if self.model_choice() == MODELS[0]:
+            return
+        try:
+            speed = abs(float(self.Cf.get()))
+        except (tk.TclError, ValueError):
+            return
+        if speed <= 0:
+            return
+        Cf, why = self.model_speed(speed)
+        if why:
+            self.Cf.set(Cf)
+            self.auto_note = f"Model: {why}"
+
+    def on_model_selected(self, event=None):
+        """The Model box changed: ``Cf`` is taken again from the measured speed
+        (Pick Arrivals, or the fronts at gauges of the same kind; the value in
+        the box when there is none) and kept to the chosen model's range."""
+        speed = self.estimate_rupture_speed() if self.stress_mode else None
+        Cf, why = self.model_speed(speed if speed else self.Cf.get())
+        self.Cf.set(Cf)
+        self.auto_note = f"Model: {why}" if why else f"Model {self.model_choice()}: Cf = {Cf:.0f} m/s"
+        self.update_plot()
 
     def auto_fit(self):
         """A starting point for a stress record, then the fit.
@@ -1453,7 +1524,8 @@ class CZMFitterView(EventView):
         itself), the record's unit,
         the elastic medium, the components fitted together and the start of
         the background window ``x_base`` (stress records), the ``model`` in
-        use at this Cf (``sub-Rayleigh`` or ``supershear``) and the peak
+        use at this Cf (``sub-Rayleigh`` or ``supershear``), the Model box's
+        setting ``model_choice`` (stress records) and the peak
         strength ``tau_p`` (Pa) that Gc and Xc imply there."""
         gauge = int(self.strain_gauge.get())
         if self.stress_mode:
@@ -1465,6 +1537,7 @@ class CZMFitterView(EventView):
         if self.stress_mode:
             context["x_base"] = self.baseline_window(self._time(), self.current_line_positions())[0]
             context["reference"] = self.reference_var.get()
+            context["model_choice"] = self.model_choice()
         if self.stress_mode and self.fit_components():
             context["fit_components"] = self.fit_components()
         regime = rupture_regime(self.Cf.get(), self.C_s, self.C_d)
