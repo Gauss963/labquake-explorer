@@ -59,14 +59,19 @@ jobs:
           python -c "import sys, tkinter, numpy, scipy, h5py, matplotlib, pandas; print(sys.version); print('Tk', tkinter.TkVersion, '| numpy', numpy.__version__, '| scipy', scipy.__version__, '| h5py', h5py.__version__, '| matplotlib', matplotlib.__version__, '| pandas', pandas.__version__)"
 
       # One pytest process per test file, each with a time limit: a view that never
-      # returns then fails its own file instead of holding the whole run.
+      # returns then fails its own file instead of holding the whole run.  The tests
+      # that fail are named as annotations, with their output in the job summary.
       - name: Tests
         shell: bash
         run: |
           failed=()
           for file in tests/test_*.py; do
             echo "::group::$file"
-            python -m pytest "$file" -q --timeout=600 --timeout-method=thread || failed+=("$file")
+            if ! python -m pytest "$file" -q -rfE --timeout=600 --timeout-method=thread 2>&1 | tee pytest.log; then
+              failed+=("$file")
+              grep -E '^(FAILED|ERROR) ' pytest.log | sed 's/^/::error::/' || true
+              { echo "### $file"; echo '```'; tail -n 80 pytest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
             echo "::endgroup::"
           done
           if [ ${#failed[@]} -gt 0 ]; then
