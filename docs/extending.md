@@ -307,6 +307,22 @@ and `C_d` the supershear solution with the same cohesive zone
 above `C_d`, no steady solution exists and nothing is drawn. When it saves
 the extra keys, `czm_parms` records which as `model`.
 
+Where the model's zero of `sigma_xy` is taken in a stress record is a
+choice (`Model zero` box; an experiment's default is
+`analysis['czm']['reference']`, the choice is saved as `reference`):
+
+- `fit end` (default): the stress drops at the front to a residual level;
+  the model is shifted onto the measured trace over the fit window, which
+  runs from `tip` to `fit end`.
+- `background`: the stress rises above its level before the front and falls
+  back to it, and what the record does below that level afterwards (the
+  fault unloading as a whole) is not the cohesive zone. The model is
+  referred to the background window like the data and never shifted; the
+  fit window runs from `background end` through `tip` to `fit end`, which
+  belongs where the trace falls back to the background. `Auto` puts the tip
+  on the maximum above the background, `fit end` on that return, and fits
+  the tip time together with `Gc` and `Xc`.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,

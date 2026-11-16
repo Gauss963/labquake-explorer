@@ -39,6 +39,19 @@ sensor's front, derives Xc and Gc from the duration and size of the drop,
 and runs the fit; on a sensor without a clear front it changes nothing.
 The front is the largest drop of sigma_xy over 50 us.
 
+The zero of the model (``Model zero`` box, stress records).  ``fit end``,
+as above: the stress drops at the front to a residual level, which is the
+model's zero.  ``background``: the stress only rises above its level before
+the front and falls back to it, and what the record does below that level
+afterwards is not the cohesive zone (the fault unloading as a whole).  Then
+the model is referred to the background window like the data and never
+shifted, the fit window runs from ``background end`` through ``tip`` to
+``fit end``, which belongs where the trace falls back to the background,
+and ``Auto`` puts the tip on the maximum above the background, ``fit end``
+on that return, and fits the tip time together with Gc and Xc.  An
+experiment sets its default with ``analysis['czm']['reference']``; the
+choice is saved with the parameters.
+
 Which model.  Below the Rayleigh speed the steady sub-Rayleigh solution
 (:class:`~labquake_explorer.utils.cohesive_crack.CohesiveCrack`); between
 the shear and longitudinal wave speeds the steady supershear solution with
@@ -84,6 +97,14 @@ LINE_ROLES = (("background end", {"color": "0.35", "linestyle": "--", "alpha": 0
               ("fit end", {"color": "crimson", "linestyle": "--", "alpha": 0.9}))
 STRESS_HINT = ("grey band: background, its mean is removed (drag its two edges)   |   red band: fit window, from 'tip' "
                "(the front reaches the sensor) to 'fit end'   |   black: the model, shifted to match sigma_xy inside it")
+BACKGROUND_HINT = ("grey band: background, its mean is removed from the data and from the model (drag its two edges)   |   "
+                   "red band: fit window, from 'background end' through 'tip' to 'fit end': put 'fit end' where the "
+                   "trace falls back to the background, what lies below it is not the cohesive zone")
+# where the model's zero of sigma_xy is taken in a stress record:
+#   'fit end'    the residual level behind the front, read at the fit-end line; the fit window is tip .. fit end
+#   'background' the level before the front (the background window); the fit window is background end .. fit end
+REFERENCES = ("fit end", "background")
+REFERENCE_SETTING = ("czm", "reference")                           # analysis['czm']['reference']: an experiment's default
 CLEAR_FRONT = 8.0                                                 # Auto wants a front this many times the noise
 CF_LIMIT = 0.98                                                   # Auto keeps Cf this far inside a model's speed range
 
@@ -202,6 +223,12 @@ class CZMFitterView(EventView):
             self.fit_boxes[component] = ttk.Checkbutton(self.fit_frame, text=component,
                                                         variable=self.fit_vars[component])
             self.fit_boxes[component].pack(side=tk.LEFT)
+        ttk.Label(self.fit_frame, text="Model zero:").pack(side=tk.LEFT, padx=(12, 2))
+        self.reference_var = tk.StringVar(master=self, value=REFERENCES[0])   # see REFERENCES
+        self.reference_box = ttk.Combobox(self.fit_frame, textvariable=self.reference_var, values=list(REFERENCES),
+                                          width=11, state="readonly")
+        self.reference_box.pack(side=tk.LEFT)
+        self.reference_box.bind("<<ComboboxSelected>>", self.update_plot)
         self.fit_frame.grid_remove()
 
         # Filter controls
@@ -347,6 +374,10 @@ class CZMFitterView(EventView):
         self.auto_note = ""
         self.hint_var.set(STRESS_HINT if self.stress_mode else "")
         self.result_var.set("")
+        if self.stress_mode and not self._opened:            # the experiment's default; later events keep the choice
+            wanted = get_setting(self.data_manager.data, *REFERENCE_SETTING)
+            wanted = wanted.decode() if isinstance(wanted, bytes) else wanted
+            self.reference_var.set(wanted if wanted in REFERENCES else REFERENCES[0])
         self.load_medium()
         default_gauge = self.default_gauge()
 
@@ -378,6 +409,10 @@ class CZMFitterView(EventView):
                 self.x_base = float(params['x_base']) if self.stress_mode and 'x_base' in params else None
             except (TypeError, ValueError):
                 self.x_base = None
+            saved = params.get('reference')
+            saved = saved.decode() if isinstance(saved, bytes) else saved
+            if self.stress_mode and saved in REFERENCES:
+                self.reference_var.set(saved)
         else:
             self._set_default_parameters()
             self.line_positions = []
@@ -618,15 +653,28 @@ class CZMFitterView(EventView):
         half = max(self._filter_window_length() // 2, 0)
         return slice(max(index - half, 0), index + half + 1)
 
+    def to_background(self) -> bool:
+        """True when the model's zero is the level before the front (``Model
+        zero: background``), False when it is the residual level at fit end."""
+        return self.stress_mode and self.reference_var.get() == "background"
+
+    def fit_mask(self, t, positions) -> np.ndarray:
+        """The samples of the fit window of a stress record: tip .. fit end, or
+        background end .. fit end when the model's zero is the background."""
+        x_min, x_tip, x_max = sorted(positions)
+        return (t >= (x_min if self.to_background() else x_tip)) & (t <= x_max)
+
     def referenced(self, component, measured, model, base, fit, i_max):
-        """A stress component and its model on the levels they are compared on:
-        the measured trace minus its background (mean over ``base``); the
-        model's sigma_xx and sigma_yy minus theirs; the model's sigma_xy
-        shifted to the measured trace's mean over the fit window ``fit`` (when
-        that holds no sample: attached at ``i_max``, x_max, over
-        :meth:`level_window`)."""
+        """A stress component and its model on the levels they are compared on.
+
+        The measured trace minus its background (mean over ``base``).  The
+        model's sigma_xx and sigma_yy minus theirs.  The model's sigma_xy: with
+        the zero at fit end, shifted to the measured trace's mean over the fit
+        window ``fit`` (when that holds no sample: attached at ``i_max``,
+        x_max, over :meth:`level_window`); with the zero at the background,
+        minus its own background like the others, never shifted."""
         data = measured - float(np.mean(measured[base]))
-        if component == "xy":
+        if component == "xy" and not self.to_background():
             window = fit if np.any(fit) else self.level_window(i_max)
             return data, model - float(np.mean(model[window])) + float(np.mean(data[window]))
         return data, model - float(np.mean(model[base]))
@@ -740,8 +788,9 @@ class CZMFitterView(EventView):
             # every trace minus its background; see ``referenced`` for the model's levels
             x_min, x_tip, x_max = sorted(line_positions)
             base = self.baseline_mask(t, line_positions)
-            fit = (t >= x_tip) & (t <= x_max)
+            fit = self.fit_mask(t, line_positions)
             i_max = int(np.argmin(np.abs(t - x_max)))
+            self.hint_var.set(BACKGROUND_HINT if self.to_background() else STRESS_HINT)
         else:
             # Exy is zeroed at x_max (the level behind the front), Eyy at x_min (before it arrives)
             x_tip = line_positions[1]
@@ -769,6 +818,11 @@ class CZMFitterView(EventView):
                 if self.stress_mode and fit.any():         # the model counts inside the fit window: faint outside it
                     ax.plot(t, curve * scale, **MODEL_OUTSIDE_STYLE)
                     ax.plot(t[fit], curve[fit] * scale, label='CZM', **MODEL_STYLE)
+                    if self.to_background():               # show what is fitted: the drop below the background
+                        inside = np.concatenate([data[fit], curve[fit][np.isfinite(curve[fit])]]) * scale   # is not
+                        low, high = float(inside.min()), float(inside.max())
+                        span = max(high - low, 1e-9)
+                        ax.set_ylim(low - span, high + 0.5 * span)
                 else:
                     ax.plot(t, curve * scale, label='CZM', **MODEL_STYLE)
             elif self.stress_mode:
@@ -784,7 +838,7 @@ class CZMFitterView(EventView):
             start, end = self.baseline_window(t, line_positions)
             for ax in self.axs:                            # the background window (grey) with its movable start,
                 ax.axvspan(start, end, color='0.85', alpha=0.6, zorder=0)        # and the fit window (red)
-                ax.axvspan(x_tip, x_max, color='crimson', alpha=0.08, zorder=0)
+                ax.axvspan(x_min if self.to_background() else x_tip, x_max, color='crimson', alpha=0.08, zorder=0)
                 self.base_lines.append(ax.axvline(x=start, color='0.35', linestyle=':'))
             top = self.axs[0]                              # the lines' names, along the top of the top panel
             named = [(start, "background start", "left", "0.35")]
@@ -883,7 +937,7 @@ class CZMFitterView(EventView):
         self.sync_gauge()
         t = self._time()
         exy = self._strain(self.strain_gauge.get())
-        mask = (t >= t1) & (t <= t2)
+        mask = self.fit_mask(t, [t0, t1, t2]) if self.stress_mode else (t >= t1) & (t <= t2)
         if not np.any(mask):
             print("No samples between the tip and max lines")
             return None
@@ -924,14 +978,17 @@ class CZMFitterView(EventView):
         t_model = np.concatenate([t_fit, t_base])                   # the fit window, then the background window
         n = t_fit.size
 
+        shifted = not self.to_background()
+
         def objective(params):
-            Gc, Xc = params
+            Gc, Xc = params[:2]
+            tip = params[2] if len(params) > 2 else t1     # a third value moves the tip (Auto, background zero)
             with np.errstate(all="ignore"):
-                model = self._model_components(t_model, t1, Xc, Gc)
+                model = self._model_components(t_model, tip, Xc, Gc)
             total = 0.0
             for component in components:
                 values = model[component]
-                if component == "xy":       # shifted to the measured mean over the fit window
+                if component == "xy" and shifted:   # shifted to the measured mean over the fit window
                     curve = values[:n] - float(np.mean(values[:n])) + float(np.mean(targets[component]))
                 else:                       # referred to the background window, as the data
                     curve = values[:n] - float(np.mean(values[n:]))
@@ -948,11 +1005,11 @@ class CZMFitterView(EventView):
             return self.auto_note
         t0, t1, t2 = sorted(self.current_line_positions())
         t = self._time()
-        mask = (t >= t1) & (t <= t2)
+        mask = self.fit_mask(t, [t0, t1, t2])
         components = self.fit_components()
         if not mask.any() or not components:
             if components:
-                return "no sample between 'tip' and 'fit end'"
+                return "no sample in the fit window"
             channels = self.sensor_channels()
             flagged = [c for c in COMPONENTS if c in channels and not self.channel_valid(channels[c])]
             return ("no valid component to fit: " + ", ".join(flagged) + " flagged not valid in this record"
@@ -965,13 +1022,19 @@ class CZMFitterView(EventView):
         if not np.isfinite(value):
             return "no model at these parameters"
         rms = np.sqrt(value / objective.n_values) * 1e-3                           # kPa -> MPa
-        text = (f"fit window {1e6 * (t2 - t1):.0f} us, {', '.join(components)}:  misfit (rms) {rms:.3f} MPa"
+        window = (t2 - t0) if self.to_background() else (t2 - t1)
+        text = (f"fit window {1e6 * window:.0f} us, {', '.join(components)}:  misfit (rms) {rms:.3f} MPa"
                 f"   |   tau_p = {self.fit_context().get('tau_p', float('nan')) / 1e6:.2f} MPa")
-        if "xy" in components:                              # the measured drop of sigma_xy over the fit window
+        if "xy" in components:
             xy = self._strain(self.sensor_channels()["xy"])
-            first, last = (int(np.argmin(np.abs(t - x))) for x in (t1, t2))
-            drop = float(np.mean(xy[self.level_window(first)]) - np.mean(xy[self.level_window(last)]))
-            text += f"   |   drop over the window = {drop / 1e6:.2f} MPa"
+            if self.to_background():                        # how far sigma_xy rises above its background in the window
+                smooth = signal.savgol_filter(xy, min(31, xy.size - 1 - (xy.size % 2 == 0)), 2) if xy.size > 33 else xy
+                above = float(np.max(smooth[mask]) - np.mean(xy[self.baseline_mask(t, [t0, t1, t2])]))
+                text += f"   |   peak above the background = {above / 1e6:.3f} MPa"
+            else:                                           # the measured drop of sigma_xy over the fit window
+                first, last = (int(np.argmin(np.abs(t - x))) for x in (t1, t2))
+                drop = float(np.mean(xy[self.level_window(first)]) - np.mean(xy[self.level_window(last)]))
+                text += f"   |   drop over the window = {drop / 1e6:.2f} MPa"
         regime = rupture_regime(self.Cf.get(), self.C_s, self.C_d)
         text += (f"   |   Cf = {abs(self.Cf.get()) / self.C_s:.2f} C_s, supershear model" if regime == "supershear" else
                  f"   |   Cf = {abs(self.Cf.get()) / rayleigh_speed(self.C_s, self.C_d):.2f} C_R, sub-Rayleigh model")
@@ -983,9 +1046,11 @@ class CZMFitterView(EventView):
         return f"{text}   |   {self.auto_note}" if self.auto_note else text
 
 
-    def fit_parameters(self):
+    def fit_parameters(self, tip_range: float = 0.0):
         """Fit Gc and Xc to the data between the tip and max lines (see
-        :meth:`build_fit_objective`).
+        :meth:`build_fit_objective`).  For a stress record a positive
+        ``tip_range`` (s) also moves the tip, by at most that much, and puts
+        the tip line where the fit ends up.
 
         Returns the scipy ``OptimizeResult`` (with ``initial_fun`` added: the
         objective at the starting guess), or None if no fit could be set up.
@@ -993,6 +1058,8 @@ class CZMFitterView(EventView):
         objective = self.build_fit_objective()
         if objective is None:
             return None
+        if self.stress_mode and tip_range > 0:
+            return self.fit_with_tip(objective, float(tip_range))
 
         initial_guess = [self.Gc.get(), self.Xc.get()]
         bounds = ((1e-6, None), (1e-6, None))
@@ -1020,6 +1087,51 @@ class CZMFitterView(EventView):
             print(f"Fitted parameters: Gc={result.x[0]:.2e}, Xc={result.x[1]:.2f}")
         else:
             print("Fitting failed:", result.message)
+        return result
+
+    def fit_with_tip(self, objective, tip_range: float):
+        """The fit of a stress record with the tip time free within
+        ``tip_range`` of where its line stands.  For each trial tip, log Gc and
+        log Xc are fitted; the tip is searched on a coarse grid, then refined
+        around the best one."""
+        positions = self.current_line_positions()
+        order = np.argsort(positions, kind="stable")
+        tip_index, tip0 = int(order[1]), float(sorted(positions)[1])
+        best = {"values": [max(self.Gc.get(), 1e-6), max(self.Xc.get(), 1e-6)]}
+        start = objective(best["values"] + [tip0])
+        if not np.isfinite(start):
+            print("No fit: the model has no value at these parameters")
+            return None
+        bounds = [tuple(np.log(b)) for b in STRESS_BOUNDS]
+
+        def at_tip(tip):
+            """The misfit with Gc and Xc fitted at one tip time (starting from the best pair so far)."""
+            guess = np.log(best["values"])
+            inner = optimize.minimize(lambda u: objective([np.exp(u[0]), np.exp(u[1]), tip]), guess, method='Nelder-Mead',
+                                      bounds=bounds, options={"xatol": 1e-3, "fatol": max(1e-7 * start, 1e-9),
+                                                              "maxiter": 400})
+            if np.isfinite(inner.fun) and inner.fun < best.get("fun", np.inf):
+                best.update(fun=float(inner.fun), values=[float(np.exp(inner.x[0])), float(np.exp(inner.x[1]))], tip=tip)
+            return float(inner.fun) if np.isfinite(inner.fun) else np.inf
+
+        grid = tip0 + tip_range * np.linspace(-1, 1, 9)
+        coarse = [at_tip(float(tip)) for tip in grid]
+        k = int(np.argmin(coarse))
+        low, high = grid[max(k - 1, 0)], grid[min(k + 1, grid.size - 1)]
+        optimize.minimize_scalar(at_tip, bounds=(float(low), float(high)), method='bounded',
+                                 options={"xatol": 1e-3 * tip_range, "maxiter": 30})
+        result = optimize.OptimizeResult(x=np.array(best["values"] + [best.get("tip", tip0)]),
+                                         fun=best.get("fun", start), success="fun" in best and best["fun"] <= start,
+                                         message="tip, Gc and Xc fitted", initial_fun=start)
+        if result.success:
+            self.Gc.set(float(result.x[0]))
+            self.Xc.set(float(result.x[1]))
+            positions[tip_index] = float(result.x[2])
+            self.set_lines(positions)
+            self.update_plot()
+            print(f"Fitted parameters: Gc={result.x[0]:.2e}, Xc={result.x[1]:.3g}, tip at {result.x[2]:.6f} s")
+        else:
+            print("Fitting failed: no tip time did better than the start")
         return result
 
     # ----------------------------------------------------------------- auto
@@ -1157,6 +1269,75 @@ class CZMFitterView(EventView):
         slope = float(np.median(slopes)) if slopes else 0.0
         return 1.0 / abs(slope) if slope else None
 
+    def rise_above_background(self, channel) -> dict | None:
+        """The stress above its level before the front on one channel of a
+        stress record, from the trace smoothed over 15 us: ``t_peak`` (its
+        maximum in the 0.3 ms before the largest drop), ``height`` above
+        ``level`` (the median of the 1 ms that ends 0.3 ms before the peak;
+        ``scatter`` is the standard deviation there), ``t_rise`` (when it last
+        left that level before the peak) and ``t_back`` (when it first returns
+        to it afterwards; None when it does not within 0.5 ms).  Leaving and
+        returning are taken at 5 % of the height.  None for a record too short."""
+        looked = self.smoothed_changes(channel)
+        if looked is None:
+            return None
+        t, fs, lag, _, step = looked
+        raw = np.asarray(waveform_data(self.strain_block(self.event))[channel], dtype=float) * self.stress_scale
+        window = max(int(round(15e-6 * fs)) | 1, 5)
+        smooth = signal.savgol_filter(raw, min(window, t.size - 1 - (t.size % 2 == 0)), 2)
+        i = int(np.argmin(step)) + lag // 2                   # the middle of the largest drop
+        near, far = int(round(300e-6 * fs)), int(round(1e-3 * fs))
+        i_peak = max(i - near, 0) + int(np.argmax(smooth[max(i - near, 0): i + 1]))
+        quiet = smooth[max(i_peak - near - far, 0): max(i_peak - near, 2)]
+        level, scatter = float(np.median(quiet)), float(np.std(quiet))
+        height = float(smooth[i_peak] - level)
+        at_level = smooth <= level + 0.05 * height
+        before = np.flatnonzero(at_level[:i_peak])
+        after = np.flatnonzero(at_level[i_peak: i_peak + int(round(500e-6 * fs))])
+        return {"t_peak": float(t[i_peak]), "height": height, "level": level, "scatter": scatter,
+                "t_rise": float(t[before[-1]]) if before.size else float(t[max(i_peak - near, 0)]),
+                "t_back": float(t[i_peak + after[0]]) if after.size else None}
+
+    def auto_fit_above_background(self, rise, Cf):
+        """``Auto`` with the model's zero at the background: the tip on the
+        maximum above the background, ``fit end`` where the trace falls back to
+        it (what lies below is left out), ``background end`` well before the
+        rise; Xc as the distance the front covers while the stress falls back
+        and Gc as the value whose peak strength is the height; then the fit,
+        which also moves the tip by up to the time the stress takes to fall
+        back.  Tries the other side of the fault when sigma_xx or sigma_yy
+        are ticked."""
+        t = self._time()
+        dt = float(np.median(np.diff(t)))
+        tip = rise["t_peak"]
+        fall = (rise["t_back"] - tip) if rise["t_back"] is not None else max(tip - rise["t_rise"], 20 * dt)
+        fall = max(fall, 5 * dt)
+        end = min(tip + fall, float(t[-1]))
+        left = max(tip - max(6 * fall, 3 * (tip - rise["t_rise"]), 1e-4), float(t[0]) + 0.1 * (tip - float(t[0])))
+        self.x_base = None                                    # the background window: record start .. left line
+        self.set_lines([left, tip, end])
+        Xc = max(Cf * fall, 1e-6)
+        Gc = cohesive_gamma(rise["height"], Xc, Cf, self.C_s, self.C_d, self.nu, self.E)
+        self.Xc.set(float(Xc))
+        self.Gc.set(float(Gc) if np.isfinite(Gc) and Gc > 0 else 1.0)
+        self.axs[0].set_xlim(max(left - 0.3 * (end - left), float(t[0])), min(end + (end - left), float(t[-1])))
+        self.update_plot()
+        print(f"Auto: Cf={Cf:.0f} m/s, peak at {tip:.6f} s, {rise['height'] / 1e6:.3f} MPa above the background, back "
+              f"to it after {fall * 1e6:.0f} us; start Xc={self.Xc.get():.3g} m, Gc={self.Gc.get():.3g} J/m^2")
+        start = (self.Gc.get(), self.Xc.get(), self.current_line_positions())
+        result = self.fit_parameters(tip_range=fall)
+        if result is not None and set(self.fit_components()) & {"xx", "yy"}:
+            first = (result, self.y.get(), self.Gc.get(), self.Xc.get(), self.current_line_positions())
+            self.y.set(-first[1]), self.Gc.set(start[0]), self.Xc.set(start[1]), self.set_lines(start[2])
+            other = self.fit_parameters(tip_range=fall)
+            if other is None or not other.fun < first[0].fun:
+                self.y.set(first[1]), self.Gc.set(first[2]), self.Xc.set(first[3]), self.set_lines(first[4])
+                self.update_plot()
+                result = first[0]
+            else:
+                result = other
+        return result
+
     def model_speed(self, speed) -> tuple:
         """``(Cf, note)``: a measured rupture speed moved, when needed, to where a
         steady model exists (``CF_LIMIT`` inside the nearer range), with a note
@@ -1208,6 +1389,15 @@ class CZMFitterView(EventView):
             self.result_var.set(self.result_text())
             return None
         t = self._time()
+        rise = self.rise_above_background(self.sensor_channels()["xy"]) if self.to_background() else None
+        if self.to_background() and (rise is None or rise["height"] < 4 * rise["scatter"] or rise["height"] <= 0):
+            what = ("the record is too short" if rise is None else
+                    f"its maximum before the drop stands {rise['height'] / 1e6:.3f} MPa above the background, whose "
+                    f"scatter is {rise['scatter'] / 1e6:.3f} MPa")
+            self.auto_note = f"Auto: nothing above the background on {name} ({what}); nothing changed"
+            print(self.auto_note)
+            self.result_var.set(self.result_text())
+            return None
         speed = self.estimate_rupture_speed()
         Cf, why = self.model_speed(speed if speed else self.Cf.get())
         if not speed:
@@ -1215,6 +1405,8 @@ class CZMFitterView(EventView):
         else:
             self.auto_note = f"Auto: the fronts give {speed:.0f} m/s" + (f"; {why}" if why else "")
         self.Cf.set(float(Cf))
+        if rise is not None:
+            return self.auto_fit_above_background(rise, Cf)
         tip, end = found["t_peak"], found["t_end"]
         if end - tip < 5 * float(np.median(np.diff(t))):          # no measurable drop time: 0.1 ms
             end = min(tip + 1e-4, float(t[-1]))
@@ -1272,6 +1464,7 @@ class CZMFitterView(EventView):
             context["sensor"] = self.selected_sensor()
         if self.stress_mode:
             context["x_base"] = self.baseline_window(self._time(), self.current_line_positions())[0]
+            context["reference"] = self.reference_var.get()
         if self.stress_mode and self.fit_components():
             context["fit_components"] = self.fit_components()
         regime = rupture_regime(self.Cf.get(), self.C_s, self.C_d)

@@ -517,8 +517,8 @@ def test_rosette_components_are_fitted_together(app_with_strain):
         v.save_parameters()
         saved = event["czm_parms"]
         assert set(saved) == EXPECTED_KEYS | {"channel", "sensor", "unit", "E", "nu", "C_s", "C_d", "tau_p",
-                                              "fit_components", "x_base", "model"}
-        assert saved["model"] == "sub-Rayleigh"
+                                              "fit_components", "x_base", "model", "reference"}
+        assert saved["model"] == "sub-Rayleigh" and saved["reference"] == "fit end"
         assert saved["sensor"] == "rosette_1" and saved["channel"] == "rosette_1_sigma_xy"
         assert saved["unit"] == "MPa" and saved["strain_gauge"] == 2
         assert saved["fit_components"] == ["xy", "xx"]
@@ -942,6 +942,113 @@ def test_auto_takes_the_drop_not_the_rise_before_it(app_with_strain):
         assert v.auto_fit() is not None
         left, tip, end = positions(v)
         assert -2e-4 < tip <= 5e-5 and tip < end
+    finally:
+        v.on_close()
+
+
+# ---------------------------------------------------------------- the model's zero at the background
+def rise_and_unload_record(app, event, default=None):
+    """A stress record as an experiment whose fault unloads as a whole gives:
+    the cohesive-zone model itself above a 2 MPa background (``FAST``, a
+    supershear front at 2000 m/s passing the middle gauge at the event time),
+    and from 0.1 ms after the tip a 1 MPa drop the model knows nothing about."""
+    medium = supershear_record(app, event, speed=2000.0)
+    record = event["waveform"]["elsys"]
+    t = np.asarray(record["time"]) - event["event_time"]
+    for i, x in enumerate((100.0, 200.0, 300.0)):
+        delay = (x - 200.0) * 1e-3 / 2000.0
+        record["data"][i] -= 1.0 * 0.5 * (1 + np.tanh((t - delay - 1.5e-4) / 3e-5))
+    if default is not None:
+        app.data_manager.data["analysis"]["czm"] = {"reference": default}
+    return medium
+
+
+def test_model_zero_at_the_background(app_with_strain):
+    from labquake_explorer.ui.views.czm_fitter_view import BACKGROUND_HINT, STRESS_HINT
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    rise_and_unload_record(app_with_strain, event, default="background")
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.reference_var.get() == "background" and v.to_background()     # the experiment's default
+        assert v.hint_var.get() == BACKGROUND_HINT
+        v.gauge_combobox.set("shear_2")
+        v.Cf.set(2000.0), v.Gc.set(FAST["Gc"]), v.Xc.set(FAST["Xc"])
+        v.set_lines([-4e-4, 0.0, 5e-5])                                      # fit end where the trace is back at the background
+        v.update_plot()
+        t = v._time()
+        # the fit window runs from background end to fit end; the model is referred to the background, never shifted:
+        window = (t >= -4e-4) & (t <= 5e-5)
+        assert np.array_equal(v.fit_mask(t, positions(v)), window)
+        measured, model = drawn(v.axs[0], "sigma_xy"), drawn(v.axs[0], "CZM")
+        np.testing.assert_allclose(measured[window], model, atol=2e-3)        # MPa: the model lies on the rise
+        whole = next(l.get_ydata() for l in v.axs[0].get_lines() if l.get_linestyle() == "--" and l.get_color() == "0.35"
+                     and l.get_ydata().size == measured.size)
+        assert abs(np.mean(whole[t < -4e-4])) < 1e-9 and abs(np.mean(measured[t < -4e-4])) < 1e-9   # both zero there
+        late = t > 4e-4                                                       # after the unloading, which is not the model's
+        assert (measured[late] - whole[late]).mean() == pytest.approx(-1.0, abs=0.01)
+        assert "fit window 450 us" in v.result_var.get() and "peak above the background" in v.result_var.get()
+        # the panel shows what is fitted, not the drop below the background
+        low, high = v.axs[0].get_ylim()
+        span = max(measured[window].max(), model.max()) - min(measured[window].min(), model.min())
+        assert high == pytest.approx(max(measured[window].max(), model.max()) + 0.5 * span)
+        assert low == pytest.approx(min(measured[window].min(), model.min()) - span)
+        # the red band starts at background end in this mode
+        assert v.build_fit_objective()([FAST["Gc"], FAST["Xc"]]) / v.build_fit_objective().n_values < 5
+        v.save_parameters()
+        assert event["czm_parms"]["reference"] == "background"
+        # the other zero on the same lines: the model is shifted onto the drop instead, and the window starts at the tip
+        v.reference_var.set("fit end")
+        v.update_plot()
+        assert v.hint_var.get() == STRESS_HINT and np.array_equal(v.fit_mask(t, positions(v)), (t >= 0.0) & (t <= 5e-5))
+        assert "fit window 50 us" in v.result_var.get() and "drop over the window" in v.result_var.get()
+    finally:
+        v.on_close()
+    again = CZMFitterView(app_with_strain, 0, 2)                             # saved with the event
+    try:
+        assert again.reference_var.get() == "background"
+    finally:
+        again.on_close()
+
+
+def test_auto_above_the_background(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    rise_and_unload_record(app_with_strain, event, default="background")
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        v.gauge_combobox.set("shear_2")
+        v.update_plot()
+        rise = v.rise_above_background(v.sensor_channels()["xy"])
+        assert abs(rise["t_peak"]) < 2e-5 and rise["height"] > 1e6 and rise["t_rise"] < rise["t_peak"] < rise["t_back"]
+        result = v.auto_fit()
+        assert result is not None and result.success
+        left, tip, end = positions(v)
+        assert left < tip < end and abs(tip) < 2e-5                          # the tip on the maximum above the background
+        assert end < 2.5e-4                                                  # fit end where the trace is back: the 1 MPa drop stays out
+        assert v.Cf.get() == pytest.approx(2000.0, rel=0.03)
+        assert 0.5 * FAST["Gc"] < v.Gc.get() < 2 * FAST["Gc"] and 0.5 * FAST["Xc"] < v.Xc.get() < 2 * FAST["Xc"]
+        assert "peak above the background" in v.result_var.get() and "supershear model" in v.result_var.get()
+        # a gauge whose trace never rises above its background: nothing for this zero to fit
+        record = event["waveform"]["elsys"]
+        t = np.asarray(record["time"]) - event["event_time"]
+        record["data"][2] = 2.0 - 0.5 * (1 + np.tanh((t - 5e-4) / 3e-5))      # shear_3: a plain drop, no rise before it
+        v.gauge_combobox.set("shear_3")
+        v.update_plot()
+        before = positions(v)
+        assert v.auto_fit() is None and positions(v) == before
+        assert "nothing above the background on shear_3" in v.result_var.get()
+    finally:
+        v.on_close()
+
+
+def test_reference_defaults_to_fit_end(app_with_strain):
+    event = app_with_strain.data_manager.get_data("runs/[0]/events/[2]")
+    add_stress_record(app_with_strain, event)                                # no analysis['czm'] in the experiment
+    v = CZMFitterView(app_with_strain, 0, 2)
+    try:
+        assert v.reference_var.get() == "fit end" and not v.to_background()
+        assert list(v.reference_box["values"]) == ["fit end", "background"]
+        v.set_event(1)                                                       # a record in volts has no such choice
+        assert not v.to_background() and not v.fit_frame.winfo_manager()
     finally:
         v.on_close()
 
