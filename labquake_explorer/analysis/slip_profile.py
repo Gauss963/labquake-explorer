@@ -1019,6 +1019,7 @@ def _hinge(x, t) -> tuple:
     at each sensor, and in each interval between sensors the two free lines when they
     meet inside it.  Returns ``(x0, t0, s_minus, s_plus)``."""
     u = np.unique(x)
+    at_sensor = 1e-9 * float(u[-1] - u[0])                   # an apex this close to a sensor is the apex at it
     best = None
     for x0 in u[1:-1]:
         A = np.column_stack([np.ones_like(x), np.minimum(x - x0, 0.0), np.maximum(x - x0, 0.0)])
@@ -1033,7 +1034,7 @@ def _hinge(x, t) -> tuple:
         if s_left == s_right:
             continue
         x0 = (i_right - i_left) / (s_left - s_right)
-        if not u[k] < x0 < u[k + 1]:
+        if not u[k] + at_sensor < x0 < u[k + 1] - at_sensor:    # at a sensor to rounding: tried above, exactly
             continue
         ss = float(np.sum((s_left * x[left] + i_left - t[left]) ** 2)
                    + np.sum((s_right * x[right] + i_right - t[right]) ** 2))
