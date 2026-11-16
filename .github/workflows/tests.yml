@@ -23,8 +23,10 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # No macOS: on the hosted macOS runner the tests that drive real Tk windows fail
+      # (its screen is too small for them); they pass on a Mac with a normal display.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python: ["3.12"]
         include:
           - os: ubuntu-latest
