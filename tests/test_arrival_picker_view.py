@@ -525,18 +525,20 @@ def test_a_record_on_an_offset_with_unplaced_channels_and_no_trigger(app, tmp_pa
 # ------------------------------------------------------------ rupture front
 def test_bilateral_front_is_kept_per_record_through_hdf5(app_with_strain, tmp_path, app_from_file):
     event = app_with_strain.data_manager.get_data(EVENT)
-    time, t_trig = add_pzt_record(event, XS, x0=250.0)            # onsets leave x = 250 mm both ways
+    # onsets leave x = 230 mm both ways: off the middle of the sensors, so that the one line
+    # through all of them has a slope (through a symmetric front it is level to rounding)
+    time, t_trig = add_pzt_record(event, XS, x0=230.0)
     view = Picker(app_with_strain, 0, 1)
     _select_record(view, "waveform/elsys")
     for i, x in enumerate(XS):
-        view.set_pick(i, int(np.argmin(np.abs(time - t_trig - abs(x - 250.0) * 1e-3 / 1500.0))), refit=False)
+        view.set_pick(i, int(np.argmin(np.abs(time - t_trig - abs(x - 230.0) * 1e-3 / 1500.0))), refit=False)
     view.update_fitted_line()
     # one line averages the two directions into a meaningless speed
     assert view.front_fit.mode == "unilateral" and len(view.front_fit.segments) == 1
     view.front_mode_var.set("bilateral")
     view.update_fitted_line()
     fit = view.front_fit
-    assert fit.valid and len(fit.segments) == 2 and fit.split_x_mm == pytest.approx(250.0, abs=10.0)
+    assert fit.valid and len(fit.segments) == 2 and fit.split_x_mm == pytest.approx(230.0, abs=10.0)
     speeds = sorted(seg.velocity_m_s for seg in fit.segments)
     assert speeds[0] == pytest.approx(-1500.0, rel=0.05) and speeds[1] == pytest.approx(1500.0, rel=0.05)
     assert "fronts start at x = " in view.front_text_var.get() and "towards -x" in view.front_text_var.get()
