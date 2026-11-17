@@ -67,6 +67,21 @@ Save stores ``event['slip_analysis']``: the record of
 ``use_auto``: while the front's sensor choice has not been edited it follows
 the pick flags, leaving out the sensors whose ``t_i`` is doubtful: pick at
 the search edge, weak or no rate peak).
+
+The Auto windows box places every sensor's two windows from its own record
+(:mod:`labquake_explorer.analysis.fit_windows`): the after window where the
+after line levels off, else where the slip rate has settled to a factor of the
+background (pre-event) rate; the before window ahead of the onset.  A sensor
+whose creep is close to its coseismic rate is flagged for a check.  "Apply to
+this event" places them for the event shown; "Apply and save to the events"
+does it for the events typed (``1-5, 8``; blank: the run's list, else every
+event), saving each.  Both keep the manual windows (moved by hand, or of an
+event saved without auto windows) as the box's choice says: all of them, the
+manual events only, or none.  The sensors to check are listed; a click opens one.
+A typed list is stored as the run's ``slip_analysis.events``.  The record then
+holds ``auto_windows``: the settings, which sensors' windows the auto windows
+placed (a window moved by hand afterwards is manual, no longer one), how, and their
+flags.
 """
 from __future__ import annotations
 
@@ -81,6 +96,7 @@ import numpy as np
 from matplotlib.backend_bases import MouseButton
 
 from labquake_explorer.analysis import coseismic_slip as cs
+from labquake_explorer.analysis import fit_windows as fw
 from labquake_explorer.analysis import slip_profile as sprof
 from labquake_explorer.data.channels import channel_names, is_channel_array
 from labquake_explorer.data.picks import extraction_record
@@ -89,7 +105,7 @@ from labquake_explorer.data.settings import get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
-from labquake_explorer.ui.views.scroll_panel import ScrollPanel
+from labquake_explorer.ui.views.scroll_panel import WHEEL_EVENTS, ScrollPanel, wheel_units
 
 LIVE_DELAY_MS = 400                    # recompute this long after the last keystroke
 HANDLE_PICK_PX = 6                     # a press this close (pixels) to t_i or a window edge grabs it
@@ -122,6 +138,20 @@ TABLE_COLUMNS = (("sensor", 70), ("x (mm)", 60), ("t_i from", 90), ("t_i - event
                  ("slip (um)", 75), ("sigma (um)", 75), ("flags", 260))
 HANDLE_NAMES = ("t_i", "before_start", "before_end", "after_start", "after_end")
 TEXT_WRAP_PX = 250                     # the fit texts wrap at this width
+AUTO_KEY = "auto_windows"              # in a slip_analysis record: how the auto windows placed them
+AUTO_VERSION = 1
+RUN_KEY = "slip_analysis"              # run level: {"version", "events"}, the events chosen for the analysis
+# what the auto windows may replace: every manual window is kept (the default), only the manual
+# events (saved without auto windows) are kept, or nothing is kept
+KEEP_MANUAL = "manual"
+KEEP_MANUAL_EVENTS = "manual_events"
+KEEP_NONE = "none"
+KEEP_MODES = (KEEP_MANUAL, KEEP_MANUAL_EVENTS, KEEP_NONE)
+KEEP_LABELS = {KEEP_MANUAL: "keep all manual windows", KEEP_MANUAL_EVENTS: "keep manual events only",
+               KEEP_NONE: "overwrite everything"}
+RUN_VERSION = 1
+AUTO_CHECK_WIDTH_PX = 270              # the list of sensors to check: shown this wide ...
+AUTO_WHY_WIDTH_PX = 720                # ... its "why" column this wide, scrolled sideways
 SIDES = (("minus", "-x"), ("plus", "+x"))   # the rupture edges, in the order of ProfileFit.tips_mm
 NOT_RESOLVED = "not resolved by the sensors:"
 # profile parameters as shown: label, unit ("u" is the slip unit), significant digits;
@@ -178,6 +208,11 @@ def _value_text(value) -> str:
         return str(np.asarray(value, dtype=float).ravel().tolist())
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _text_value(value) -> str:
+    """A saved text, also when an HDF5 round trip made it bytes."""
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def doubtful_t_i(sensor: cs.SensorSlip) -> bool:
@@ -430,6 +465,9 @@ class SlipDistributionView(EventView):
         self.profile_curve = None
         self._profile_xlim = (0.0, 1.0)
         self._fault_auto = None        # the fault panels' limits as the last redraw set them
+        self.auto_info: list = []      # per sensor: the AutoWindows that placed its windows, or None
+        self.manual: list = []         # per sensor: its windows are manual (saved so, or moved here)
+        self.auto_settings: Optional[dict] = None   # the settings the auto windows were placed with
         super().__init__(app, run_idx, event_idx)
 
     # ------------------------------------------------------------------ ui
@@ -447,6 +485,12 @@ class SlipDistributionView(EventView):
         frame = ttk.LabelFrame(left, text="Event")
         frame.pack(fill="x", pady=(0, 4))
         self.build_event_selector(frame, row=0, column=0)
+        arrows = ttk.Frame(frame)                # previous / next event, as for the sensors
+        arrows.grid(row=0, column=2, padx=(0, 4), sticky="w")
+        self.prev_event_button = ttk.Button(arrows, text="◀", width=2, command=lambda: self.step_event(-1))
+        self.prev_event_button.pack(side="left")
+        self.next_event_button = ttk.Button(arrows, text="▶", width=2, command=lambda: self.step_event(+1))
+        self.next_event_button.pack(side="left")
         ttk.Label(frame, text="Field:").grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self.field_combobox = ttk.Combobox(frame, width=10, state="readonly")
         self.field_combobox.grid(row=1, column=1, padx=4, pady=2, sticky="w")
@@ -609,8 +653,11 @@ class SlipDistributionView(EventView):
             fill="x", pady=2)
 
         self._build_fit_frames(fits)
+        self._build_auto_frame(fits)             # auto windows (analysis/fit_windows.py)
         self.left_panel.bind_children()
         self.fits_panel.bind_children()
+        for sequence in WHEEL_EVENTS:            # the wheel over the list of sensors to check scrolls the list
+            self.auto_check_table.bind(sequence, self.on_auto_check_wheel)
         self.make_figure(figsize=(8.5, 6), figure_kwargs={"layout": "constrained"},
                          row=0, column=2, padx=5, pady=5, sticky="nsew")
         gs = self.figure.add_gridspec(2, 2, width_ratios=(1.35, 1.0))
@@ -630,12 +677,26 @@ class SlipDistributionView(EventView):
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("button_release_event", self.on_release)
 
-        self.table = ttk.Treeview(self, columns=[c for c, _ in TABLE_COLUMNS], show="headings", height=8,
+        # the table scrolls both ways: the rows below its height, and flags longer than their column
+        table_box = ttk.Frame(self)
+        table_box.grid(row=2, column=2, padx=5, pady=(0, 5), sticky="ew")
+        self.table = ttk.Treeview(table_box, columns=[c for c, _ in TABLE_COLUMNS], show="headings", height=8,
                                   selectmode="browse")
         for name, width in TABLE_COLUMNS:
             self.table.heading(name, text=name)
             self.table.column(name, width=width, anchor="e" if name not in ("sensor", "t_i from", "flags") else "w")
-        self.table.grid(row=2, column=2, padx=5, pady=(0, 5), sticky="ew")
+            self.table.column(name, minwidth=width)      # scroll sideways rather than squeeze a column
+        self.table_yscroll = ttk.Scrollbar(table_box, orient="vertical", command=self.table.yview)
+        self.table_xscroll = ttk.Scrollbar(table_box, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=self.table_yscroll.set, xscrollcommand=self.table_xscroll.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        self.table_yscroll.grid(row=0, column=1, sticky="ns")
+        self.table_xscroll.grid(row=1, column=0, sticky="ew")
+        table_box.grid_columnconfigure(0, weight=1)
+        table_box.update_idletasks()             # its natural size, kept while the flags column widens
+        table_box.configure(width=self.table.winfo_reqwidth() + self.table_yscroll.winfo_reqwidth(),
+                            height=self.table.winfo_reqheight() + self.table_xscroll.winfo_reqheight())
+        table_box.grid_propagate(False)
         self.table.bind("<ButtonPress-1>", lambda e: self.flush_pending(), add="+")    # before the class binding
         self.table.bind("<<TreeviewSelect>>", self.on_table_select)
 
@@ -724,6 +785,69 @@ class SlipDistributionView(EventView):
         ttk.Label(frame, textvariable=self.front_text_var, wraplength=TEXT_WRAP_PX, justify="left").grid(
             row=3, column=0, columnspan=2, padx=4, pady=2, sticky="w")
 
+    def _build_auto_frame(self, master) -> None:
+        """The Auto windows box: its settings, the two buttons and the list of
+        sensors to check (see :meth:`apply_auto_windows`)."""
+        frame = ttk.LabelFrame(master, text="Auto windows")
+        frame.pack(fill="x", pady=4)
+        ttk.Label(frame, text="every sensor's windows placed from its own\nrecord (analysis/fit_windows.py)",
+                  foreground="#606060", justify="left").grid(
+            row=0, column=0, columnspan=4, padx=4, sticky="w")
+        self.auto_width_var = tk.StringVar(master=self, value=_text(fw.DEFAULT_WIDTH_S))
+        self.auto_plateau_var = tk.StringVar(master=self, value=_text(fw.DEFAULT_PLATEAU_TOL_UM))
+        self.auto_factor_var = tk.StringVar(master=self, value=_text(fw.DEFAULT_BACKGROUND_FACTOR))
+        self.auto_creep_var = tk.StringVar(master=self, value=_text(fw.DEFAULT_CREEP_RATIO * 100))
+        self.auto_events_var = tk.StringVar(master=self, value="")
+        self.auto_keep_var = tk.StringVar(master=self, value=KEEP_LABELS[KEEP_MANUAL])
+        self._entry(frame, "Width (s):", self.auto_width_var, 1, self.update_status, width=6, name="auto width")
+        self._entry_at(frame, "Plateau (um):", self.auto_plateau_var, 1, 2, self.update_status,
+                       name="auto plateau")
+        self._entry(frame, "Background x:", self.auto_factor_var, 2, self.update_status, width=6,
+                    name="auto background factor")
+        self._entry_at(frame, "Creep flag (%):", self.auto_creep_var, 2, 2, self.update_status,
+                       name="auto creep flag")
+        ttk.Button(frame, text="Apply to this event", command=self.apply_auto_windows).grid(
+            row=3, column=0, columnspan=4, padx=4, pady=2, sticky="w")
+        ttk.Label(frame, text="Events:").grid(row=4, column=0, padx=4, pady=2, sticky="e")
+        self._entry_only(frame, self.auto_events_var, 4, 1, "auto events", self.update_status, width=14)
+        self.entries["auto events"].grid(columnspan=3)
+        ttk.Label(frame, text="e.g. 1-5, 8; blank: the run's list, else all", foreground="#606060").grid(
+            row=5, column=0, columnspan=4, padx=4, sticky="w")
+        self.auto_keep_combobox = ttk.Combobox(frame, textvariable=self.auto_keep_var, state="readonly", width=30,
+                                               values=[KEEP_LABELS[m] for m in KEEP_MODES])
+        self.auto_keep_combobox.grid(row=6, column=0, columnspan=4, padx=4, pady=2, sticky="w")
+        ttk.Button(frame, text="Apply and save to the events", command=self.apply_auto_to_events).grid(
+            row=7, column=0, columnspan=4, padx=4, pady=2, sticky="w")
+        ttk.Label(frame, text="to check (click to open):", foreground="#606060").grid(
+            row=8, column=0, columnspan=4, padx=4, sticky="w")
+        # the list keeps the column's width and scrolls sideways to show the whole "why"
+        box = ttk.Frame(frame)
+        box.grid(row=9, column=0, columnspan=4, padx=4, pady=2, sticky="w")
+        self.auto_check_table = ttk.Treeview(box, columns=("event", "sensor", "why"), show="headings", height=5,
+                                             selectmode="browse")
+        try:                                     # pixel widths follow the font on a scaled (high-DPI) display
+            scale = max(1.0, float(self.tk.call("tk", "scaling")) * 72.0 / 96.0)
+        except (tk.TclError, ValueError):
+            scale = 1.0
+        for name, width in (("event", 45), ("sensor", 60), ("why", AUTO_WHY_WIDTH_PX)):
+            self.auto_check_table.heading(name, text=name)
+            self.auto_check_table.column(name, width=int(width * scale), minwidth=int(width * scale), anchor="w",
+                                         stretch=False)
+        self.auto_check_xscroll = ttk.Scrollbar(box, orient="horizontal", command=self.auto_check_table.xview)
+        self.auto_check_yscroll = ttk.Scrollbar(box, orient="vertical", command=self.auto_check_table.yview)
+        self.auto_check_table.configure(xscrollcommand=self.auto_check_xscroll.set,
+                                        yscrollcommand=self.auto_check_yscroll.set)
+        self.auto_check_table.grid(row=0, column=0, sticky="nsew")
+        self.auto_check_yscroll.grid(row=0, column=1, sticky="ns")
+        self.auto_check_xscroll.grid(row=1, column=0, sticky="ew")
+        box.grid_rowconfigure(0, weight=1)
+        box.grid_columnconfigure(0, weight=1)
+        box.update_idletasks()
+        box.configure(width=int(AUTO_CHECK_WIDTH_PX * scale) + self.auto_check_yscroll.winfo_reqwidth(),
+                      height=self.auto_check_table.winfo_reqheight() + self.auto_check_xscroll.winfo_reqheight())
+        box.grid_propagate(False)
+        self.auto_check_table.bind("<<TreeviewSelect>>", self.on_auto_check_selected)
+
     def _use_menu(self, master, row) -> tk.Menubutton:
         mb = tk.Menubutton(master, text="Sensors used", relief="raised")
         mb.grid(row=row, column=0, columnspan=2, padx=4, pady=2, sticky="w")
@@ -798,6 +922,25 @@ class SlipDistributionView(EventView):
                                                    f"staying on event {self.event_idx}.", parent=self)
             return
         super().set_event(event_idx)
+
+    def step_event(self, delta: int) -> None:
+        """The previous (``delta`` < 0) or next event with a slip array: among the
+        run's chosen events (``slip_analysis.events``) when it has a list, else
+        among all; nothing at either end."""
+        n = self.n_events()
+        chosen = self.run_events()
+        order = sorted(e for e in chosen if 0 <= e < n) if chosen is not None else list(range(n))
+        candidates = [e for e in order if (e > self.event_idx if delta > 0 else e < self.event_idx)]
+        if delta < 0:
+            candidates.reverse()
+        for k in candidates:
+            try:
+                event = self.data_manager.get_data(f"{self.run_path}/events/[{k}]")
+            except (KeyError, IndexError, TypeError):
+                continue
+            if slip_fields(event):
+                self.set_event(k)
+                return
 
     def on_event_loaded(self) -> None:
         fields = slip_fields(self.event, self.get_run())
@@ -882,6 +1025,7 @@ class SlipDistributionView(EventView):
             self.fit_before = [before] * n
             self.fit_after = [after] * n
             self.saved = None
+        self.restore_auto(record if inputs is not None else None, n)
         self.sensor_combobox.config(values=[self.sensor_label(i) for i in range(n)])
         self.sensor = min(max(self.sensor, 0), n - 1)
         self.restore_fit_settings(record if inputs is not None else None)
@@ -1250,11 +1394,22 @@ class SlipDistributionView(EventView):
                 self.table.insert("", "end", iid=str(i), values=(
                     s.channel, _text(s.x_mm), METHOD_LABELS[s.method], f"{s.t_shift_s * 1e3:.2f}",
                     f"{s.coseismic_slip:.3f}" if math.isfinite(s.coseismic_slip) else "n/a",
-                    f"{s.noise:.3f}" if math.isfinite(s.noise) else "n/a", "; ".join(s.flags)))
+                    f"{s.noise:.3f}" if math.isfinite(s.noise) else "n/a", "; ".join(self.sensor_flags(i))))
             if self.table.exists(str(self.sensor)):
                 self.table.selection_set(str(self.sensor))
         finally:
             self._syncing = False
+        self.fit_flags_column()
+
+    def fit_flags_column(self) -> None:
+        """Widen the flags column to its longest text (the table then scrolls sideways)."""
+        texts = [str(self.table.set(iid, "flags")) for iid in self.table.get_children()]
+        font = getattr(self, "_text_font", None)
+        if font is None or not texts:
+            return
+        base = dict(TABLE_COLUMNS)["flags"]
+        width = max(base, max(font.measure(t) for t in texts) + 16)
+        self.table.column("flags", width=width, minwidth=width)
 
     # --------------------------------------------------------------- edits
     def on_method_selected(self, event=None) -> None:
@@ -1381,6 +1536,10 @@ class SlipDistributionView(EventView):
         for i in targets:
             self.fit_before[i] = tuple(float(v) for v in before)
             self.fit_after[i] = tuple(float(v) for v in after)
+            if i < len(self.auto_info):
+                self.auto_info[i] = None         # manual now, not placed by the auto windows
+            if i < len(self.manual):
+                self.manual[i] = True
         self.recompute()
 
     def on_same_windows_toggled(self) -> None:
@@ -2381,6 +2540,355 @@ class SlipDistributionView(EventView):
         else:
             self.set_windows(state["before"], state["after"])
 
+    # --------------------------------------------------------- auto windows
+    # The windows placed from each sensor's own record by analysis/fit_windows.py; the
+    # slip is still measured by analyze_slip as for manual windows.
+    def sensor_flags(self, i: int) -> list:
+        """The analysis flags of sensor ``i`` and those of its auto windows."""
+        flags = list(self.result.sensors[i].flags) if self.result is not None else []
+        return flags + self.auto_flags(i)
+
+    def auto_flags(self, i: int) -> list:
+        """The flags of sensor ``i``'s auto windows, and ``FLAG_NEGATIVE`` when the
+        slip they give is below zero; empty for manual windows."""
+        info = self.auto_info[i] if i < len(self.auto_info) else None
+        if info is None:
+            return []
+        flags = [f for f in info.flags if f != fw.FLAG_NEGATIVE]
+        if self.result is not None and i < len(self.result.sensors) and self.result.sensors[i].coseismic_slip < 0:
+            flags.append(fw.FLAG_NEGATIVE)
+        return flags
+
+    def read_auto_settings(self) -> dict:
+        """The Auto windows settings typed, as keyword arguments of
+        :func:`fit_windows.auto_windows` (ValueError when unusable)."""
+        width = _parse(self.auto_width_var.get(), "auto window width (s)")
+        plateau = _parse(self.auto_plateau_var.get(), "auto plateau tolerance (um)")
+        factor = _parse(self.auto_factor_var.get(), "auto background factor")
+        creep = _parse(self.auto_creep_var.get(), "auto creep flag (%)") / 100.0
+        if width <= 0:
+            raise ValueError("the auto window width must be > 0")
+        if plateau < 0:
+            raise ValueError("the auto plateau tolerance must be >= 0")
+        if factor <= 0:
+            raise ValueError("the auto background factor must be > 0")
+        if creep <= 0:
+            raise ValueError("the auto creep flag must be > 0 %")
+        return {"width_s": width, "plateau_tol_um": plateau, "background_factor": factor, "creep_ratio": creep}
+
+    def neighbour_events(self) -> tuple:
+        """The previous and the next event of the run, relative to this event's
+        time (NaN when there is none)."""
+        times = []
+        for event in self.get_run().get("events", []):
+            try:
+                times.append(float(event["event_time"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        times = np.asarray(times, dtype=float)
+        earlier = times[times < self.t_event - 1e-9]
+        later = times[times > self.t_event + 1e-9]
+        return (float(earlier.max() - self.t_event) if earlier.size else float("nan"),
+                float(later.min() - self.t_event) if later.size else float("nan"))
+
+    def keep_mode(self) -> str:
+        """What the auto windows may replace: one of ``KEEP_MODES``."""
+        label = self.auto_keep_var.get()
+        return next((m for m in KEEP_MODES if KEEP_LABELS[m] == label), KEEP_MANUAL)
+
+    def saved_manual(self) -> bool:
+        """The event shown is a manual event: saved without auto windows, every window manual."""
+        return isinstance(self.saved, dict) and AUTO_KEY not in self.saved
+
+    def kept_sensors(self, mode: Optional[str] = None) -> list:
+        """Per sensor: its windows are kept under ``mode`` (the box's choice by
+        default): every manual one (``KEEP_MANUAL``), those of a manual event
+        (``KEEP_MANUAL_EVENTS``), none (``KEEP_NONE``)."""
+        mode = self.keep_mode() if mode is None else mode
+        n = len(self.channels)
+        if mode == KEEP_NONE:
+            return [False] * n
+        if self.saved_manual():
+            return [True] * n
+        if mode == KEEP_MANUAL_EVENTS:
+            return [False] * n
+        return [bool(v) for v in (list(self.manual) + [False] * n)[:n]]
+
+    def apply_auto_windows(self, settings: Optional[dict] = None, mode: Optional[str] = None) -> bool:
+        """Place the sensors' windows from their records and recompute; False (and
+        the reason in the status line) when it cannot.  The windows that ``mode``
+        keeps (the box's choice by default; see :meth:`kept_sensors`) stay as
+        they are, and so does a window that cannot be placed.  The windows then
+        differ between sensors, so "same windows for all sensors" is cleared."""
+        self.flush_pending()
+        if self.result is None or self._stale:
+            self.status_var.set("auto windows: no result to place them from - fix the values first")
+            return False
+        if self.t_i_method() == cs.METHOD_BURST:
+            self.status_var.set("auto windows: the Burst tab places its own level windows")
+            return False
+        kept = self.kept_sensors(mode)
+        if kept and all(kept):
+            self.status_var.set("auto windows: every window of this event is manual and is kept "
+                                f"(choose '{KEEP_LABELS[KEEP_NONE]}' to replace them)")
+            return False
+        try:
+            settings = self.read_auto_settings() if settings is None else settings
+            prev_s, next_s = self.neighbour_events()
+            found = fw.auto_windows(self.time, self.data, self.t_event, [s.t_shift_s for s in self.result.sensors],
+                                    self.result.rate, prev_event_s=prev_s, next_event_s=next_s, **settings)
+        except ValueError as e:
+            self.status_var.set(f"auto windows: {e}")
+            return False
+        n = len(found)
+        info = (list(self.auto_info) + [None] * n)[:n]
+        manual = (list(self.manual) + [False] * n)[:n]
+        for i, w in enumerate(found):
+            if kept[i]:
+                continue                          # manual and kept: its windows and state stay
+            if w.before is not None:
+                self.fit_before[i] = tuple(w.before)
+            if w.after is not None:
+                self.fit_after[i] = tuple(w.after)
+            info[i], manual[i] = w, False
+        self.auto_info, self.manual = info, manual
+        self.auto_settings = self.full_auto_settings(settings)
+        self.same_windows_var.set(False)
+        ok = self.recompute()
+        if ok and any(kept):
+            self.status_var.set(f"{self.status_var.get()} | auto windows: kept {sum(kept)} manual "
+                                "sensor(s)")
+        return ok
+
+    @staticmethod
+    def full_auto_settings(settings: dict) -> dict:
+        """Every setting of :func:`fit_windows.auto_windows`: those given, the defaults for the rest."""
+        out = {"width_s": fw.DEFAULT_WIDTH_S, "min_start_s": fw.DEFAULT_MIN_START_S,
+               "max_start_s": fw.DEFAULT_MAX_START_S, "step_s": fw.DEFAULT_STEP_S,
+               "plateau_tol_um": fw.DEFAULT_PLATEAU_TOL_UM, "plateau_span_s": fw.DEFAULT_PLATEAU_SPAN_S,
+               "background_factor": fw.DEFAULT_BACKGROUND_FACTOR, "rate_smoothing_s": fw.DEFAULT_RATE_SMOOTHING_S,
+               "min_after_s": fw.DEFAULT_MIN_AFTER_S, "max_decay_s": fw.DEFAULT_MAX_DECAY_S,
+               "creep_ratio": fw.DEFAULT_CREEP_RATIO, "onset_fraction": fw.DEFAULT_ONSET_FRACTION,
+               "before_gap_s": fw.DEFAULT_BEFORE_GAP_S, "onset_search_s": fw.DEFAULT_ONSET_SEARCH_S,
+               "event_margin_s": fw.DEFAULT_EVENT_MARGIN_S}
+        out.update({k: float(v) for k, v in settings.items()})
+        return out
+
+    def auto_record(self) -> Optional[dict]:
+        """The ``auto_windows`` part of the record: None when no sensor's windows
+        are the ones the auto windows placed."""
+        n = len(self.channels)
+        info = (list(self.auto_info) + [None] * n)[:n]
+        if not any(w is not None for w in info):
+            return None
+        return {"version": AUTO_VERSION, "settings": dict(self.auto_settings or {}),
+                "applied": [w is not None for w in info],
+                "kind": [w.kind if w is not None else "" for w in info],
+                "flags": ["; ".join(self.auto_flags(i)) for i in range(n)],
+                "creep_ratio": [float(w.creep_ratio) if w is not None else float("nan") for w in info],
+                "background_rate_um_s": [float(w.background_rate) if w is not None else float("nan") for w in info]}
+
+    def restore_auto(self, record: Optional[dict], n: int) -> None:
+        """Which sensors' windows the auto windows placed, from a saved record;
+        the others of a saved record are manual."""
+        self.auto_info = [None] * n
+        self.auto_settings = None
+        self.manual = [isinstance(record, dict)] * n
+        auto = record.get(AUTO_KEY) if isinstance(record, dict) else None
+        if not isinstance(auto, dict):
+            return
+        try:
+            applied = [bool(v) for v in np.asarray(auto["applied"]).ravel()]
+            kinds = [_text_value(v) for v in np.asarray(auto["kind"], dtype=object).ravel()]
+            flags = [_text_value(v) for v in np.asarray(auto["flags"], dtype=object).ravel()]
+            ratio = [float(v) for v in np.asarray(auto.get("creep_ratio", [np.nan] * n), dtype=float).ravel()]
+            background = [float(v) for v in
+                          np.asarray(auto.get("background_rate_um_s", [np.nan] * n), dtype=float).ravel()]
+        except (KeyError, TypeError, ValueError):
+            return
+        if not len(applied) == len(kinds) == len(flags) == len(ratio) == len(background) == n:
+            return
+        settings = auto.get("settings")
+        self.auto_settings = {str(k): float(np.asarray(v).ravel()[0]) for k, v in settings.items()} \
+            if isinstance(settings, dict) else None
+        for i in range(n):
+            self.manual[i] = not applied[i]
+            if applied[i]:
+                self.auto_info[i] = fw.AutoWindows(self.fit_before[i], self.fit_after[i], kinds[i],
+                                                   background_rate=background[i], creep_ratio=ratio[i],
+                                                   flags=[f for f in flags[i].split("; ")
+                                                          if f and f != fw.FLAG_NEGATIVE])   # from the slip shown
+
+    def run_events(self) -> Optional[list]:
+        """The events chosen for the analysis (the run's ``slip_analysis.events``), or None."""
+        record = self.get_run().get(RUN_KEY)
+        if not isinstance(record, dict) or record.get("events") is None:
+            return None
+        try:
+            return [int(v) for v in np.asarray(record["events"]).ravel()]
+        except (TypeError, ValueError):
+            return None
+
+    def run_label(self) -> str:
+        """The run by its name (``run2``) and its place in the file (``runs/[1]``)."""
+        name = self.get_run().get("name")
+        name = _text_value(np.asarray(name).ravel()[0]) if name is not None and np.size(name) else ""
+        return f"{name} ({self.run_path})" if name else self.run_path
+
+    def auto_event_list(self) -> tuple:
+        """``(events, typed)``: the events typed in the Events entry (``1-5, 8``),
+        else the run's list, else every event; ValueError for a bad entry."""
+        n = self.n_events()
+        text = self.auto_events_var.get().strip()
+        if not text:
+            events = self.run_events()
+            return ([e for e in events if 0 <= e < n] if events is not None else list(range(n))), False
+        events = []
+        for part in text.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                if "-" in part[1:]:
+                    lo, hi = (int(v) for v in part.split("-", 1))
+                    events.extend(range(lo, hi + 1))
+                else:
+                    events.append(int(part))
+            except ValueError:
+                raise ValueError(f"events: {part!r} is not an event number or a range like 1-5") from None
+        bad = [e for e in events if not 0 <= e < n]
+        if bad:
+            raise ValueError(f"events: {bad[0]} is not an event of this run (0 to {n - 1})")
+        return sorted(set(events)), True
+
+    def apply_auto_to_events(self, confirm: bool = True) -> Optional[dict]:
+        """Apply the auto windows to the events listed and save each, keeping the
+        manual windows as the box's choice says (see :meth:`kept_sensors`).
+        Returns the events ``done``, ``kept`` (manual events left whole) and
+        ``failed``, the manual sensors kept (``kept_sensors``) and the sensors to
+        ``check`` (``(event, sensor, flags)``), also listed in the view; None when
+        nothing ran.  A typed list of events is stored as the run's list."""
+        self.flush_pending()
+        try:
+            settings = self.read_auto_settings()
+            events, typed = self.auto_event_list()
+        except ValueError as e:
+            self.status_var.set(f"auto windows: {e}")
+            return None
+        if self.t_i_method() == cs.METHOD_BURST:
+            self.status_var.set("auto windows: the Burst tab places its own level windows")
+            return None
+        mode = self.keep_mode()
+        manual_events, manual_sensors = self.manual_counts(events)
+        if mode == KEEP_MANUAL:
+            note = (f"Kept: {manual_events} manual event(s) and {manual_sensors} manual sensor(s) "
+                    "in events with auto windows.")
+        elif mode == KEEP_MANUAL_EVENTS:
+            note = (f"Kept: {manual_events} manual event(s).\nOverwritten: {manual_sensors} manual sensor(s) "
+                    "in events with auto windows.")
+        else:
+            note = (f"Overwritten: {manual_events} manual event(s) and {manual_sensors} manual sensor(s) "
+                    "in events with auto windows.")
+        if confirm and not messagebox.askokcancel(
+                "Auto windows", f"Place the windows automatically and save {len(events)} event(s) of "
+                                f"{self.run_label()}?\n{note}", parent=self):
+            return None
+        if typed:
+            self.data_manager.set_data(f"{self.run_path}/{RUN_KEY}", {"version": RUN_VERSION, "events": events}, True)
+            self.get_run()[RUN_KEY] = {"version": RUN_VERSION, "events": events}
+        start = self.event_idx
+        out = {"done": [], "kept": [], "kept_sensors": [], "failed": [], "check": []}
+        for k in events:
+            event = self.data_manager.get_data(f"{self.run_path}/events/[{k}]")
+            record = event.get(self.result_key) if isinstance(event, dict) else None
+            if not slip_fields(event):
+                out["failed"].append((k, "no slip channel array"))
+                continue
+            if mode != KEEP_NONE and isinstance(record, dict) and AUTO_KEY not in record:
+                out["kept"].append(k)
+                continue
+            try:
+                if k != self.event_idx:
+                    self.set_event(k)
+                kept = self.kept_sensors(mode)
+                ok = self.apply_auto_windows(settings, mode) and self.save()
+            except Exception as e:                        # one bad event does not stop the others
+                out["failed"].append((k, str(e)))
+                continue
+            if not ok:
+                out["failed"].append((k, self.status_var.get()))
+                continue
+            out["done"].append(k)
+            out["kept_sensors"].extend((k, i) for i, v in enumerate(kept) if v)
+            out["check"].extend((k, i, flags) for i in range(len(self.channels))
+                                if (flags := self.sensor_flags(i)))
+            self.status_var.set(f"auto windows: event {k} saved ({len(out['done'])} of {len(events)})")
+            self.update_idletasks()
+        if self.event_idx != start:
+            self.set_event(start)
+        self.fill_auto_check(out["check"])
+        parts = [f"auto windows: {len(out['done'])} event(s) saved"]
+        if out["kept"]:
+            parts.append(f"kept (manual): {', '.join(str(k) for k in out['kept'])}")
+        if out["kept_sensors"]:
+            parts.append(f"{len(out['kept_sensors'])} manual sensor(s) kept")
+        if out["failed"]:
+            parts.append("not done: " + ", ".join(f"{k} ({why})" for k, why in out["failed"]))
+        parts.append(f"{len(out['check'])} sensor(s) to check")
+        self.status_var.set(" | ".join(parts))
+        return out
+
+    def manual_counts(self, events) -> tuple:
+        """``(events, sensors)`` of ``events`` that are manual, from the saved
+        records: the events saved without auto windows, and the manual sensors
+        of events saved with them (the event shown counts as it is now)."""
+        n_events = n_sensors = 0
+        for k in events:
+            if k == self.event_idx:
+                if self.saved_manual():
+                    n_events += 1
+                else:
+                    n_sensors += sum(1 for v in self.manual if v)
+                continue
+            event = self.data_manager.get_data(f"{self.run_path}/events/[{k}]")
+            record = event.get(self.result_key) if isinstance(event, dict) else None
+            if not isinstance(record, dict):
+                continue
+            auto = record.get(AUTO_KEY)
+            if not isinstance(auto, dict):
+                n_events += 1
+                continue
+            try:
+                n_sensors += sum(1 for v in np.asarray(auto["applied"]).ravel() if not bool(v))
+            except (KeyError, TypeError, ValueError):
+                pass
+        return n_events, n_sensors
+
+    def fill_auto_check(self, rows) -> None:
+        """List the sensors to check, ``(event, sensor, flags)`` each."""
+        self.auto_check_table.delete(*self.auto_check_table.get_children())
+        for k, i, flags in rows:
+            name = self.channels[i] if i < len(self.channels) else str(i)
+            self.auto_check_table.insert("", "end", iid=f"{k}:{i}", values=(k, name, "; ".join(flags)))
+
+    def on_auto_check_wheel(self, event):
+        """Scroll the list of sensors to check, not the column it is in."""
+        units = wheel_units(event)
+        if units:
+            self.auto_check_table.yview_scroll(units, "units")
+        return "break"
+
+    def on_auto_check_selected(self, event=None) -> None:
+        """Open the event and the sensor of the row clicked."""
+        selection = self.auto_check_table.selection()
+        if not selection:
+            return
+        k, i = (int(v) for v in selection[0].split(":"))
+        if k != self.event_idx:
+            self.set_event(k)
+        if self.event_idx == k:
+            self.set_sensor(i)
+
     # ----------------------------------------------------------------- save
     def record(self) -> Optional[dict]:
         """The ``slip_analysis`` record of the current state, or None."""
@@ -2407,6 +2915,9 @@ class SlipDistributionView(EventView):
             front["use"] = [bool(v) for v in self.front_use]
             front["use_auto"] = bool(self.front_use_auto)
             rec["front"] = front
+        auto = self.auto_record()
+        if auto is not None:
+            rec[AUTO_KEY] = auto
         return rec
 
     def entry_error(self) -> Optional[str]:
@@ -2521,7 +3032,7 @@ class SlipDistributionView(EventView):
     def update_status(self) -> None:
         if self.result is None:
             return
-        flagged = [s for s in self.result.sensors if s.flags]
+        flagged = [(s, self.sensor_flags(i)) for i, s in enumerate(self.result.sensors) if self.sensor_flags(i)]
         manual = sum(1 for s in self.result.sensors if s.method == cs.METHOD_MANUAL)
         reference = f"reference at {1e3 * (self.result.t_ref - self.t_event):+.1f} ms"
         shared = [s for s in self.result.sensors if s.method == cs.METHOD_SHARED]
@@ -2532,7 +3043,7 @@ class SlipDistributionView(EventView):
         else:
             parts = [f"{len(self.result.sensors)} sensors, {manual} manual; " + reference]
         if flagged:
-            parts.append("check: " + ", ".join(f"{s.channel} ({'; '.join(s.flags)})" for s in flagged))
+            parts.append("check: " + ", ".join(f"{s.channel} ({'; '.join(flags)})" for s, flags in flagged))
         error = self.entry_error()
         if error is not None:
             parts.append(f"entry not applied: {error}")

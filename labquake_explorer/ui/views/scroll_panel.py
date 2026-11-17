@@ -90,7 +90,10 @@ class ScrollPanel(ttk.Frame):
         shown_w, shown_h = int(self.canvas.winfo_width()), int(self.canvas.winfo_height())
         width = max(shown_w, self.inner.winfo_reqwidth())
         height = max(shown_h, self.content_height())
-        self.canvas.itemconfigure(self._window, width=width, height=height)
+        # the content keeps its own height (no height on the window item): a fixed one would hide
+        # content that grows later, such as a status text getting longer, since the inner frame
+        # would then not change size and no <Configure> would come to update the scroll region
+        self.canvas.itemconfigure(self._window, width=width)
         self.canvas.configure(scrollregion=(0, 0, width, height))
         if self.content_height() > shown_h > 1:
             self.scrollbar.grid()
