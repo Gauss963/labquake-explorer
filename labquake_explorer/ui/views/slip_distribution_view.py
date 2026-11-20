@@ -3048,7 +3048,10 @@ class SlipDistributionView(EventView):
         if error is not None:
             parts.append(f"entry not applied: {error}")
         elif self.saved is None:
-            parts.append("not saved")
+            stored = self.event.get(self.result_key) if isinstance(self.event, dict) else None
+            other = stored.get("field") if isinstance(stored, dict) else None
+            parts.append(f"not saved; the event's record is for {other}, Save replaces it"
+                         if other is not None and str(other) != self.field else "not saved")
         else:
             parts.append("matches the saved record" if self.matches_saved() else "differs from the saved record (Save to update)")
         self.status_var.set(" | ".join(parts))

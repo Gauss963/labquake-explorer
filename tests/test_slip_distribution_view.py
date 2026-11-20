@@ -1015,9 +1015,11 @@ def test_waveform_field_and_burst_tab(slip_app):
     with opened(slip_app, 1) as view:
         assert list(view.field_combobox["values"]) == ["slip", "waveform/elsys"] and view.field == "slip"
         assert view.pzt is None
+        assert view.save()
         view.field_combobox.set("waveform/elsys")
         view.on_field_selected()
         assert view.field == "waveform/elsys" and view.time.size == 120000 and view.pzt is not None
+        assert "the event's record is for slip, Save replaces it" in view.status_var.get()
         assert view.start_s == pytest.approx(-0.04, abs=1e-3) and view.end_s == pytest.approx(0.02, abs=1e-3)
         assert view.result is not None and view.result.window_mode == "lines"
         view.select_t_i_method(cs.METHOD_BURST)
