@@ -309,7 +309,8 @@ def test_mouse_events_grab_handles_and_drags_start_from_the_windows_shown(slip_a
     view.on_motion(mouse("motion_notify_event", ti + 0.5))
     view.on_release(mouse("button_release_event", ti + 0.5))
     assert view._drag is None and view.methods[4] == cs.METHOD_MANUAL
-    assert view.t_shift[4] == pytest.approx(ti + 0.5, abs=0.02)
+    one_px = abs(ax.transData.inverted().transform((1.0, 0.0))[0] - ax.transData.inverted().transform((0.0, 0.0))[0])
+    assert view.t_shift[4] == pytest.approx(ti + 0.5, abs=one_px)    # mouse events carry whole pixels
     ti = view.t_shift[4]
     view.on_press(mouse("button_press_event", 1.25, dx_px=-3))
     assert view._drag["what"] == "after_start"

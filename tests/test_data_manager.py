@@ -209,7 +209,7 @@ def test_save_safety(tmp_path, dm):
     assert loaded(sub / "exp.h5").get_data("runs/[0]/strain/filename") == os.path.join("..", "raw", "run1.tpc5")
     m.save_file(path)                                 # the copy has everything memory has: saving over is fine now
     assert loaded(path).get_data("runs/[0]/strain/filename") == os.path.join("raw", "run1.tpc5")
-    assert os.stat(path).st_mode & 0o777 == 0o644
+    assert os.name == "nt" or os.stat(path).st_mode & 0o777 == 0o644   # Windows has no mode bits
     # a failed load changes neither the data nor the folder raw files are read from
     bad = sub / "broken.h5"
     bad.write_bytes(b"not hdf5")
