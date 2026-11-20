@@ -7,7 +7,9 @@ pick and a right double-click on a marker removes it.  The view owns the
 axes: after (re)plotting it calls ``set_curve`` and ``draw_markers`` to put
 the markers back, and receives ``on_change(kind, idx)`` once per completed
 edit (``kind`` is ``"add"``, ``"remove"`` or ``"move"``; ``idx`` the sample
-added, removed or moved to).  ``on_release_hook`` runs after every button
+added, removed or moved to); ``on_drag(position, idx)`` while a marker is
+dragged, after each step to another sample.  ``color`` is one colour or one
+per marker position.  ``on_release_hook`` runs after every button
 release, so a view that must not rebuild the axes while a marker is held can
 postpone that work until the mouse is up.  Markers are sized in data units
 and follow every change of the axes limits (toolbar zoom, pan, home).
@@ -29,7 +31,8 @@ class PointPicker:
     def __init__(self, ax, canvas, x, y, picks: Sequence[int] = (), add_remove: bool = True,
                  toolbar_active: Callable[[], bool] = lambda: False,
                  on_change: Optional[ChangeCallback] = None,
-                 on_release_hook: Optional[Callable[[], None]] = None, color: str = "red"):
+                 on_release_hook: Optional[Callable[[], None]] = None, color="red",
+                 on_drag: Optional[ChangeCallback] = None):
         self.ax = ax
         self.canvas = canvas
         self.figure = ax.figure
@@ -40,6 +43,7 @@ class PointPicker:
         self.toolbar_active = toolbar_active
         self.on_change = on_change
         self.on_release_hook = on_release_hook
+        self.on_drag = on_drag
         self.color = color
         self._lim_cids: list = []
         self.markers: list[patches.Ellipse] = []
@@ -68,8 +72,9 @@ class PointPicker:
         self.y = np.asarray(y)
 
     def _make_marker(self, idx: int, label: int, width: float, height: float) -> patches.Ellipse:
+        color = self.color if isinstance(self.color, str) else self.color[label % len(self.color)]
         marker = patches.Ellipse((self.x[idx], self.y[idx]), width=width, height=height,
-                                 color=self.color, fill=False, lw=2, picker=8, label=str(label))
+                                 color=color, fill=False, lw=2, picker=8, label=str(label))
         self.ax.add_patch(marker)
         self.markers.append(marker)
         return marker
@@ -195,6 +200,8 @@ class PointPicker:
                 self.current_artist.set_center((self.x[idx], self.y[idx]))
                 self.picks[position] = idx
                 self.moved_to = idx
+                if self.on_drag is not None:
+                    self.on_drag(position, idx)
                 self.canvas.draw_idle()
         except Exception as e:
             print(f"Error in on_motion: {e}")

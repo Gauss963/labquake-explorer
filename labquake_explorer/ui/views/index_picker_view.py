@@ -12,12 +12,12 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Optional
 
-import matplotlib.patches as patches
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-from labquake_explorer.ui.views.base import BaseView, nearest_sample
+from labquake_explorer.ui.views.base import BaseView
+from labquake_explorer.ui.views.point_picker import PointPicker
 
 
 def split_item_path(path: Optional[str]) -> tuple[str, Optional[str]]:
@@ -46,14 +46,12 @@ class ArrayPairView(BaseView):
         self.item_x = item_x
         self.data_x = np.array([])
         self.data_y = np.array([])
-        self.markers: list[patches.Ellipse] = []
-        self.picked_idx: list[int] = []
-        self.offset = [0.0, 0.0]
-        self.current_artist = None
-        self.currently_dragging = False
         super().__init__(app)
 
         self.build_ui()
+        self.picker = PointPicker(self.ax, self.canvas, self.data_x, self.data_y, add_remove=False,
+                                  toolbar_active=self.toolbar_active, color=self.marker_color,
+                                  on_drag=lambda position, idx: self.on_dragged())
         self.init_comboboxes()
         self.plot_data()
         if len(self.data_y) > 0:
@@ -61,12 +59,18 @@ class ArrayPairView(BaseView):
             self.picked_idx = [int(n / 3), int(n / 3 * 2)]
         self.plot_picked_points()
 
-        self.canvas.mpl_connect("pick_event", self.on_pick)
-        self.canvas.mpl_connect("motion_notify_event", self.on_motion)
-        self.canvas.mpl_connect("button_press_event", self.on_press)
-        self.canvas.mpl_connect("button_release_event", self.on_release)
-        self.canvas.mpl_connect("resize_event", self.on_resize)
-        self.canvas.mpl_connect("scroll_event", self.on_resize)
+    @property
+    def picked_idx(self) -> list[int]:
+        """The picked sample indices (the picker's list: edits in place move nothing until redrawn)."""
+        return self.picker.picks
+
+    @picked_idx.setter
+    def picked_idx(self, value) -> None:
+        self.picker.picks = [int(i) for i in value]
+
+    @property
+    def markers(self) -> list:
+        return self.picker.markers
 
     # ------------------------------------------------------------------ ui
     def build_ui(self):
@@ -158,7 +162,6 @@ class ArrayPairView(BaseView):
         if not self.item_y:
             return
         self.ax.clear()
-        self.markers = []
         self.data_y = np.asarray(self.data_manager.get_data(self.item_path(self.item_y)))
         if self.item_x is None:
             self.data_x = np.arange(len(self.data_y))
@@ -173,6 +176,7 @@ class ArrayPairView(BaseView):
                 self.ax.set_xlabel(self.item_x)
         self.ax.plot(self.data_x, self.data_y, zorder=-100)
         self.ax.set_ylabel(self.item_y)
+        self.picker.set_curve(self.data_x, self.data_y)
         self.canvas.draw()
 
     def clamp_picked(self):
@@ -187,16 +191,7 @@ class ArrayPairView(BaseView):
         if len(self.data_y) == 0:
             return
         self.clamp_picked()
-        width, height = self.get_circle_dims()
-        for marker in self.markers:
-            if marker in self.ax.patches:
-                marker.remove()
-        self.markers = []
-        for i, idx in enumerate(self.picked_idx):
-            marker = patches.Ellipse((self.data_x[idx], self.data_y[idx]), width=width, height=height,
-                                     color=self.marker_color, fill=False, lw=2, picker=8, label=str(i))
-            self.ax.add_patch(marker)
-            self.markers.append(marker)
+        self.picker.draw_markers()
         self.draw_overlays()
         self.canvas.draw()
         self.update_readout()
@@ -222,70 +217,10 @@ class ArrayPairView(BaseView):
         except tk.TclError:
             pass
 
-    def get_circle_dims(self):
-        self.canvas.draw()
-        xl = self.ax.get_xlim()
-        yl = self.ax.get_ylim()
-        ratio = (yl[-1] - yl[0]) / (xl[-1] - xl[0])
-        fig_size = self.figure.get_size_inches()
-        ratio *= fig_size[0] / fig_size[1]
-        width = (xl[-1] - xl[0]) / fig_size[0] * 0.15
-        return width, width * ratio
-
-    def nearest_index(self, cx: float, cy: float) -> int:
-        """Finite sample nearest to (cx, cy) in axes-normalized distance.
-
-        NaN samples are never candidates; with no finite sample at all the
-        drag is refused (ValueError, caught by ``on_motion``).
-        """
-        idx = nearest_sample(self.data_x, self.data_y, cx, cy, self.ax.get_xlim(), self.ax.get_ylim())
-        if idx is None:
-            raise ValueError("no finite samples to snap to")
-        return idx
-
-    # ------------------------------------------------------------- dragging
-    def on_pick(self, event):
-        if self.toolbar_active():
-            return
-        if self.current_artist is None and isinstance(event.artist, patches.Ellipse):
-            self.current_artist = event.artist
-            x0, y0 = self.current_artist.center
-            self.offset = [x0 - event.mouseevent.xdata, y0 - event.mouseevent.ydata]
-
-    def on_press(self, event):
-        self.currently_dragging = True
-
-    def on_release(self, event):
-        self.current_artist = None
-        self.currently_dragging = False
-        self.on_resize(None)
-
-    def on_motion(self, event):
-        if not self.currently_dragging or self.current_artist is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        if not isinstance(self.current_artist, patches.Ellipse):
-            return
-        try:
-            dx, dy = self.offset
-            idx = self.nearest_index(event.xdata + dx, event.ydata + dy)
-            self.current_artist.set_center((self.data_x[idx], self.data_y[idx]))
-            self.picked_idx[int(self.current_artist.get_label())] = idx
-            self.update_overlays()
-            self.update_readout()
-            self.canvas.draw_idle()
-        except Exception as e:
-            print(f"Error in on_motion: {e}")
-
-    def on_resize(self, event):
-        if getattr(self, "ax", None) is None or not self.markers:
-            return
-        width, height = self.get_circle_dims()
-        for marker in self.markers:
-            marker.set_width(width)
-            marker.set_height(height)
-        self.canvas.draw()
+    def on_dragged(self):
+        """A marker was dragged to another sample."""
+        self.update_overlays()
+        self.update_readout()
 
 
 class IndexPickerView(ArrayPairView):
