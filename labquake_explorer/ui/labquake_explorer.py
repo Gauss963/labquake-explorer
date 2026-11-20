@@ -368,18 +368,6 @@ class LabquakeExplorer:
         if self.active_context_menu:
             self.active_context_menu.post(event.x_root, event.y_root)
     
-    def has_child_name_contains(self, item_id, keyword):
-        if not item_id:
-            return False
-        children = self.data_tree.get_children(item_id)
-        return any(keyword in self.data_tree.item(child_id, "text") for child_id in children)
-    
-    def has_child_named(self, item_id, name):
-        if not item_id:
-            return False
-        children = self.data_tree.get_children(item_id)
-        return any(name == self.data_tree.item(child_id, "text").split(":")[0] for child_id in children)
-
     def on_delete(self, event) -> None:
         """Handle deletion of items from the tree view"""
         try:

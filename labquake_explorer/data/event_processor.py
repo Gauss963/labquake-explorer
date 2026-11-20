@@ -195,28 +195,3 @@ class EventProcessor:
             "raw": np.asarray(ref["raw"])[:, sl],
             "original": {"time": win.time, "raw": raw},
         }
-
-    # ------------------------------------------------------------- paths
-    def get_data_at_path(self, data: Dict[str, Any], path: str) -> Any:
-        """Get data at specified path"""
-        current = data
-        for key in path.split('/'):
-            if key[0] == '[' and key[-1] == ']':
-                key = int(key[1:-1])
-            current = current[key]
-        return current
-
-    def set_data_at_path(self, data: Dict[str, Any], path: str, value: Any, add_key: bool = False) -> None:
-        """Set data at specified path"""
-        parts = path.split('/')
-        current = data
-        for i, part in enumerate(parts[:-1]):
-            if part[0] == '[' and part[-1] == ']':
-                part = int(part[1:-1])
-            if part not in current and add_key:
-                current[part] = {} if i < len(parts) - 2 else None
-            current = current[part]
-        last_key = parts[-1]
-        if last_key[0] == '[' and last_key[-1] == ']':
-            last_key = int(last_key[1:-1])
-        current[last_key] = value

@@ -7,7 +7,6 @@ class LabquakeExplorerConfig:
     WINDOW_GAP: int = 100
     WINDOW_WIDTH: int = 300
     WINDOW_TITLE: str = "Labquake Explorer"
-    MAX_ARRAY_DISPLAY: int = 1000
     DEFAULT_WINDOW_SIZE: float = 5.0
     FILE_TYPES: tuple = (                 # first entry is the dialogs' default
         ("HDF5 files", "*.h5 *.hdf5"),

@@ -81,14 +81,13 @@ from tkinter import messagebox, ttk
 import numpy as np
 from scipy import optimize, signal
 
-from labquake_explorer.data.data_processor import DataProcessor
 from labquake_explorer.data.settings import get_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_channels,
                                             waveform_data, waveform_time)
-from labquake_explorer.utils.cohesive_crack import (CohesiveCrack, cohesive_delta_sigmas, cohesive_gamma,
+from labquake_explorer.utils.cohesive_crack import (CohesiveCrack, stress_to_strain, voltage_to_strain, cohesive_delta_sigmas, cohesive_gamma,
                                                     cohesive_tau_p, rayleigh_speed, rupture_regime)
 
 STRESS_UNITS = {"Pa": 1.0, "kPa": 1e3, "MPa": 1e6, "GPa": 1e9}   # Pa per unit of a record stored in stress
@@ -756,7 +755,7 @@ class CZMFitterView(EventView):
         if self.stress_mode:
             strain = np.asarray(raw, dtype=float) * self.stress_scale
         else:
-            strain = DataProcessor.voltage_to_strain(raw)
+            strain = voltage_to_strain(raw)
         if self.filtering:
             strain = signal.savgol_filter(strain, self._filter_window_length(), 2)
         return strain
@@ -782,7 +781,7 @@ class CZMFitterView(EventView):
             x_zeroed, self.y.get(), Xc, Cf, self.C_s, self.C_d, self.nu, Gc, self.E)
         if self.stress_mode:
             return {"xy": delta_sigma_xy, "xx": delta_sigma_xx, "yy": delta_sigma_yy}
-        delta_e_xx, delta_e_xy, delta_e_yy = DataProcessor.stress_to_strain(
+        delta_e_xx, delta_e_xy, delta_e_yy = stress_to_strain(
             self.E, self.nu, delta_sigma_xx, delta_sigma_xy, delta_sigma_yy)
         return {"xy": delta_e_xy, "xx": delta_e_xx, "yy": delta_e_yy}
 

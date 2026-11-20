@@ -49,73 +49,6 @@ def getBlockName(channel, block):
     name = '/measurements/00000001/channels/' + channelString + '/blocks/' + blockString + '/'
     return name
 
-def getVoltageData(fileRef, channel, block = 1):
-    channel_group           = fileRef[getChannelGroupName(channel)]
-    dataset_name            = getDataSetName(channel,block)
-
-    ''' Get Scaling Parameters '''
-    binToVoltageFactor      = channel_group.attrs['binToVoltFactor']
-    binToVoltageConstant    = channel_group.attrs['binToVoltConstant']
-
-    ''' Get Analog and Digital Mask for Data separation '''
-    analogMask              = channel_group.attrs['analogMask']
-    markerMask              = channel_group.attrs['markerMask']
-
-    analogData              = fileRef[dataset_name] & analogMask
-    
-    ''' Scale To voltage '''
-    return analogData * binToVoltageFactor + binToVoltageConstant
-
-def getPhysicalData(fileRef, channel, block = 1):
-    channel_group           = fileRef[getChannelGroupName(channel)]
-    dataset_name            = getDataSetName(channel,block)
-
-    ''' Get Scaling Parameters '''
-    binToVoltageFactor      = channel_group.attrs['binToVoltFactor']
-    binToVoltageConstant    = channel_group.attrs['binToVoltConstant']
-    VoltToPhysicalFactor    = channel_group.attrs['voltToPhysicalFactor']
-    VoltToPhysicalConstant  = channel_group.attrs['voltToPhysicalConstant']
-
-    ''' Get Analog and Digital Mask for Data separation '''
-    analogMask              = channel_group.attrs['analogMask']
-    markerMask              = channel_group.attrs['markerMask']
-    
-    analogData              = fileRef[dataset_name] & analogMask
-    
-    ''' Scale To voltage '''
-    voltageData = analogData * binToVoltageFactor + binToVoltageConstant
-    return voltageData * VoltToPhysicalFactor + VoltToPhysicalConstant
-
-def getChannelName(fileRef, channel):
-    channel_group           = fileRef[getChannelGroupName(channel)]
-    return channel_group.attrs['name']
-
-def getPhysicalUnit(fileRef, channel):
-    channel_group           = fileRef[getChannelGroupName(channel)]
-    return  channel_group.attrs['physicalUnit']
-
-def getSampleRate(fileRef, channel, block = 1):
-    block_group             = fileRef[getBlockName(channel,block)]
-    return block_group.attrs['sampleRateHertz']
-
-def getTriggerSample(fileRef, channel, block = 1):
-    block_group             = fileRef[getBlockName(channel,block)]
-    return block_group.attrs['triggerSample']
-
-def getTriggerTime(fileRef, channel, block = 1):
-    block_group             = fileRef[getBlockName(channel,block)]
-    return block_group.attrs['triggerTimeSeconds']
-
-def getStartTime(fileRef, channel, block = 1):
-    block_group             = fileRef[getBlockName(channel,block)]
-    return block_group.attrs['startTime']
-
-def getNChannels(fileRef, block = 1):
-    return len(fileRef['/measurements/00000001/channels'])
-
-def getNSamples(fileRef, channel, block = 1):
-    return len(fileRef[getBlockName(channel,block)+'raw'])
-
 
 # ---------------------------------------------------------------------------
 # package API
@@ -434,7 +367,5 @@ __all__ = [
     'layout_problems', 'continuous_block', 'trigger_blocks', 'find_block',
     'read_channel', 'read_block', 'read_window', 'block_table', 'blocks_from_table',
     'read_continuous',
-    'getDataSetName', 'getChannelGroupName', 'getBlockName', 'getVoltageData',
-    'getPhysicalData', 'getChannelName', 'getPhysicalUnit', 'getSampleRate',
-    'getTriggerSample', 'getTriggerTime', 'getStartTime', 'getNChannels', 'getNSamples',
+    'getDataSetName', 'getChannelGroupName', 'getBlockName',
 ]
