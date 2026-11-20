@@ -195,6 +195,15 @@ def test_write_fault_geometry_in_place(tmp_path, suffix):
     assert fault(load(path), "ends_x_mm") == [0.0, 400.0]
     with pytest.raises(ValueError, match="two numbers"):
         M.write_fault_geometry(path, patch_x_mm=[1.0])
+    # an unusable old value is dropped from either kind of file, never moved; nothing to do adds nothing
+    data, _ = make_experiment()
+    data["patch_x_mm"] = 187.5
+    other = tmp_path / f"scalar{suffix}"
+    save(data, other)
+    notes = M.write_fault_geometry(other)
+    assert len(notes) == 1 and notes[0].startswith("patch_x_mm: unusable value") and notes[0].endswith("dropped")
+    back = load(other)
+    assert "patch_x_mm" not in back and "fault" not in back.get("analysis", {})
 
 
 def test_flat_pzt_settings_and_version_1_stores_upgrade_to_result_sets():

@@ -469,25 +469,34 @@ def write_fault_geometry(path, patch_x_mm=None, ends_x_mm=None) -> list:
         return notes
     notes = []
     with h5py.File(path, "r+") as f:
-        analysis = f.require_group(ANALYSIS_KEY)
-        analysis.attrs[CONTAINER_ATTR] = "dict"
-        fault = analysis.require_group(FAULT_SETTING)
-        fault.attrs[CONTAINER_ATTR] = "dict"
+        def fault_group():                                # created only when something is written
+            analysis = f.require_group(ANALYSIS_KEY)
+            analysis.attrs[CONTAINER_ATTR] = "dict"
+            group = analysis.require_group(FAULT_SETTING)
+            group.attrs[CONTAINER_ATTR] = "dict"
+            return group
+
         moves = [(old, new) for old, new in LEGACY_GEOMETRY_KEYS.items() if old in f]
         legacy = f.get(FAULT_SETTING)
         if isinstance(legacy, h5py.Group):                # a fault dict; a text fault stays
             moves += [(f"{FAULT_SETTING}/{key}", key) for key in FAULT_GEOMETRY_KEYS if key in legacy]
-        for old, new in moves:
-            if new in fault:
-                del f[old]                                # the value already in analysis wins
-            else:
-                f.move(old, f"{ANALYSIS_KEY}/{FAULT_SETTING}/{new}")
+        for old, new in moves:                            # the same rule as upgrade_fault_geometry
+            try:
+                value = _pair(f[old][...])
+            except (ValueError, TypeError):
+                notes.append(f"{old}: unusable value {f[old][...]!r} dropped")
+                del f[old]
+                continue
+            del f[old]
+            if f.get(f"{ANALYSIS_KEY}/{FAULT_SETTING}/{new}") is None:       # a value already in analysis wins
+                fault_group().create_dataset(new, data=np.asarray(value, dtype=float))
             notes.append(f"{old} -> {ANALYSIS_KEY}/{FAULT_SETTING}/{new}")
         if isinstance(legacy, h5py.Group) and not len(legacy):
             del f[FAULT_SETTING]
         for key, value in wanted.items():
             if value is None:
                 continue
+            fault = fault_group()
             if key in fault:
                 old_value = np.asarray(fault[key][...], dtype=float).ravel()
                 if old_value.size == 2 and np.allclose(old_value, value):

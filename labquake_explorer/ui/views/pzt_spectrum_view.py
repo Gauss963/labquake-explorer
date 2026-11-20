@@ -82,11 +82,12 @@ from labquake_explorer.analysis import spectrum as sp
 from labquake_explorer.analysis.spectrum import N_BOUNDS
 from labquake_explorer.analysis import spectrum_ensemble as se
 from labquake_explorer.data.spectrum_store import DEFAULT_SET, ensure_set, set_channels, set_name, set_names
-from labquake_explorer.data.settings import delete_setting, get_setting, set_setting
+from labquake_explorer.data.settings import get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.ui.views.scroll_panel import ScrollPanel
+from labquake_explorer.data.migrate import upgrade_spectrum_settings
 from labquake_explorer.data.sources import (current_arrival_set, pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
                                             waveform_channels, waveform_data, waveform_time, waveform_trigger_time)
 
@@ -1203,25 +1204,7 @@ class PZTSpectrumView(EventView):
                      "attenuation": copy.deepcopy(self.attenuation_table)}
             set_setting(data, entry, SETTING, SETS_SETTING, name, "sensors", key)
         set_setting(data, name, SETTING, CURRENT_SET_SETTING)
-        self._move_flat_settings()
-
-    def _move_flat_settings(self) -> None:
-        """The ``settings`` and ``sensors`` a file kept directly under
-        ``analysis['pzt_spectrum']`` (written before result sets) belong to the
-        default set; what the default set already has wins."""
-        data = self.data_manager.data
-        for key in ("settings", "sensors"):
-            flat = get_setting(data, SETTING, key)
-            if flat is None:
-                continue
-            if isinstance(flat, dict):
-                if key == "sensors":
-                    for sensor, entry in flat.items():
-                        if get_setting(data, SETTING, SETS_SETTING, DEFAULT_SET, key, sensor) is None:
-                            set_setting(data, entry, SETTING, SETS_SETTING, DEFAULT_SET, key, sensor)
-                elif get_setting(data, SETTING, SETS_SETTING, DEFAULT_SET, key) is None:
-                    set_setting(data, flat, SETTING, SETS_SETTING, DEFAULT_SET, key)
-            delete_setting(data, SETTING, key)
+        upgrade_spectrum_settings(data)          # settings kept before result sets belong to the default set
 
     # ---------------------------------------------------------- parameters
     def read_parameters(self) -> dict:
