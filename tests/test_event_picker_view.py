@@ -291,6 +291,12 @@ def test_y_can_be_a_converted_source_channel(tmp_path, app_from_file):
     v.picker.add_point(int(np.nanargmin(y)))
     assert v.extract(confirm=False) == 1
     assert app.data_manager.get_data("runs/[0]/event_extraction")["y_field"] == "elsys/sigma_xy"
+    # raw file gone (moved, or the experiment copied elsewhere): nothing is extracted, the events stay
+    events = app.data_manager.get_data("runs/[0]/events")
+    raw = tmp_path / run["elsys"]["filename"]
+    raw.rename(raw.with_suffix(".moved"))
+    assert v.extract(confirm=False) == 0 and "cannot be opened" in v.status_var.get()
+    assert app.data_manager.get_data("runs/[0]/events") is events and "waveform" in events[0]
     v.on_close()
 
 
