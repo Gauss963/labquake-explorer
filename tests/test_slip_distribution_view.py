@@ -1,6 +1,7 @@
 """Headless-Tk tests for the Slip Distribution view (coseismic slip per sensor)."""
 import contextlib
 import functools
+import inspect
 import math
 import warnings
 
@@ -76,7 +77,10 @@ def type_param(v, model, name, text, field="value"):
 
 def press(view, ax, xd, yd, button=1, name="button_press_event"):
     """matplotlib's own dispatch of a mouse event at data (xd, yd) of ``ax``."""
-    event = MouseEvent(name, view.canvas, *ax.transData.transform((xd, yd)), button=button)
+    held = {}
+    if name == "motion_notify_event" and "buttons" in inspect.signature(MouseEvent).parameters:
+        held["buttons"] = {button}        # the buttons held during a move: the toolbar's zoom reads them (matplotlib 3.11)
+    event = MouseEvent(name, view.canvas, *ax.transData.transform((xd, yd)), button=button, **held)
     view.canvas.callbacks.process(name, event)
 
 

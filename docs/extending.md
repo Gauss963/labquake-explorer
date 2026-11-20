@@ -293,6 +293,78 @@ Dict with `Cf`, `y`, `Xc`, `Gc`, `x_min`, `x_tip`, `x_max`, `x_lim_min`,
 `x_lim_max`, `strain_gauge`; `Cf` defaults to `|rupture_speed|` when Pick
 Arrivals has saved one. A legacy list of eight values is still read.
 
+A record in volts is fitted as strain, with the view's default medium. A
+record stored in a stress unit (`Pa`, `kPa`, `MPa`, `GPa`: a recorder read
+through a `conversion`) is fitted as stress; an experiment sets its own
+medium with `analysis['medium']`: `E_Pa` and `nu`, plus the wave speeds
+(`vs_m_s`, `vp_m_s`) or the density `rho_kg_m3` they follow from. In either
+of those two cases the dict also holds `channel` (the channel's name),
+`unit`, the medium used (`E`, `nu`, `C_s`, `C_d`) and `tau_p` (Pa), the peak
+strength Gc and Xc imply at that `Cf`.
+
+A stress record's channels are grouped by sensor through their names
+(`<sensor>_sigma_xy`, `_sigma_xx`, `_sigma_yy`). The gauge box lists the
+record's sensors by name, the view shows the three components of the
+selected one and fits Gc and Xc to the ticked ones at once; `sensor` records
+its name, `fit_components` which components (`['xy', 'xx', 'yy']` for a
+rosette, `['xy']` for a shear gauge), and `channel` is the sensor's
+`sigma_xy` channel. Pick Arrivals starts such a record with one trace per
+sensor (its `sigma_xy`); the menus switch the other components on.
+
+Lines and levels of a stress record: the three marker lines are named on
+the plot, left to right `background end`, `tip` (the front reaches the
+sensor) and `fit end`. The mean of each component over the background
+window (grey band, from `x_base`, the record's start unless moved, to
+`background end`) is removed, so every trace starts at 0; the model's
+`sigma_xx` and `sigma_yy` are referred to the same window and its
+`sigma_xy`, which is zero at the residual level, is shifted to match the
+measured trace over the fit window (red band, `tip` to `fit end`). The line
+under the parameters gives the misfit there. `Auto` sets `Cf` (the saved
+arrivals, else the fronts at the record's sensors, kept below the Rayleigh
+speed), the lines, and starting values of `Xc` and `Gc`, then fits; it tries
+both sides of the fault when `sigma_xx` or `sigma_yy` are ticked and leaves
+a sensor without a clear front alone. `x_base` is saved with the other keys.
+
+A `conversion` may carry `valid`, one flag per output channel, False where
+the channel is not a real measurement (an input it uses was railed or
+unplugged). Event records inherit it (`waveform/<recorder>/valid`). Pick
+Arrivals still draws such a channel, since it tells when the front arrives;
+the CZM view draws it grey and leaves it out of every fit. `Auto` takes the
+rupture speed from sensors of the same kind (cross-correlation of their
+fronts), puts the tip on the largest drop of `sigma_xy` and ends the fit
+window at the end of the initial rapid drop.
+
+The model follows the rupture speed (`utils.cohesive_crack`): below the
+Rayleigh speed the sub-Rayleigh solution (`CohesiveCrack`), between `C_s`
+and `C_d` the supershear solution with the same cohesive zone
+(`SupershearCohesiveCrack`); between the Rayleigh and shear speeds, and
+above `C_d`, no steady solution exists and nothing is drawn. When it saves
+the extra keys, `czm_parms` records which as `model`.
+
+For a stress record the `Model` box can fix the solution instead (`auto`,
+`sub-Rayleigh`, `supershear`; an experiment's default is
+`analysis['czm']['model']`, the choice is saved as `model_choice`). A chosen
+model keeps `Cf` in its own speed range: below `C_R` for `sub-Rayleigh`,
+between `C_s` and `C_d` for `supershear`; a measured speed outside it is moved
+to the nearest edge (0.98 of the way in) and the result line says so. `auto`
+takes `Cf` back from the measured speed.
+
+Where the model's zero of `sigma_xy` is taken in a stress record is a
+choice (`Model zero` box; an experiment's default is
+`analysis['czm']['reference']`, the choice is saved as `reference`):
+
+- `fit end` (default): the stress drops at the front to a residual level;
+  the model is shifted onto the measured trace over the fit window, which
+  runs from `tip` to `fit end`.
+- `background`: the stress rises above its level before the front and falls
+  back to it, and what the record does below that level afterwards (the
+  fault unloading as a whole) is not the cohesive zone. The model is
+  referred to the background window like the data and never shifted; the
+  fit window runs from `background end` through `tip` to `fit end`, which
+  belongs where the trace falls back to the background. `Auto` puts the tip
+  on the maximum above the background, `fit end` on that return, and fits
+  the tip time together with `Gc` and `Xc`.
+
 ### `interevent` (InterEventView, run level, version 1)
 
 `delay_s`, `width_s`, `lp_field`, `slip_field`, `event_times`, `recurrence`,

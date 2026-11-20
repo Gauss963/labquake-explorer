@@ -1,6 +1,9 @@
+import h5py
 import numpy as np
 import pytest
 
+from labquake_explorer.data import sources as S
+from labquake_explorer.data.channels import channel_array
 from labquake_explorer.data.data_manager import DataManager
 from labquake_explorer.data.event_processor import EventProcessor
 from labquake_explorer.preprocessing import Calibration, EddySlip, pressure_transducers, run_from_tpc5, run_from_tpc5_ni
@@ -145,3 +148,205 @@ def test_event_fields_window_choice_and_no_base_dir(elsys, tmp_path, capsys):
     e2 = EventProcessor().extract_events(run, idx, window=0.05)[0]
     assert "waveform" not in e2 and "elsys" not in e2 and e2["time"].size > 0
     assert "raw-data references skipped" in capsys.readouterr().out
+
+
+def sample_aligned_run(tmp_path, aligned=True):
+    """The layout of a run stored without a time axis or offsets: the NI is the
+    time base (raw_data + sample_rate), the Elsys a continuous 20 kHz tpc5 whose
+    sample 14 000 (0.7 s) is the NI's sample 12 000 (1.2 s)."""
+    tpc5 = tmp_path / "run1.tpc5"
+    write_tpc5(tpc5, {"A1 (0.A1)": pulse(0.7)}, fs_continuous=20_000.0, trigger_times=())
+    ni = tmp_path / "run1.npz"
+    v = write_ni_npz(ni, {"n": lambda t: 1.0 + 0 * t}, fs=10_000.0, duration=3.0)
+    run = {"name": "run1",
+           "normal_stress": v["ai0"] * 2.0,
+           "ni": S.NINpzSource.open(ni, {"ai0": "pressure_1"}).to_reference(tmp_path)
+                 | {"raw_data": channel_array(v["ai0"][None, :], ["pressure_1"], unit="V")},
+           "elsys": S.Tpc5Source.open(tpc5, {"A1": "pzt_1"}).to_reference(tmp_path) | {"sample_rate": 20_000.0}}
+    for key in ("ni", "elsys"):
+        del run[key]["time_offset"]
+    if aligned:
+        run["ni"]["aligned_sample"], run["elsys"]["aligned_sample"] = 12_000, 14_000
+    return run
+
+
+def test_sample_aligned_run_time_and_offsets(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    assert S.time_base(run) == "ni"
+    t = S.run_time(run)
+    assert t.size == 30_000 and t[0] == 0.0 and t[1] == pytest.approx(1e-4)
+    assert S.aligned_offset(run, "ni") == 0.0 and S.aligned_offset(run, "elsys") == pytest.approx(0.5)
+    assert S.open_source(run["elsys"], tmp_path, run).time_offset == pytest.approx(0.5)
+    del run["elsys"]["aligned_sample"]
+    assert S.aligned_offset(run, "elsys") is None
+    with pytest.raises(ValueError, match="not aligned"):
+        S.open_source(run["elsys"], tmp_path, run)
+
+
+def test_sample_aligned_run_load_extract_and_save(tmp_path):
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [sample_aligned_run(tmp_path)]}
+    dm.save_file(tmp_path / "t0001.h5")
+    back = DataManager()
+    back.load_file(tmp_path / "t0001.h5")
+    rrun = back.get_data("runs/[0]")
+    assert rrun["time"].size == 30_000 and rrun["time"][-1] == pytest.approx(2.9999)   # filled in on load
+    e = back.event_processor.extract_events(rrun, [index_at(rrun, 1.2)], window=0.01)[0]
+    st = e["waveform"]["elsys"]
+    assert st["sample_rate"] == 20_000.0 and st["time"][np.argmax(st["data"][0])] == pytest.approx(1.2, abs=1e-4)
+    # the derived time axis is not written back, and stays in memory after the save
+    back.save_file(tmp_path / "again.h5")
+    with h5py.File(tmp_path / "again.h5") as f:
+        assert "time" not in f["runs"]["0"]
+    assert "time" in rrun
+
+
+def test_unaligned_recorder_is_skipped(tmp_path, capsys):
+    run = sample_aligned_run(tmp_path, aligned=False)
+    run["time"] = S.run_time(run)
+    e = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [12_000], window=0.01)[0]
+    assert set(e["waveform"]) == {"ni"}
+    assert "not aligned" in capsys.readouterr().out
+
+
+def test_conversion_reads_elsys_in_output_units(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy", "twice"], "inputs": ["pzt_1"],
+                                  "matrix": np.array([[-3.0], [2.0]]), "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    assert isinstance(src, S.ConvertedSource) and src.fields == ["sigma_xy", "twice"]
+    assert src.time_offset == pytest.approx(0.5) and src.base.time_offset == pytest.approx(0.5)
+    volts = src.base.read_window(1.19, 1.21)
+    win = src.read_window(1.19, 1.21, ["twice"])
+    assert win.unit == "MPa" and win.fields == ["twice"] and win.sample_rate == 20_000.0
+    np.testing.assert_allclose(win.data[0], 2.0 * volts.data[0], rtol=1e-6)
+    # extracted events carry the converted channels and their unit
+    run["time"] = S.run_time(run)
+    e = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [12_000], window=0.01)[0]
+    st = e["waveform"]["elsys"]
+    assert st["unit"] == "MPa" and list(st["channels"]) == ["sigma_xy", "twice"]
+    assert st["time"][np.argmin(st["data"][0])] == pytest.approx(1.2, abs=1e-4)      # -3 x the pulse
+    np.testing.assert_allclose(st["data"][1], -2.0 / 3.0 * st["data"][0], rtol=1e-5)
+
+
+def test_conversion_needs_known_inputs(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["s"], "inputs": ["nope"], "matrix": [[1.0]], "unit": "MPa"}
+    with pytest.raises(KeyError):
+        S.open_source(run["elsys"], tmp_path, run)
+
+
+def test_conversion_reads_only_the_inputs_a_channel_uses(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["pzt_1"], "matrix": [[2.0]], "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    src.inputs, src.matrix = ["pzt_1", "spare"], np.array([[2.0, 0.0]])   # a second input this row ignores
+    win = src.read_window(1.19, 1.21, ["sigma_xy"])                       # "spare" is not a field: never read
+    assert win.fields == ["sigma_xy"] and win.unit == "MPa"
+
+
+def test_mean_on_samples_puts_a_converted_channel_on_the_run_samples(tmp_path):
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["pzt_1"], "matrix": [[-3.0]], "unit": "MPa"}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    t = S.run_time(run)
+    y = S.mean_on_samples(src, "sigma_xy", t, chunk_s=0.3)
+    assert y.shape == t.shape
+    covered = (t >= 0.5 + 0.5e-4) & (t <= 2.5 - 0.5e-4)            # the 2 s Elsys record starts at run 0.5 s
+    assert np.isnan(y[t < 0.5 - 1e-4]).all() and np.isnan(y[t > 2.5 + 1e-4]).all() and np.isfinite(y[covered]).all()
+    i = int(np.nanargmin(y))
+    assert t[i] == pytest.approx(1.2, abs=1e-4)                     # the pulse, at the run's samples
+    win = src.read_window(t[i] - 0.5e-4, t[i] + 0.5e-4, ["sigma_xy"], dtype=np.float64)
+    assert win.data[0].min() <= y[i] <= win.data[0].max() and y[i] < -0.2   # the mean of the Elsys samples there
+
+
+def dual_mode_run(tmp_path):
+    """A sample-aligned run whose Elsys file is in dual mode: a 2 kHz continuous
+    block (slower than the 10 kHz NI time base) plus 200 kHz trigger blocks at
+    0.5 s and 1.4 s; the first trigger is the NI's sample 10 000 (1.0 s), so the
+    Elsys clock sits 0.5 s behind the run's.  The channel is a slow ramp with a
+    sharp pulse at each trigger."""
+    tpc5 = tmp_path / "run1.tpc5"
+    signal = lambda t: 0.05 * t + pulse(0.5)(t) + pulse(1.4)(t)
+    write_tpc5(tpc5, {"A1 (0.A1)": signal}, fs_continuous=2_000.0, trigger_times=(0.5, 1.4))
+    ni = tmp_path / "run1.npz"
+    v = write_ni_npz(ni, {"n": lambda t: 1.0 + 0 * t}, fs=10_000.0, duration=3.0)
+    run = {"name": "run1",
+           "normal_stress": v["ai0"] * 2.0,
+           "ni": S.NINpzSource.open(ni, {"ai0": "pressure_1"}).to_reference(tmp_path)
+                 | {"raw_data": channel_array(v["ai0"][None, :], ["pressure_1"], unit="V")},
+           "elsys": S.Tpc5Source.open(tpc5, {"A1": "gauge"}).to_reference(tmp_path) | {"sample_rate": 200_000.0}}
+    for key in ("ni", "elsys"):
+        del run[key]["time_offset"]
+    run["ni"]["aligned_sample"], run["elsys"]["aligned_sample"] = 10_000, 100_000
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["gauge"], "matrix": [[-3.0]], "unit": "MPa"}
+    return run
+
+
+def test_whole_run_series_of_a_dual_mode_file_comes_from_the_continuous_block(tmp_path):
+    run = dual_mode_run(tmp_path)
+    src = S.open_source(run["elsys"], tmp_path, run)
+    assert src.time_offset == pytest.approx(0.5) and len(src.trigger_blocks) == 2
+    # between the triggers no trigger block covers the window, the continuous block does
+    assert src.read_window(1.2, 1.3, ["sigma_xy"]) is None
+    hist = src.read_history(1.2, 1.3, ["sigma_xy"], dtype=np.float64)
+    assert hist.block == 1 and hist.sample_rate == 2_000.0 and hist.unit == "MPa" and hist.fields == ["sigma_xy"]
+    np.testing.assert_allclose(hist.data[0], -3.0 * 0.05 * (hist.time - 0.5), atol=2e-3)
+    assert src.read_history(2.9, 2.95, ["sigma_xy"]) is None            # past the 2 s record (run 0.5 .. 2.5 s)
+    # on the run's samples: interpolated between the 2 kHz samples, no gaps, NaN outside the record
+    t = S.run_time(run)
+    y = S.mean_on_samples(src, "sigma_xy", t, chunk_s=0.3)
+    covered = (t >= 0.5) & (t <= 2.4995)
+    assert np.isfinite(y[covered]).all()
+    assert np.isnan(y[t < 0.5 - 1e-4]).all() and np.isnan(y[t > 2.5 + 1e-4]).all()
+    quiet = covered & (np.abs(t - 1.0) > 0.01) & (np.abs(t - 1.9) > 0.01)   # away from the two pulses
+    np.testing.assert_allclose(y[quiet], -3.0 * 0.05 * (t[quiet] - 0.5), atol=2e-3)
+
+
+def test_converted_record_and_its_positions(tmp_path):
+    from labquake_explorer.data.channels import positions_table
+    run = dual_mode_run(tmp_path)
+    run["elsys"]["conversion"]["positions"] = positions_table(["sigma_xy"], {"sigma_xy": (175.0, 1.0, np.nan)})
+    src = S.open_source(run["elsys"], tmp_path, run)
+    rec = src.read_record(2)                                               # a whole trigger block, converted
+    assert rec.unit == "MPa" and rec.fields == ["sigma_xy"] and rec.block == 2 and rec.data.shape == (1, 2000)
+    assert rec.trigger_time == pytest.approx(1.0) and rec.data[0].min() < -0.25    # -3 x the 0.1 V pulse
+    table = src.positions_for(["sigma_xy"])
+    assert table["x"] == [175.0] and table["y"] == [1.0] and table["unit"] == "mm"
+    run["time"] = S.run_time(run)
+    event = EventProcessor(tmp_path / "exp.h5").extract_events(run, [10_000], window=0.05)[0]
+    wave = event["waveform"]["elsys"]
+    assert wave["unit"] == "MPa" and wave["block"] == 2 and wave["positions"]["x"] == [175.0]
+    # without positions in the conversion the record simply has none
+    del run["elsys"]["conversion"]["positions"]
+    event = EventProcessor(tmp_path / "exp.h5").extract_events(run, [10_000], window=0.05)[0]
+    assert "positions" not in event["waveform"]["elsys"]
+    assert S.open_source(run["elsys"], tmp_path, run).positions_for(["sigma_xy"]) is None
+
+
+def test_conversion_flags_channels_that_are_not_valid(tmp_path):
+    run = dual_mode_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["a_sigma_xy", "a_sigma_xx"], "inputs": ["gauge"],
+                                  "matrix": [[-3.0], [2.0]], "unit": "MPa", "valid": [True, False]}
+    src = S.open_source(run["elsys"], tmp_path, run)
+    assert src.valid == [True, False] and src.valid_for(["a_sigma_xx"]) == [False]
+    run["time"] = S.run_time(run)
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [run]}
+    run["events"] = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [10_000], window=0.05)
+    assert run["events"][0]["waveform"]["elsys"]["valid"] == [True, False]
+    del run["time"]
+    dm.save_file(tmp_path / "t0001.h5")                                   # the flags survive the file
+    back = DataManager()
+    back.load_file(tmp_path / "t0001.h5")
+    record = back.data["runs"][0]["events"][0]["waveform"]["elsys"]
+    assert [bool(v) for v in record["valid"]] == [True, False] and list(record["channels"]) == ["a_sigma_xy", "a_sigma_xx"]
+    assert S.open_source(back.data["runs"][0]["elsys"], tmp_path, back.data["runs"][0]).valid == [True, False]
+    # no flags in the conversion: none in the record
+    del run["elsys"]["conversion"]["valid"]
+    run["time"] = S.run_time(run)
+    event = EventProcessor(tmp_path / "t0001.h5").extract_events(run, [10_000], window=0.05)[0]
+    assert "valid" not in event["waveform"]["elsys"] and S.open_source(run["elsys"], tmp_path, run).valid_for(["a_sigma_xy"]) is None
+    run["elsys"]["conversion"]["valid"] = [True]                           # one flag for two channels
+    with pytest.raises(ValueError, match="valid"):
+        S.open_source(run["elsys"], tmp_path, run)

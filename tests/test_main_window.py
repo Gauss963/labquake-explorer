@@ -105,3 +105,16 @@ def test_save_as_defaults_to_hdf5(app, tmp_path, monkeypatch):
     assert (tmp_path / "p0001.h5").exists()
     assert app.current_file_path == tmp_path / "p0001.h5"
     assert app.data_tree.heading("#0")["text"] == "p0001.h5"
+
+
+def test_right_click_acts_on_the_row_under_the_pointer(app, monkeypatch):
+    """The menu is for the row right-clicked, not the row selected before."""
+    monkeypatch.setattr(tk.Menu, "post", lambda self, x, y: None)
+    run = app.find_item("runs/[0]")
+    app.data_tree.selection_set(app.find_item("runs/[0]/name"))             # a string row selected
+    monkeypatch.setattr(app.data_tree, "identify_row", lambda y: run)
+    app.on_right_click(SimpleNamespace(x_root=0, y_root=0, y=0))
+    menu = app.active_context_menu
+    assert app.data_tree.selection() == (run,)
+    assert "Plot Run Signals" in [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    app.on_left_click(None)

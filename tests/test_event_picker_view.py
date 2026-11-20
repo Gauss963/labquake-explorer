@@ -267,3 +267,45 @@ def test_form_starts_from_the_extraction_record_or_defaults(app):
     v.save_picks()
     assert app.data_manager.get_data("runs/[0]/event_extraction/event_indices") == [100]
     v.on_close()
+
+
+def test_y_can_be_a_converted_source_channel(tmp_path, app_from_file):
+    import numpy as np
+    from labquake_explorer.data.data_manager import DataManager
+    from labquake_explorer.ui.views import event_picker_view
+    from tests.test_event_processor import sample_aligned_run
+    run = sample_aligned_run(tmp_path)
+    run["elsys"]["conversion"] = {"channels": ["sigma_xy"], "inputs": ["pzt_1"], "matrix": [[-3.0]], "unit": "MPa"}
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [run]}
+    dm.save_file(tmp_path / "t0001.h5")
+    app = app_from_file(tmp_path / "t0001.h5")
+    v = EventPickerView(app, 0)
+    assert "elsys/sigma_xy" in v.y_combo["values"] and "elsys/sigma_xy" not in v.x_combo["values"]
+    v.y_combo.set("elsys/sigma_xy")
+    v.plot()
+    y = v.y_values()
+    assert y.shape == v.time.shape and v.time[np.nanargmin(y)] == pytest.approx(1.2, abs=1e-4)
+    assert v.ax.get_ylabel() == "elsys/sigma_xy (MPa)"
+    assert any(k[1] == "sigma_xy" for k in event_picker_view._SOURCE_SERIES)   # read once, then cached
+    v.picker.add_point(int(np.nanargmin(y)))
+    assert v.extract(confirm=False) == 1
+    assert app.data_manager.get_data("runs/[0]/event_extraction")["y_field"] == "elsys/sigma_xy"
+    v.on_close()
+
+
+def test_converted_channel_of_a_dual_mode_file_is_drawn_over_the_whole_run(tmp_path, app_from_file):
+    import numpy as np
+    from labquake_explorer.data.data_manager import DataManager
+    from tests.test_event_processor import dual_mode_run
+    dm = DataManager()
+    dm.data = {"name": "t0001", "runs": [dual_mode_run(tmp_path)]}
+    dm.save_file(tmp_path / "t0001.h5")
+    app = app_from_file(tmp_path / "t0001.h5")
+    v = EventPickerView(app, 0)
+    v.y_combo.set("elsys/sigma_xy")
+    v.plot()
+    y = v.y_values()
+    inside = (v.time >= 0.5) & (v.time <= 2.4995)             # the Elsys continuous block on the run clock
+    assert y.shape == v.time.shape and np.isfinite(y[inside]).all() and np.isnan(y[~inside]).all()
+    v.on_close()

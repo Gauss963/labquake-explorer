@@ -350,10 +350,16 @@ class LabquakeExplorer:
                 pass
         self.active_context_menu = None
 
-        try:
-            item = self.data_tree.selection()[0]
-        except:
-            item = None
+        # act on the row under the pointer (a right-click does not select it on macOS),
+        # falling back to the current selection (also for an event that carries no pointer position)
+        y = getattr(event, "y", None)
+        item = self.data_tree.identify_row(y) if y is not None else ""
+        if item:
+            self.data_tree.selection_set(item)
+            self.data_tree.focus(item)
+        else:
+            selection = self.data_tree.selection()
+            item = selection[0] if selection else None
         if not item:
             return
 
