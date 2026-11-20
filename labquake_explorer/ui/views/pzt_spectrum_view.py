@@ -87,7 +87,7 @@ from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.ui.views.scroll_panel import ScrollPanel
-from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
+from labquake_explorer.data.sources import (current_arrival_set, pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
                                             waveform_channels, waveform_data, waveform_time, waveform_trigger_time)
 
 RESULT_VERSION = 1
@@ -333,6 +333,7 @@ class PZTSpectrumView(EventView):
         self.record: Optional[dict] = None       # working record of the current channel
         self.result_set: str = DEFAULT_SET       # the result set shown and saved into
         self.calibration_table: Optional[dict] = None   # the loaded gain table (Calibration.as_dict + gain_db)
+        self.trigger_pick_set: Optional[str] = None     # pick set of a saved "picked arrival" record; None: current
         self._first_load = True
         super().__init__(app, run_idx, event_idx)
 
@@ -1004,6 +1005,7 @@ class PZTSpectrumView(EventView):
     def apply_record(self, rec: dict) -> None:
         """Put a record's parameters into the controls."""
         g = rec.get
+        self.trigger_pick_set = g("trigger_pick_set") if isinstance(g("trigger_pick_set"), str) else None
         self.trigger_combobox.set(g("trigger", TRIGGER_EVENT_TIME) if g("trigger") in TRIGGERS else TRIGGER_EVENT_TIME)
         self.pre_var.set(_text(g("pre_ms", DEFAULTS["pre_ms"])))
         self.post_var.set(_text(g("post_ms", DEFAULTS["post_ms"])))
@@ -1317,13 +1319,16 @@ class PZTSpectrumView(EventView):
                                  "older event): use event_time or a picked arrival")
             t = t_rec
         else:
+            block = waveform_block(self.event, self.record_key)
+            name = self.trigger_pick_set or current_arrival_set(block)
             try:
-                picks = read_arrivals(waveform_block(self.event, self.record_key), self.event)
+                picks = read_arrivals(block, self.event, set_name=name)
                 arrivals = np.asarray(picks["arrival_time"], dtype=float).ravel()
                 t = float(arrivals[p["channel"]])
             except (KeyError, TypeError, ValueError, IndexError):
-                raise ValueError(f"no picked arrival for channel {p['channel']} "
+                raise ValueError(f"no picked arrival for channel {p['channel']} in pick set {name!r} "
                                  f"({self.record_key}: run Pick Arrivals on this record first)") from None
+            p["trigger_pick_set"] = name
         if not math.isfinite(t):
             raise ValueError("trigger time is not finite")
         if not (self.strain_time[0] <= t <= self.strain_time[-1]):
@@ -1529,7 +1534,8 @@ class PZTSpectrumView(EventView):
                      fit: sp.SpectralFit) -> dict:
         """The JSON-like record stored per channel.
 
-        Keys: version, channel, trigger, trigger_time_s, fs_hz, pre_ms, post_ms,
+        Keys: version, channel, trigger, trigger_pick_set (the Pick Arrivals set a
+        "picked arrival" trigger came from), trigger_time_s, fs_hz, pre_ms, post_ms,
         taper, baseline, highpass_hz, remove_step, calibration_path,
         calibration_unit, calibration_db, calibration_divisor, t_star_s, fmin_hz, fmax_hz,
         bins_per_decade, snr_min, n_fixed, n_max (the ceiling of a free n;
@@ -1548,6 +1554,7 @@ class PZTSpectrumView(EventView):
             "field": p.get("field"),
             "channel": int(p["channel"]),
             "trigger": p["trigger"],
+            "trigger_pick_set": p.get("trigger_pick_set") if p["trigger"] == TRIGGER_PICKED else None,
             "trigger_time_s": float(trigger_time),
             "fs_hz": float(spectrum.meta.get("fs", float("nan"))),
             "pre_ms": float(p["pre_ms"]),
