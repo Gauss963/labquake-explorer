@@ -14,7 +14,8 @@ Conventions (documented once here, echoed in the result ``meta``):
 * The noise window is the equal-length segment immediately before the signal
   window, or immediately after it when there is no room before (a recorder
   that keeps little pre-trigger data); a caller's ``noise_window`` may lie on
-  either side.  ``noise_region`` says which (``'pre'``, ``'post'``,
+  either side, and a longer one keeps the signal window's length nearest the
+  signal.  ``noise_region`` says which (``'pre'``, ``'post'``,
   ``'explicit'``).  When fewer samples exist it is shortened down to 25% of
   the signal length (and its spectrum is scaled to the signal length); below
   that the noise is NaN and ``noise_available`` is False.  It never overlaps
@@ -113,7 +114,7 @@ class WindowResult:
     noise_fraction: float       # len(noise) / len(signal); 0 when unavailable
     noise_available: bool
     baseline_mode: str          # requested mode
-    baseline_region: str        # 'noise', 'pre_trigger', 'none' (where the line was fitted)
+    baseline_region: str        # 'noise' (line), 'pre_trigger' (mean), 'none': where the baseline was fitted
     step_removed: bool
     step_amplitude: float       # amplitude of the removed step (input units); NaN if not removed
     step_centre: float          # fractional sample (in the signal window) of the removed step's half-rise
@@ -280,7 +281,8 @@ def extract_window(time, x, trigger_time: float, pre_s: float, post_s: float,
     signal window instead (``'post'``).  ``noise_window = (start_s, end_s)``
     relative to the trigger gives one explicitly (``'explicit'``): it must end
     at or before the signal window or start at or after it, a gap between the
-    two being allowed.  Either way it has to hold at least
+    two being allowed; longer than the signal window, it keeps the samples
+    nearest the signal (the FFT has the signal's length).  Either way it has to hold at least
     ``MIN_NOISE_FRACTION`` of the signal window's samples to count.
 
     For the spectrum's no-coherent-gain amplitude convention the transient
@@ -291,9 +293,12 @@ def extract_window(time, x, trigger_time: float, pre_s: float, post_s: float,
 
     ``baseline``:
       * ``'pre_linear'`` (default): a straight line fitted over the noise window
-        (or, when no noise window lies before the signal, over the pre-trigger
-        samples) is subtracted from noise and signal.  With fewer than two
-        such samples no baseline is removed and ``baseline_region == 'none'``.
+        is subtracted from noise and signal.  When no noise window lies before
+        the signal only the mean of the pre-trigger samples is subtracted
+        (``baseline_region == 'pre_trigger'``): a line through those few
+        samples, extended over the signal and a noise window after it, adds a
+        ramp of its own.  With fewer than two such samples no baseline is
+        removed and ``baseline_region == 'none'``.
       * ``'none'``: raw samples.
       * ``'highpass'``: zero-phase Butterworth (order 2) at ``highpass_hz``,
         run over noise + signal jointly so the join has no edge effect.
@@ -359,11 +364,11 @@ def extract_window(time, x, trigger_time: float, pre_s: float, post_s: float,
             raise ValueError("noise_window must be (start, end) seconds relative to the trigger, start < end")
         noise_region = "explicit"
         if end_s <= -pre_s + 0.5 * dt:                   # before the signal window
-            i_n0 = max(0, i_trigger + int(round(start_s * fs)))
             i_n1 = min(i0, i_trigger + int(round(end_s * fs)))
+            i_n0 = max(0, i_trigger + int(round(start_s * fs)), i_n1 - n)
         elif start_s >= post_s - 0.5 * dt:               # after it
             i_n0 = max(i1, i_trigger + int(round(start_s * fs)))
-            i_n1 = min(x.size, i_trigger + int(round(end_s * fs)))
+            i_n1 = min(x.size, i_trigger + int(round(end_s * fs)), i_n0 + n)
         else:
             raise ValueError("the noise window must lie before the signal window (end <= -pre_s) "
                              "or after it (start >= post_s)")
@@ -394,7 +399,7 @@ def extract_window(time, x, trigger_time: float, pre_s: float, post_s: float,
         else:
             k = y = None
         if k is not None and np.all(np.isfinite(y)):
-            slope, intercept = np.polyfit(k, y, 1)
+            slope, intercept = np.polyfit(k, y, 1) if region == "noise" else (0.0, float(np.mean(y)))
             sig = sig - (slope * np.arange(n) + intercept)
             if noise_available:
                 noise = noise - (slope * np.arange(i_n0 - i0, i_n1 - i0) + intercept)
@@ -863,6 +868,7 @@ def compute_spectrum(window: WindowResult, taper: str = "tukey", alpha: float = 
         "n_pre": window.n_pre, "n_post": window.n_post, "window_s": float(window.window_s),
         "i_trigger": int(window.i_trigger), "trigger_time": float(window.trigger_time),
         "taper": taper, "alpha": float(alpha),
+        "signal_incoherent_gain": float(np.sqrt(np.mean(w ** 2))),
         "taper_energy_fraction": taper_fraction, "transient_in_flat_region": in_flat,
         "baseline_mode": window.baseline_mode, "baseline_region": window.baseline_region,
         "highpass_hz": window.highpass_hz,
@@ -920,9 +926,11 @@ def bin_spectrum(spectrum: SpectrumResult, fmin: Optional[float] = None,
     Per bin: ``amp = sqrt(mean(amp_signal**2))`` over finite raw bins, likewise
     for the noise, ``snr = amp / noise``, ``counts`` = raw bins used.  Empty
     bins are dropped.  ``noise_subtract=True`` uses
-    ``amp = sqrt(max(mean(signal power) - mean(noise power), 0))`` instead,
-    removing the quadrature bias of additive noise (bins with no noise
-    estimate are left as they are; ``meta['noise_subtracted']`` says whether
+    ``amp = sqrt(max(mean(signal power) - IG^2 mean(noise power), 0))`` instead,
+    removing the quadrature bias of additive noise (the noise estimate is at
+    the untapered level, the noise inside the tapered signal is ``IG^2`` of it,
+    ``IG = meta['signal_incoherent_gain']``); bins with no noise
+    estimate are left as they are ( ``meta['noise_subtracted']`` says whether
     it was applied).  ``estimator`` (``BIN_ESTIMATORS``): ``'rms'`` is the
     above; ``'logmean'`` takes the geometric mean of the raw amplitudes per
     bin and ``'median'`` their median, for the signal and the noise alike,
@@ -969,7 +977,8 @@ def bin_spectrum(spectrum: SpectrumResult, fmin: Optional[float] = None,
             noise_power = np.where(has_noise, n_power[keep] / np.maximum(n_counts[keep], 1), np.nan)
             subtracted = bool(noise_subtract) and bool(np.any(has_noise))
             if subtracted:
-                mean_power = np.where(has_noise, np.maximum(mean_power - noise_power, 0.0), mean_power)
+                ig2 = float(spectrum.meta.get("signal_incoherent_gain", 1.0)) ** 2
+                mean_power = np.where(has_noise, np.maximum(mean_power - ig2 * noise_power, 0.0), mean_power)
             amp_b = np.sqrt(mean_power)
             noise_b = np.sqrt(noise_power)
         else:
