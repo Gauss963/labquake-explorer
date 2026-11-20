@@ -88,26 +88,35 @@ class LabquakeExplorer:
             title="Select data file",
             filetypes=self.config.FILE_TYPES
         )
-        if not file_path:
+        if not file_path or not self.confirm_discard():
             return
 
         try:
             path = Path(file_path)
             self.data_manager.load_file(path)
-            self.current_file_path = path
-            self.save_button.configure(state="normal")
-            self.refresh_tree()
-            print(f"File loaded: {file_path}")
-
-            # Expand the runs node
-            for item in self.data_tree.get_children(""):
-                if self.data_tree.item(item)["text"].startswith("runs"):
-                    self.data_tree.item(item, open=True)
-                    break
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {e}")
+            return
+        self.close_views()          # an open view would keep the old file's data and save it into this one
+        self.current_file_path = path
+        self.save_button.configure(state="normal")
+        self.refresh_tree()
+        print(f"File loaded: {file_path}")
 
-    def save_file(self) -> None:
+        # Expand the runs node
+        for item in self.data_tree.get_children(""):
+            if self.data_tree.item(item)["text"].startswith("runs"):
+                self.data_tree.item(item, open=True)
+                break
+        errors = self.data_manager.load_errors
+        if errors:
+            listed = "\n".join(errors[:10]) + (f"\n... and {len(errors) - 10} more" if len(errors) > 10 else "")
+            messagebox.showwarning("Parts of the file could not be read",
+                                   f"{len(errors)} parts of {path.name} could not be read and are missing:\n\n"
+                                   f"{listed}\n\nSaving over this file is refused; save to another file.")
+
+    def save_file(self) -> bool:
+        """Ask for a path and write the experiment there; True once saved."""
         current = self.current_file_path
         initial_file = None
         if current:
@@ -122,16 +131,39 @@ class LabquakeExplorer:
                 filetypes=self.config.FILE_TYPES,
             )
         if not file_path:
-            return
+            return False
 
         try:
             self.data_manager.save_file(Path(file_path))
-            print(f"File saved: {file_path}")
-            self.current_file_path = Path(file_path)
-            self.refresh_tree()
-            messagebox.showinfo("Success", "File saved successfully")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save file: {e}")
+            return False
+        print(f"File saved: {file_path}")
+        self.current_file_path = Path(file_path)
+        self.refresh_tree()
+        messagebox.showinfo("Success", "File saved successfully")
+        return True
+
+    def confirm_discard(self) -> bool:
+        """True when the experiment in memory may be dropped: nothing changed
+        since it was loaded or saved, or the user saved it or chose to discard it."""
+        if not self.data_manager.modified():
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes", "The experiment has changes that are not saved to a file.\n\nSave them first?",
+            icon=messagebox.WARNING)
+        if answer is None:
+            return False
+        return self.save_file() if answer else True
+
+    def close_views(self) -> None:
+        for window in self.child_windows[:]:
+            try:
+                if window.winfo_exists():
+                    getattr(window, "on_close", window.destroy)()
+            except tk.TclError:
+                pass
+            self.unregister_child(window)
 
     def refresh_tree(self) -> None:
         if not self.data_manager.data:
@@ -435,6 +467,8 @@ class LabquakeExplorer:
         return False
 
     def on_closing(self) -> None:
+        if not self.confirm_discard():
+            return
         try:
             # First withdraw (hide) all windows
             for window in self.child_windows[:]:

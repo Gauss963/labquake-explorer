@@ -35,6 +35,7 @@ def no_dialogs(monkeypatch):
     monkeypatch.setattr(messagebox, "showinfo", lambda *a, **k: calls.append(a))
     monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **k: True)
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: True)
+    monkeypatch.setattr(messagebox, "askyesnocancel", lambda *a, **k: False)   # "discard" at unsaved changes
     return calls
 
 
