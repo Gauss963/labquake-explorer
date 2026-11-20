@@ -536,6 +536,21 @@ def channel_records(run: dict, result_set: str = DEFAULT_SET) -> dict[str, list]
     return out
 
 
+def refit_store(event: dict, store: dict, record: dict) -> Optional[dict]:
+    """Where a refit of ``record`` (found in ``store``) is written: that store,
+    except the older event-level map, which PZT Spectrum and migration read
+    only as a flat channel map: then the spectrum store of the record the
+    record names (or of the event's only record); None when there is none."""
+    if store is not event.get(PZT_KEY):
+        return store
+    blocks = waveform_blocks(event)
+    key = record.get("record")
+    block = blocks.get(key) if key else (next(iter(blocks.values())) if len(blocks) == 1 else None)
+    if not isinstance(block, dict):
+        return None
+    return block.setdefault(SPECTRUM_KEY, {})
+
+
 def parse_t_star_grid(text) -> np.ndarray:
     """``'from, to, step'`` in microseconds -> the grid in seconds (ValueError when unusable)."""
     parts = [p.strip() for p in str(text or "").replace(";", ",").split(",") if p.strip()]
@@ -894,21 +909,28 @@ class SourceScalingView(RunView):
         if name == self.result_set:
             self.status_var.set("give the refits a set name different from the one scanned")
             return False
-        n_written = 0
+        n_written = n_homeless = 0
+        events = event_list(self.run)
         for channel, items in channel_records(self.run, self.result_set).items():
             scan = self.t_star_scans.get(channel)
             if scan is None or not np.isfinite(scan.best_t_star_s):
                 continue
-            for _, store, record in items:
+            for j, store, record in items:
+                target = refit_store(events[j], store, record)
+                if target is None:
+                    n_homeless += 1
+                    continue
                 try:
                     new = refit_record(record, scan.best_t_star_s)
                 except ValueError:
                     continue
                 new["result_set"] = name
-                ensure_set(store, name)["channels"][channel] = new
+                ensure_set(target, name)["channels"][channel] = new
                 n_written += 1
+        homeless = (f"; {n_homeless} record(s) of the older event-level map name no record to write into "
+                    f"(migrate the file first)") if n_homeless else ""
         if not n_written:
-            self.status_var.set("no record could be refitted")
+            self.status_var.set("no record could be refitted" + homeless)
             return False
         data = self.data_manager.data
         settings = copy.deepcopy(get_setting(data, PZT_SETTING, "sets", self.result_set))
@@ -926,7 +948,7 @@ class SourceScalingView(RunView):
         self.refresh_sets()
         self.set_combo.set(name)
         self.on_set_selected()
-        self.status_var.set(f"{n_written} record(s) refitted with the shared t* into set '{name}'")
+        self.status_var.set(f"{n_written} record(s) refitted with the shared t* into set '{name}'{homeless}")
         return True
 
     def plot_t_star(self) -> None:

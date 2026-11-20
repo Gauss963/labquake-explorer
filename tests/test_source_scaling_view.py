@@ -628,6 +628,8 @@ def test_shared_t_star_scan_and_refit_set(app):
         s = replace(s, amp_binned=s.amp_binned * loss, noise_binned=s.noise_binned * loss)
         rec.update({"spectrum": s.as_dict(), "fmin_hz": 1000.0, "fmax_hz": 50e3, "snr_min": None, "n_fixed": True,
                     "loss": "linear", "n_max": 8.0, "t_star_s": None, "result_set": "default", "field": "pzt_4"})
+        if k > 0:      # the older map's records: the refit goes to the event's (PSU strain) record
+            event["strain"] = {"original": {"time": np.arange(4) * 1e-6, "raw": np.zeros((1, 4))}}
     app.data_manager.data.setdefault("analysis", {})["pzt_spectrum"] = {
         "sets": {"default": {"settings": {"pre_ms": 0.5}, "sensors": {"pzt_4": {"t_star_s": None, "distance_m": 0.1}}}}}
     v = SourceScalingView(app, 0)
@@ -651,13 +653,15 @@ def test_shared_t_star_scan_and_refit_set(app):
     assert not v.save_refits() and "different" in v.status_var.get()
     v.refit_set_var.set("tstar")
     assert v.save_refits(), v.status_var.get()
+    assert "1 record(s) of the older event-level map" in v.status_var.get()     # event 0 has no record to hold it
     assert v.result_set == "tstar" and list(v.set_combo["values"]) == ["default", "tstar"]
-    new = events[0]["pzt_spectrum"]["sets"]["tstar"]["channels"]["ch3"]
-    old = events[0]["pzt_spectrum"]["sets"]["default"]["channels"]["ch3"]
+    assert events[0]["pzt_spectrum"]["version"] == 1 and "sets" not in events[0]["pzt_spectrum"]   # left as it was
+    new = events[1]["strain"]["spectrum"]["sets"]["tstar"]["channels"]["ch3"]
+    old = events[1]["pzt_spectrum"]["channels"]["ch3"]
     assert new["t_star_s"] == pytest.approx(20e-6) and new["result_set"] == "tstar" and new["ensemble"] is None
     assert new["t_star_refit"]["from_set"] == "default"
     assert ts.record_input(old).fit(0.0).fc < 0.5 * new["fit"]["fc"]       # the uncorrected fit sits far too low
-    assert new["fit"]["fc"] == pytest.approx(8e3, rel=0.05) and new["source"]["valid"]
+    assert new["fit"]["fc"] == pytest.approx(10e3, rel=0.05) and new["source"]["valid"]
     assert new["source"]["seismic_moment_nm"] != old["source"]["seismic_moment_nm"]
     sets = app.data_manager.data["analysis"]["pzt_spectrum"]["sets"]
     assert sets["tstar"]["sensors"]["pzt_4"]["t_star_s"] == pytest.approx(20e-6)
