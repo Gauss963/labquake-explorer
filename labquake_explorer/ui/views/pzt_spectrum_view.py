@@ -409,11 +409,11 @@ class PZTSpectrumView(EventView):
         ttk.Label(frame, text="Record:").grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self.record_combobox = ttk.Combobox(frame, width=14, state="readonly")
         self.record_combobox.grid(row=1, column=1, padx=4, pady=2, sticky="w")
-        self.record_combobox.bind("<<ComboboxSelected>>", self.on_record_selected)
+        self.record_combobox.bind("<<ComboboxSelected>>", self._record_chosen)
         ttk.Label(frame, text="Channel:").grid(row=2, column=0, padx=4, pady=2, sticky="e")
         self.channel_combobox = ttk.Combobox(frame, width=14, state="readonly")
         self.channel_combobox.grid(row=2, column=1, padx=4, pady=2, sticky="w")
-        self.channel_combobox.bind("<<ComboboxSelected>>", self.on_channel_selected)
+        self.channel_combobox.bind("<<ComboboxSelected>>", self._channel_chosen)
         ttk.Label(frame, text="Trigger:").grid(row=3, column=0, padx=4, pady=2, sticky="e")
         self.trigger_combobox = ttk.Combobox(frame, width=14, state="readonly", values=list(TRIGGERS))
         self.trigger_combobox.set(TRIGGER_EVENT_TIME)
@@ -424,7 +424,7 @@ class PZTSpectrumView(EventView):
         self.set_combobox.set(DEFAULT_SET)
         self.set_combobox.grid(row=4, column=1, padx=4, pady=2, sticky="w")
         for sequence in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
-            self.set_combobox.bind(sequence, self.on_set_changed, add="+")
+            self.set_combobox.bind(sequence, self._set_chosen, add="+")
         ttk.Label(frame, text="type a new name to start another set (e.g. BAC, EGF)",
                   foreground="#606060").grid(row=5, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w")
 
@@ -669,6 +669,33 @@ class PZTSpectrumView(EventView):
         self.record_combobox.set(self.record_key or "")
         self._load_record()
 
+    def has_unsaved_edits(self) -> bool:
+        """The channel has a saved record and the controls now give a different one."""
+        saved = getattr(self, "_saved_for_compare", None)
+        return (isinstance(saved, dict) and isinstance(self.record, dict)
+                and self.compare_with_saved(saved) != "matches the saved record")
+
+    def _record_chosen(self, event=None) -> None:
+        if self.record_combobox.get().strip() != self.record_key and not self.confirm_leave("open another record"):
+            self.record_combobox.set(self.record_key or "")
+            return
+        self.on_record_selected(event)
+
+    def _channel_chosen(self, event=None) -> None:
+        if not self.confirm_leave("open another channel"):
+            channel = getattr(self, "_shown_channel", None)
+            if channel is not None:
+                self.channel_combobox.set(self._channel_label(channel))
+            return
+        self.on_channel_selected(event)
+
+    def _set_chosen(self, event=None) -> None:
+        typed = self.set_combobox.get().strip()
+        if typed and typed != self.result_set and not self.confirm_leave(f"open result set '{typed}'"):
+            self.set_combobox.set(self.result_set)
+            return
+        self.on_set_changed(event)
+
     def on_record_selected(self, event=None) -> None:
         key = self.record_combobox.get().strip()
         if key and key != self.record_key:
@@ -888,6 +915,7 @@ class PZTSpectrumView(EventView):
         self._clear_channel_state()
         self._saved_for_compare = None
         channel = self.current_channel()
+        self._shown_channel = channel
         rec = self.saved_channels().get(channel) if channel is not None else None
         if not isinstance(rec, dict):
             self.apply_sensor(self.experiment_sensor(channel))      # the sensor's own stored values, if any

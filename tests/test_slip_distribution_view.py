@@ -235,6 +235,15 @@ def test_a_typed_value_is_applied_before_save_navigation_and_dropped_on_close(sl
     view.schedule(view.on_t_shift_edited)
     view.step_sensor(+1)                                  # goes to sensor 2, then the view moves on
     assert view.sensor == 3 and view.t_shift[2] == pytest.approx(0.013) and view.methods[3] == cs.METHOD_MAX_RATE
+    # the arrows ask before the edit (t_i of sensor 2 = 13 ms, not saved) goes; "No" stays
+    from tkinter import messagebox
+    asked = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(messagebox, "askyesno", lambda *a, **k: asked.append(a) or False)
+        assert view.has_unsaved_edits()
+        event_idx = view.event_idx
+        view.next_event_button.invoke()
+        assert len(asked) == 1 and view.event_idx == event_idx and view.t_shift[2] == pytest.approx(0.013)
     view.before_end_var.set("abc")                        # a bad value in an entry is never saved past
     assert not view.save() and "not saved" in view.status_var.get()
     assert view.event["slip_analysis"]["t_shift_s"][2] == pytest.approx(0.0125)

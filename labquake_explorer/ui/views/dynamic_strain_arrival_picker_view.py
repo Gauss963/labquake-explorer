@@ -160,6 +160,7 @@ class DynamicStrainArrivalPickerView(EventView):
         self.locations = []
         self.channel = 0                    # the channel selected in the table
         self.saved_state = None             # (picks, shown, fitting) as saved for this record, or None
+        self.loaded_state = None            # the same, as loaded (what an unsaved record started from)
         self._defaults = {}                 # the record's default for each entry, to tell an edited one
         self._shown_names = []              # the channel names of the record last drawn
         self.pick_set = None                # the pick set shown and saved into (chosen on the first load)
@@ -181,14 +182,14 @@ class DynamicStrainArrivalPickerView(EventView):
         self.build_event_selector(frame, row=0, column=0)
         arrows = ttk.Frame(frame)
         arrows.grid(row=0, column=2, padx=2, sticky="w")
-        self.prev_event_button = ttk.Button(arrows, text="◀", width=2, command=lambda: self.step_event(-1))
+        self.prev_event_button = ttk.Button(arrows, text="◀", width=2, command=lambda: self.step_event_asked(-1))
         self.prev_event_button.pack(side="left")
-        self.next_event_button = ttk.Button(arrows, text="▶", width=2, command=lambda: self.step_event(+1))
+        self.next_event_button = ttk.Button(arrows, text="▶", width=2, command=lambda: self.step_event_asked(+1))
         self.next_event_button.pack(side="left")
         ttk.Label(frame, text="Record:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
         self.record_combobox = ttk.Combobox(frame, width=16, state="readonly")
         self.record_combobox.grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="w")
-        self.record_combobox.bind("<<ComboboxSelected>>", self.on_record_selected)
+        self.record_combobox.bind("<<ComboboxSelected>>", self._record_chosen)
 
         frame = ttk.LabelFrame(left, text="Channels")
         frame.pack(fill="x", pady=4)
@@ -340,7 +341,7 @@ class DynamicStrainArrivalPickerView(EventView):
         self.pick_set_combobox = ttk.Combobox(frame, width=16, values=[DEFAULT_ARRIVAL_SET])   # editable
         self.pick_set_combobox.grid(row=0, column=1, padx=4, pady=2, sticky="w")
         for sequence in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
-            self.pick_set_combobox.bind(sequence, self.on_pick_set_changed, add="+")
+            self.pick_set_combobox.bind(sequence, self._pick_set_chosen, add="+")
         self.save_button = ttk.Button(frame, text="Save", command=self.save)
         self.save_button.grid(row=0, column=2, padx=4, pady=2, sticky="w")
         ttk.Label(frame, text="a saved set loads its picks; a new name keeps the picks shown for Save",
@@ -385,6 +386,28 @@ class DynamicStrainArrivalPickerView(EventView):
     def current_block(self):
         """The record selected in the Record combobox (None without any)."""
         return waveform_block(self.event, self.record_key) if self.record_key else None
+
+    def _record_chosen(self, event=None) -> None:
+        if self.record_combobox.get().strip() != self.record_key and not self.confirm_leave("open another record"):
+            self.record_combobox.set(self.record_key or "")
+            return
+        self.on_record_selected(event)
+
+    def _pick_set_chosen(self, event=None) -> None:
+        """A saved set replaces the picks shown, so ask first; a new name keeps them."""
+        typed = self.pick_set_combobox.get().strip()
+        if (typed and typed != self.pick_set and typed in arrival_sets(self.current_block())
+                and not self.confirm_leave(f"load pick set '{typed}'")):
+            self.pick_set_combobox.set(self.pick_set)
+            return
+        self.on_pick_set_changed(event)
+
+    def has_unsaved_edits(self) -> bool:
+        """Picks, shown/fit choices or the front mode changed since the record was loaded or saved."""
+        if self.picked_idx is None:
+            return False
+        reference = self.saved_state if self.saved_state is not None else self.loaded_state
+        return reference is not None and self.current_state() != reference
 
     def on_record_selected(self, event=None):
         key = self.record_combobox.get().strip()
@@ -653,6 +676,7 @@ class DynamicStrainArrivalPickerView(EventView):
         self.plot()
         self.noise_note_var.set(self.noise_end()[1])
         self.saved_state = self.current_state() if self.picked_idx is not None and picks is not None else None
+        self.loaded_state = self.current_state() if self.picked_idx is not None else None
         self.update_fitted_line()
 
     # ------------------------------------------------------------ defaults

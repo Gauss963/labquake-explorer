@@ -817,3 +817,32 @@ def test_a_record_saved_with_single_opens_unilateral(app_with_strain, view):
     view.on_close()
     reopened = Picker(app_with_strain, 0, 1)
     assert reopened.front_mode_var.get() == "unilateral" and reopened.front_fit.mode == "unilateral"
+
+
+def test_clicks_that_would_drop_unsaved_picks_ask_first(app_with_strain, view, monkeypatch):
+    """The event box, the arrows, the record box and a saved pick set ask before
+    unsaved picks go; "No" keeps them.  The methods a script calls never ask."""
+    from tkinter import messagebox
+    asked = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: asked.append(a) or False)
+    view.pick_peaks()
+    view.save()
+    view.event_combobox.set("2")
+    view.event_combobox.event_generate("<<ComboboxSelected>>")
+    assert asked == [] and view.event_idx == 2                  # nothing unsaved: no question
+    view.event_combobox.set("1")
+    view.event_combobox.event_generate("<<ComboboxSelected>>")
+    view.set_pick(0, view.picked_idx[0] + 5)
+    edited = list(view.picked_idx)
+    view.event_combobox.set("2")
+    view.event_combobox.event_generate("<<ComboboxSelected>>")
+    view.next_event_button.invoke()
+    view.save()
+    view.choose_pick_set("other")                              # a new set keeps the picks shown: no question
+    view.set_pick(0, view.picked_idx[0] + 5)
+    view.pick_set_combobox.set("default")
+    view.pick_set_combobox.event_generate("<<ComboboxSelected>>")
+    assert len(asked) == 3 and view.event_idx == 1 and view.event_combobox.get() == "1"
+    assert view.pick_set == "other" and view.picked_idx[0] == edited[0] + 5
+    view.set_event(2)                                          # a script's call goes ahead
+    assert view.event_idx == 2 and len(asked) == 3
