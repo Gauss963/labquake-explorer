@@ -120,10 +120,18 @@ def test_creep_close_to_the_coseismic_rate_is_flagged():
     sharp, creeping = fw.auto_windows(t, data, EVENT_TIME, shifts, rate)
     assert sharp.creep_ratio < 0.01 and fw.FLAG_CREEP not in sharp.flags
     assert creeping.creep_ratio > fw.DEFAULT_CREEP_RATIO and fw.FLAG_CREEP in creeping.flags
-    k = np.argmin(np.abs(t - EVENT_TIME - shifts[1]))
-    assert creeping.creep_ratio == pytest.approx(creeping.background_rate / rate[1][k])
+    t_i = EVENT_TIME + shifts[1]
+    assert creeping.creep_ratio == pytest.approx(creeping.background_rate / fw.peak_rate(t, rate[1], t_i))
     (w,) = fw.auto_windows(t, data[1:], EVENT_TIME, shifts[1:], rate[1:], creep_ratio=0.9)
     assert fw.FLAG_CREEP not in w.flags
+    # an onset pick (the rate at 20 % of its peak, 1.44 rise times ahead of the max rate, within
+    # min_start_s of it) gives the same ratio and onset as the max-rate pick
+    t, data, rate, shifts = make([dict(step_um=6.0, load_um_s=10.0, rise_s=0.04)])
+    (at_peak,) = fw.auto_windows(t, data, EVENT_TIME, shifts, rate)
+    (onset_pick,) = fw.auto_windows(t, data, EVENT_TIME, [shifts[0] - 1.44 * 0.04], rate)
+    assert at_peak.creep_ratio > fw.DEFAULT_CREEP_RATIO
+    assert onset_pick.creep_ratio == pytest.approx(at_peak.creep_ratio, rel=0.02)
+    assert onset_pick.onset_s == pytest.approx(at_peak.onset_s, abs=2e-3)
 
 
 def test_plateau_start_rejects_a_level_stretch_at_the_end():
