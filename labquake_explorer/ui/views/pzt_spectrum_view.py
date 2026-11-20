@@ -1813,6 +1813,8 @@ class PZTSpectrumView(EventView):
         """Merge the current channel's record into the selected record's
         ``spectrum`` map (keys ``'ch<k>'``).  Channels of this record still in
         the older event-level map move here too, legacy digit keys renamed."""
+        if getattr(self, "_compute_after_id", None) is not None:   # an edit still waiting for the keys to settle
+            self.schedule_compute(now=True)
         if not isinstance(self.record, dict):
             self.status_var.set("nothing to save - the current controls give no spectrum")
             return False

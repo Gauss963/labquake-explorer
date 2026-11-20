@@ -225,6 +225,10 @@ def test_controls_reach_the_analysis_live_and_errors_go_to_status(brune_app, vie
     assert view.record["pre_ms"] == 0.5 and view._compute_after_id is not None
     view.schedule_compute(now=True)                      # what the timer does
     assert view.record["pre_ms"] == 0.6 and view._compute_after_id is None
+    view.pre_var.set("0.55")
+    view.schedule_compute()
+    assert view.save() and view.record["pre_ms"] == 0.55  # Save straight after typing saves what was typed
+    assert stored(view)[f"ch{BRUNE_CH}"]["pre_ms"] == 0.55
     # a combobox and a checkbox recompute at once
     view.taper_combobox.set("bh4")
     view.taper_combobox.event_generate("<<ComboboxSelected>>")
