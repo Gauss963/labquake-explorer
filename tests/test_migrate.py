@@ -222,3 +222,13 @@ def test_version_1_arrivals_become_the_default_pick_set():
     assert M.upgrade_event(event, {}, "e") == ["e: waveform/elsys/arrivals upgraded to version 2 (pick set default)"]
     assert record["arrivals"] == {"version": 2, "current": "default", "sets": {"default": {"picked_idx": [1, 2]}}}
     assert M.upgrade_event(event, {}, "e") == []                        # nothing left to do
+
+
+def test_upgrade_keeps_the_extraction_records_own_picks():
+    """A stale top-level event_indices never overrides the record's picks (the reader prefers the record too)."""
+    from labquake_explorer.data.picks import picked_indices
+    run = {"name": "run1", "event_extraction": {"version": 2, "event_indices": [10, 20, 30]}, "event_indices": [10, 20]}
+    assert picked_indices(run) == [10, 20, 30]
+    M.upgrade_experiment({"runs": [run]})
+    assert picked_indices(run) == [10, 20, 30] and run["event_extraction"]["version"] == 2
+    assert "event_indices" not in run

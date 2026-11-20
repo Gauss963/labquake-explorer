@@ -31,5 +31,6 @@ def test_upgrade_and_ensure_set():
     v1_list = {"version": 1, "channels": [{"channel": 0}]}
     st.upgrade_store(v1_list)
     assert st.set_channels(v1_list) == [{"channel": 0}]
+    assert st.ensure_set(v1_list) == {"channels": {"ch0": {"channel": 0}}}      # writing into it keeps the record
     assert st.ensure_set({}, "x") == {"channels": {}}
     assert not st.upgrade_store("junk")

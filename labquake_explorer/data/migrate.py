@@ -102,9 +102,9 @@ def upgrade_run(run: dict, where: str = "run") -> list:
         if isinstance(legacy_window, Mapping):
             for k, v in legacy_window.items():
                 record.setdefault(k, v)
-        if legacy_picks is not None:
-            record["event_indices"] = [int(i) for i in np.asarray(legacy_picks).ravel()]
-        record["version"] = 1
+        if legacy_picks is not None:      # the record's own picks win, as picks.picked_indices reads them
+            record.setdefault("event_indices", [int(i) for i in np.asarray(legacy_picks).ravel()])
+        record.setdefault("version", 1)
         run[EXTRACTION_KEY] = record
         notes.append(f"{where}: picks and window moved into {EXTRACTION_KEY}")
     if "displacement" in run and is_channel_array(run.get("slip")):
