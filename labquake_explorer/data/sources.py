@@ -728,6 +728,27 @@ def run_sources(run: Mapping) -> dict:
     return {key: value for key, value in run.items() if reference_format(value) is not None}
 
 
+def rebase_references(data: Mapping, old_base, new_base) -> list:
+    """Rewrite the ``filename`` of every run's raw-data reference, relative to
+    ``old_base``, so it points at the same file from ``new_base`` (an
+    experiment saved into another folder).  Returns ``[(ref, old filename)]``
+    so a failed save can put them back."""
+    changed = []
+    runs = data.get("runs") if isinstance(data, Mapping) else None
+    for run in runs if isinstance(runs, list) else []:
+        if not isinstance(run, dict):
+            continue
+        for ref in run_sources(run).values():
+            name = str(ref.get("filename", ""))
+            if not name or os.path.isabs(name):
+                continue
+            moved = os.path.relpath(os.path.normpath(Path(old_base) / name), Path(new_base))
+            if moved != name:
+                changed.append((ref, ref["filename"]))
+                ref["filename"] = moved
+    return changed
+
+
 def open_source(ref: Mapping, base_dir, run: Optional[Mapping] = None) -> Source:
     """The :class:`Source` a reference points at.  A reference stored without
     ``time_offset`` in a run with a time base gets its offset from the

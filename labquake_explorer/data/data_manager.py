@@ -1,12 +1,14 @@
 """Data management and processing for Labquake Explorer"""
+import hashlib
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import numpy as np
 import h5py
 from labquake_explorer.data.event_processor import EventProcessor
-from labquake_explorer.data.sources import run_time
+from labquake_explorer.data.sources import rebase_references, run_time
 from labquake_explorer.data.stamp import stamp
 
 # HDF5 group attribute recording whether a group was written from a dict or a
@@ -19,23 +21,65 @@ class DataManager:
     def __init__(self):
         self.data: Optional[Dict[str, Any]] = None
         self.data_path: Optional[Path] = None
-        self.data: Optional[Dict[str, Any]] = None
         self.event_processor = EventProcessor()
         self._derived_time: List[Dict[str, Any]] = []   # runs whose 'time' was filled in on load
-
+        # paths of the HDF5 members that could not be read on the last load;
+        # saving over that file would erase them, so save_file refuses it
+        self.load_errors: List[str] = []
+        self._saved_fingerprint: Optional[str] = None
 
     def load_file(self, path: Path) -> None:
-        """Load data from a file"""
-        self.data_path = path
-        self.event_processor.set_data_path(path)  # Set the data path in EventProcessor
-
+        """Load data from a file.  The current data and path change only when
+        the whole read succeeds.  Members that cannot be read are listed in
+        ``load_errors`` (the rest of the file still loads)."""
+        path = Path(path)
+        errors: List[str] = []
         if path.suffix.lower() == '.npz':
-            self._load_npz(path)
+            data = self._load_npz(path)
         elif path.suffix.lower() in ['.h5', '.hdf5']:
-            self._load_hdf5(path)
+            data = self._load_hdf5(path, errors)
         else:
             raise ValueError(f"Unsupported file type: {path.suffix}")
+        self.data = data
+        self.data_path = path
+        self.load_errors = errors
+        self.event_processor.set_data_path(path)
         self._fill_run_times()
+        self._saved_fingerprint = self.fingerprint()
+
+    def fingerprint(self) -> Optional[str]:
+        """A hash of the whole experiment (keys, values and array bytes), to
+        tell whether anything changed since the last load or save."""
+        if self.data is None:
+            return None
+        h = hashlib.blake2b(digest_size=16)
+
+        def walk(value):
+            if isinstance(value, dict):
+                h.update(b"{")
+                for k, v in value.items():
+                    h.update(repr(k).encode())
+                    walk(v)
+                h.update(b"}")
+            elif isinstance(value, (list, tuple)):
+                h.update(b"[")
+                for v in value:
+                    walk(v)
+                h.update(b"]")
+            elif isinstance(value, np.ndarray) and value.dtype != object:
+                h.update(f"{value.dtype}{value.shape}".encode())
+                h.update(np.ascontiguousarray(value).view(np.uint8).ravel())
+            elif isinstance(value, np.ndarray):
+                walk(value.tolist())
+            else:
+                h.update(repr(value).encode())
+
+        walk(self.data)
+        return h.hexdigest()
+
+    def modified(self) -> bool:
+        """True when the data differs from what was last loaded or saved."""
+        return self.data is not None and self.fingerprint() != self._saved_fingerprint
 
     def _fill_run_times(self) -> None:
         """Give every run stored without ``time`` the axis its time base implies
@@ -50,19 +94,20 @@ class DataManager:
                     run["time"] = time
                     self._derived_time.append(run)
 
-    def _load_npz(self, path: Path) -> None:
-        """Load data from NPZ file"""
+    @staticmethod
+    def _load_npz(path: Path) -> dict:
         with np.load(path, allow_pickle=True) as data:
-            self.data = data["experiment"][()]
-
-    def _load_hdf5(self, path: Path) -> None:
-        with h5py.File(path, 'r') as h5data:
-            self.data = self._load_h5_group(h5data)
+            return data["experiment"][()]
 
     @classmethod
-    def _load_h5_item(cls, item):
+    def _load_hdf5(cls, path: Path, errors: Optional[list] = None) -> dict:
+        with h5py.File(path, 'r') as h5data:
+            return cls._load_h5_group(h5data, [] if errors is None else errors)
+
+    @classmethod
+    def _load_h5_item(cls, item, errors: list):
         if isinstance(item, h5py.Group):
-            return cls._load_h5_group(item)
+            return cls._load_h5_group(item, errors)
         return cls._load_h5_dataset(item)
 
     @staticmethod
@@ -70,21 +115,17 @@ class DataManager:
         """Datasets come back as numpy arrays; scalars as Python scalars.
         String datasets come back as ``str`` when 0-d and as a ``list`` of
         ``str`` otherwise (so a one-element string list stays a list)."""
-        try:
-            data = np.array(item)
-            if data.dtype.kind in ('S', 'O'):
-                if data.size == 0:
-                    return []
-                if isinstance(data.flat[0], bytes):
-                    if data.ndim == 0:
-                        return data.flat[0].decode('utf-8')
-                    return [x.decode('utf-8') for x in data.flat]
-            if data.ndim == 0:  # scalar dataset
-                return data.item()
-            return data
-        except Exception as exc:
-            print(f"Dataset loading error: {str(exc)}")
-            return None
+        data = np.array(item)
+        if data.dtype.kind in ('S', 'O'):
+            if data.size == 0:
+                return []
+            if isinstance(data.flat[0], bytes):
+                if data.ndim == 0:
+                    return data.flat[0].decode('utf-8')
+                return [x.decode('utf-8') for x in data.flat]
+        if data.ndim == 0:  # scalar dataset
+            return data.item()
+        return data
 
     _SLASH = "%2F"      # '/' is the HDF5 path separator, so dict keys containing it are escaped
 
@@ -97,7 +138,7 @@ class DataManager:
         return name.replace(cls._SLASH, "/")
 
     @classmethod
-    def _load_h5_group(cls, group):
+    def _load_h5_group(cls, group, errors: list):
         """Groups written from a list come back as lists, groups written from
         a dict as dicts (``CONTAINER_ATTR``).  Without the marker (files from
         older versions) groups whose keys are exactly 0..n-1 become lists."""
@@ -108,13 +149,13 @@ class DataManager:
         if container == "list" or (container is None and keys and all(k.isdigit() for k in keys)):
             indices = sorted(int(k) for k in keys)
             if indices == list(range(len(indices))):
-                return [cls._load_h5_item(group[str(i)]) for i in indices]
+                return [cls._load_h5_item(group[str(i)], errors) for i in indices]
         result = {}
         for key in keys:
             try:
-                result[cls._unescape_key(key)] = cls._load_h5_item(group[key])
+                result[cls._unescape_key(key)] = cls._load_h5_item(group[key], errors)
             except Exception as exc:
-                print(f"Error loading {key}: {str(exc)}")
+                errors.append(f"{group.name.rstrip('/')}/{key}: {exc}")
         return result
 
     def save_file(self, path: Path) -> None:
@@ -124,18 +165,30 @@ class DataManager:
         after the whole tree has been written, so a failure part-way through
         never leaves a truncated file behind (the usual flow overwrites the
         file that was just loaded).  Any other suffix raises ``ValueError``
-        instead of silently writing nothing.  The top-level ``labquake_explorer``
+        instead of silently writing nothing, and a value of a type it cannot
+        store raises ``TypeError`` (the old file stays).  Saving over a file
+        whose last load missed parts (``load_errors``) raises ``ValueError``.
+        Saved into another folder, the runs' raw-data references are rewritten
+        to point at the same files from there.  The top-level ``labquake_explorer``
         dict is refreshed first: the package version writing the file and when
         (``labquake_explorer.data.stamp``).
         """
         if not self.data:
             raise ValueError("No data to save")
-        stamp(self.data)
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_SUFFIXES:
             raise ValueError(f"Unsupported file type: {path.suffix!r} "
                              f"(use one of {', '.join(SUPPORTED_SUFFIXES)})")
+        if self.load_errors and self.data_path is not None and path.resolve() == self.data_path.resolve():
+            raise ValueError(f"{len(self.load_errors)} parts of {path.name} could not be read on load "
+                             f"and saving over it would erase them; save to another file "
+                             f"(first: {self.load_errors[0]})")
+        stamp(self.data)
+        old_base = self.data_path.parent if self.data_path is not None else None
+        rebased = []
+        if old_base is not None and old_base.resolve() != path.parent.resolve():
+            rebased = rebase_references(self.data, old_base, path.parent)
 
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=suffix)
         os.close(fd)
@@ -150,16 +203,24 @@ class DataManager:
                     f.attrs[CONTAINER_ATTR] = "dict"
                     for k, v in self.data.items():
                         self._save_h5_item(f, k, v)
+            if path.exists():   # mkstemp makes the file owner-only; keep the old file's mode
+                os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
             os.replace(tmp, path)
         except BaseException:
             try:
                 tmp.unlink()
             except OSError:
                 pass
+            for ref, name in rebased:
+                ref["filename"] = name
             raise
         finally:
             for run, time in derived:
                 run["time"] = time
+        self.data_path = path
+        self.load_errors = []
+        self.event_processor.set_data_path(path)
+        self._saved_fingerprint = self.fingerprint()
 
     @classmethod
     def _save_h5_item(cls, group, key, value) -> None:
@@ -226,45 +287,12 @@ class DataManager:
             group.create_dataset(key, data=value)
         else:
             try:
-                group.create_dataset(key, data=np.array(value))
+                arr = np.array(value)
             except (ValueError, TypeError) as e:
-                print(f"Warning: Could not save {key}: {e}")
-
-    def extract_events(self, indices: List[int], window_size: float) -> List[Dict]:
-        """Extract events using provided indices"""
-        if not self.data:
-            raise ValueError("No data loaded")
-            
-        events = []
-        for idx in indices:
-            event = self._extract_single_event(idx, window_size)
-            events.append(event)
-        return events
-
-    def _extract_single_event(self, idx: int, window: float) -> Dict:
-        """Extract single event data"""
-        event_time = self.data["time"][idx]
-        
-        idx_beg = np.argmin(np.abs(event_time - window - self.data["time"]))
-        idx_end = np.argmin(np.abs(event_time + window - self.data["time"]))
-        idx_event = range(idx_beg, idx_end + 1)
-        
-        event = {
-            'event_time': event_time,
-            'time': self.data['time'][idx_event]
-        }
-        
-        for key, value in self.data.items():
-            if key != "events" and isinstance(value, (np.ndarray, list)):
-                try:
-                    event[key] = value[idx_event]
-                except IndexError:
-                    event[key] = value[idx]
-                    
-        if 'strain' in self.data:
-            event['strain'] = self._process_strain_data(event_time, window)
-            
-        return event
+                raise TypeError(f"cannot save {group.name}/{key} ({type(value).__name__}): {e}") from e
+            if arr.dtype == object:
+                raise TypeError(f"cannot save {group.name}/{key}: {type(value).__name__} is not a supported type")
+            group.create_dataset(key, data=arr)
 
     def get_data(self, path: str) -> Any:
         """Get data at specified path (e.g. 'runs/[0]/events/[3]/shear_stress')."""
