@@ -113,16 +113,6 @@ def _phase(phase: str) -> str:
     return p
 
 
-def _unit(name: str, vec) -> np.ndarray:
-    v = np.asarray(vec, dtype=float).ravel()
-    if v.shape != (3,) or not np.all(np.isfinite(v)):
-        raise ValueError(f"{name} must be a finite 3-vector")
-    norm = float(np.linalg.norm(v))
-    if norm == 0.0:
-        raise ValueError(f"{name} must have non-zero length")
-    return v / norm
-
-
 # ----------------------------------------------------------------------------
 # elementary relations
 # ----------------------------------------------------------------------------
@@ -147,29 +137,10 @@ def seismic_moment(omega0_ms: float, rho: float, c: float, distance_m: float,
     return 4.0 * math.pi * rho * c ** 3 * distance * omega0 / (f * s)
 
 
-def plateau_from_moment(m0_nm: float, rho: float, c: float, distance_m: float,
-                        radiation_coefficient: float, free_surface_factor: float = 1.0) -> float:
-    """Inverse of :func:`seismic_moment`: the displacement plateau (m*s) for a given M0."""
-    m0 = _positive("m0_nm", m0_nm)
-    rho = _positive("rho", rho)
-    c = _positive("c", c)
-    distance = _positive("distance_m", distance_m)
-    f = abs(_finite("radiation_coefficient", radiation_coefficient))
-    if f == 0.0:
-        raise ValueError("radiation_coefficient must be non-zero (sensor at a node)")
-    s = _positive("free_surface_factor", free_surface_factor)
-    return m0 * f * s / (4.0 * math.pi * rho * c ** 3 * distance)
-
-
 def moment_magnitude(m0_nm: float) -> float:
     """``Mw = (2/3) (log10 M0 - 9.1)`` (Hanks & Kanamori 1979, IASPEI form)."""
     m0 = _positive("m0_nm", m0_nm)
     return (2.0 / 3.0) * (math.log10(m0) - 9.1)
-
-
-def moment_from_magnitude(mw: float) -> float:
-    """Inverse of :func:`moment_magnitude`."""
-    return 10.0 ** (1.5 * _finite("mw", mw) + 9.1)
 
 
 def source_radius(fc_hz: float, vs: float, k: float) -> float:
@@ -190,133 +161,6 @@ def wavenumber_distance(f_hz: float, distance_m: float, c: float) -> float:
 def far_field_ok(kR: float) -> bool:
     """True when ``kR >= FAR_FIELD_KR`` (far-field approximation acceptable)."""
     return bool(np.isfinite(kR) and kR >= FAR_FIELD_KR)
-
-
-# ----------------------------------------------------------------------------
-# radiation pattern, free surface, geometry
-# ----------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class RadiationPattern:
-    """Double-couple radiation coefficients for one take-off direction."""
-    p: float               # signed: 2 (n.g)(s.g)
-    s: float               # magnitude: |(n.g) s + (s.g) n - 2 (n.g)(s.g) g|
-    p_near_node: bool      # |p| < NODE_THRESHOLD
-
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-
-def radiation_pattern(fault_normal, slip_direction, ray_direction) -> RadiationPattern:
-    """P and S radiation coefficients of a double couple.
-
-    All three arguments are 3-vectors (normalised here).  ``ray_direction``
-    points from the source towards the sensor.  The P coefficient is signed
-    (polarity); the S coefficient is the magnitude of the vector S pattern.
-    """
-    n = _unit("fault_normal", fault_normal)
-    s = _unit("slip_direction", slip_direction)
-    g = _unit("ray_direction", ray_direction)
-    ng = float(n @ g)
-    sg = float(s @ g)
-    r_p = 2.0 * ng * sg
-    r_s = float(np.linalg.norm(ng * s + sg * n - 2.0 * ng * sg * g))
-    return RadiationPattern(float(r_p), r_s, abs(r_p) < NODE_THRESHOLD)
-
-
-def radiation_coefficient(phase: str, fault_normal, slip_direction, ray_direction) -> float:
-    """Radiation coefficient for ``phase``: signed ``R_P`` or ``R_S`` magnitude.
-
-    ``|R_P| < 0.2`` means the sensor lies near a P node; the moment derived
-    from such a sensor is very sensitive to the assumed geometry.
-    """
-    pat = radiation_pattern(fault_normal, slip_direction, ray_direction)
-    return pat.p if _phase(phase) == "P" else pat.s
-
-
-def free_surface_amplification(incidence_deg, vp: float, vs: float):
-    """Vertical-component free-surface response to an incident plane P wave.
-
-    Aki & Richards (2002, eq. 5.30 family): with ray parameter
-    ``p = sin(i)/vp``, ``eta_a = cos(i)/vp``, ``eta_b = sqrt(1/vs^2 - p^2)``,
-    ``D = (1/vs^2 - 2 p^2)^2 + 4 p^2 eta_a eta_b``, the vertical displacement
-    at the surface per unit incident P amplitude is
-    ``u_z = 2 vp eta_a (1/vs^2 - 2 p^2) / (vs^2 D)``.
-
-    Equals 2.0 at normal incidence, ~1.0 at 60 degrees for a Poisson solid,
-    and 0.0 at grazing incidence (90 degrees).  ``incidence_deg`` may be a
-    scalar or array in [0, 90]; a scalar input gives a float.  NaN entries
-    (``Geometry.incidence_deg`` when no sensor normal was given) propagate to
-    NaN instead of raising; finite angles outside [0, 90] and infinities
-    raise ``ValueError``.  ``vs >= vp`` raises.
-
-    The factor is non-negative for every angle when ``vp/vs >= sqrt(2)``
-    (``1/vs^2 - 2 p^2 >= 2 cos^2(i)/vp^2``); for smaller, unphysical ratios
-    it becomes NEGATIVE at steep incidence.  So the return value can be 0
-    (grazing), negative (bad vp/vs) or NaN (unknown incidence), none of which
-    can divide a moment.  :func:`source_parameters` therefore returns
-    ``valid=False`` (it never raises) for such a factor.  View guidance: pass
-    ``free_surface_factor=1.0`` when the sensor is not on a free surface or
-    the incidence is unknown, and treat incidence >= ~85 degrees as unusable
-    (the response collapses towards 0 there and the moment blows up).
-    """
-    vp = _positive("vp", vp)
-    vs = _positive("vs", vs)
-    if vs >= vp:
-        raise ValueError("vs must be smaller than vp")
-    inc = np.asarray(incidence_deg, dtype=float)
-    known = ~np.isnan(inc)
-    if np.any(np.isinf(inc)) or np.any(inc[known] < 0.0) or np.any(inc[known] > 90.0):
-        raise ValueError("incidence_deg must be within [0, 90] (NaN propagates)")
-    i = np.radians(inc)
-    p = np.sin(i) / vp
-    eta_a = np.cos(i) / vp
-    eta_b = np.sqrt(np.maximum(1.0 / vs ** 2 - p ** 2, 0.0))
-    d = (1.0 / vs ** 2 - 2.0 * p ** 2) ** 2 + 4.0 * p ** 2 * eta_a * eta_b
-    u_z = 2.0 * vp * eta_a * (1.0 / vs ** 2 - 2.0 * p ** 2) / (vs ** 2 * d)
-    u_z = np.where(inc >= 90.0, 0.0, u_z)       # NaN >= 90 is False: NaN stays NaN
-    return float(u_z) if u_z.ndim == 0 else u_z
-
-
-@dataclass(frozen=True)
-class Geometry:
-    """Source-receiver geometry in SI units."""
-    distance_m: float
-    ray: tuple[float, float, float]     # unit vector from source to sensor
-    incidence_deg: float                # arccos(|n_sensor . ray|); NaN without a normal
-
-    def as_dict(self) -> dict:
-        return {"distance_m": self.distance_m, "ray": list(self.ray),
-                "incidence_deg": self.incidence_deg}
-
-
-def geometry(sensor_xyz_m, source_xyz_m, sensor_normal=None) -> Geometry:
-    """Distance, take-off ray (source -> sensor) and incidence angle at the sensor.
-
-    Coordinates are in METRES (the view converts from cm).  The incidence
-    angle is measured from the sensor's own normal, so a sensor whose normal
-    points at the source has incidence 0.  Without ``sensor_normal`` the
-    incidence is NaN (and :func:`free_surface_amplification` then returns
-    NaN: use a free-surface factor of 1.0 in that case).  Coincident points
-    raise.
-    """
-    sensor = np.asarray(sensor_xyz_m, dtype=float).ravel()
-    source = np.asarray(source_xyz_m, dtype=float).ravel()
-    if sensor.shape != (3,) or source.shape != (3,):
-        raise ValueError("sensor_xyz_m and source_xyz_m must be 3-vectors")
-    if not (np.all(np.isfinite(sensor)) and np.all(np.isfinite(source))):
-        raise ValueError("coordinates must be finite")
-    d = sensor - source
-    distance = float(np.linalg.norm(d))
-    if distance == 0.0:
-        raise ValueError("sensor and source coincide (zero distance)")
-    ray = d / distance
-    if sensor_normal is None:
-        incidence = float("nan")
-    else:
-        n = _unit("sensor_normal", sensor_normal)
-        incidence = float(np.degrees(np.arccos(np.clip(abs(float(n @ ray)), 0.0, 1.0))))
-    return Geometry(distance, tuple(float(v) for v in ray), incidence)
 
 
 # ----------------------------------------------------------------------------

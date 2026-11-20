@@ -750,13 +750,6 @@ def load_q_csv(path: Union[str, Path], travel_time_s: float, hold_ends: bool = F
                                    travel_time_s, source=str(path), hold_ends=hold_ends)
 
 
-def t_star_from_q(distance_m: float, q: float, c: float) -> float:
-    """``t* = distance / (Q * c)`` in seconds."""
-    if not (q > 0 and c > 0 and distance_m >= 0):
-        raise ValueError("Q and c must be > 0 and distance >= 0")
-    return float(distance_m) / (float(q) * float(c))
-
-
 # ---------------------------------------------------------------------------
 # spectrum
 # ---------------------------------------------------------------------------
@@ -1224,6 +1217,6 @@ __all__ = [
     "WindowResult", "Calibration", "SpectrumResult", "SpectralFit",
     "sampling_rate", "extract_window", "taper_window", "load_calibration_csv",
     "csv_gain_is_db", "Attenuation", "load_q_csv",
-    "t_star_from_q", "compute_spectrum", "bin_spectrum", "fit_omega_n",
+    "compute_spectrum", "bin_spectrum", "fit_omega_n",
     "brune_spectrum", "brune_pulse",
 ]

@@ -270,9 +270,6 @@ def test_t_star_and_attenuation_table_corrections():
     np.testing.assert_allclose(s1.amp_signal, s0.amp_signal * corr, rtol=1e-12)
     np.testing.assert_allclose(s1.amp_noise, s0.amp_noise * corr, rtol=1e-12)
     assert s1.t_star_s == 2e-6 and s1.meta["t_star_s"] == 2e-6
-    assert sp.t_star_from_q(0.1, 50.0, 5000.0) == pytest.approx(0.1 / (50 * 5000))
-    with pytest.raises(ValueError):
-        sp.t_star_from_q(0.1, 0.0, 5000.0)
     with pytest.raises(ValueError):
         sp.compute_spectrum(w, t_star_s=-1.0)
     # a Q(f) table: the same factor per frequency, signal and noise; not together with t*

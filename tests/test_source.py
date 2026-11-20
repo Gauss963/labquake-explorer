@@ -5,10 +5,8 @@ import numpy as np
 import pytest
 
 from labquake_explorer.analysis.source import (
-    PHASE_CONSTANTS, PLATEAU_UNAVAILABLE_WARNING, Geometry, RadiationPattern, SourceParameters,
-    far_field_ok, free_surface_amplification, geometry, moment_from_magnitude,
-    moment_magnitude, plateau_from_moment, radiation_coefficient, radiation_pattern,
-    seismic_moment, source_parameters, source_radius, stress_drop_eshelby,
+    PHASE_CONSTANTS, PLATEAU_UNAVAILABLE_WARNING, SourceParameters, far_field_ok,
+    moment_magnitude, seismic_moment, source_parameters, source_radius, stress_drop_eshelby,
     wavenumber_distance,
 )
 
@@ -25,11 +23,9 @@ def test_scalar_relations():
     assert stress_drop_eshelby(1.0, 0.01) == pytest.approx(437.5e3)
     assert moment_magnitude(10 ** 9.1) == pytest.approx(0.0, abs=1e-12)
     assert moment_magnitude(10 ** 10.6) == pytest.approx(1.0)
-    assert moment_from_magnitude(moment_magnitude(3.7e2)) == pytest.approx(3.7e2)
     omega0 = 2.5e-9
     m0 = seismic_moment(omega0, RHO, VP, 0.05, 0.8, 1.5)
     assert m0 == pytest.approx(4 * math.pi * RHO * VP ** 3 * 0.05 * omega0 / (0.8 * 1.5))
-    assert plateau_from_moment(m0, RHO, VP, 0.05, 0.8, 1.5) == pytest.approx(omega0)
     # polarity sign of the radiation coefficient does not change the moment
     assert seismic_moment(omega0, RHO, VP, 0.05, -0.8) == seismic_moment(omega0, RHO, VP, 0.05, 0.8)
     assert source_radius(50e3, VS, 0.32) == pytest.approx(0.32 * VS / 50e3)
@@ -44,84 +40,12 @@ def test_bad_inputs_raise():
         r(seismic_moment, omega0, RHO, VP, 0.05, 0.8)
     r(seismic_moment, 1e-9, RHO, VP, 0.05, 0.0)                # node
     r(seismic_moment, 1e-9, RHO, VP, 0.05, 0.8, 0.0)           # bad free-surface factor (strict low-level API)
-    r(radiation_pattern, (0, 0, 0), (1, 0, 0), (0, 0, 1))
-    r(radiation_pattern, (0, 0, 1), (1, 0), (0, 0, 1))
-    r(radiation_coefficient, "Rayleigh", (0, 0, 1), (1, 0, 0), (0, 0, 1))
-    for incidence in (95.0, -1.0, float("inf")):
-        r(free_surface_amplification, incidence, VP, VS)
-    r(free_surface_amplification, 10.0, VS, VP)                # vs >= vp
-    r(geometry, (1.0, 2.0, 3.0), (1.0, 2.0, 3.0))
-    r(geometry, (1.0, 2.0), (0.0, 0.0, 0.0))
     r(source_parameters, 1e-10, 40e3, "L", RHO, VP, VS, 0.05, 0.8)
     r(source_parameters, 1e-10, 40e3, "P", 0.0, VP, VS, 0.05, 0.8)
     r(source_parameters, 1e-10, 40e3, "P", RHO, VP, VS, -0.05, 0.8)
     r(source_parameters, 1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.8, k=-1.0)
     r(source_parameters, 1e-10, 40e3, "P", RHO, VP, VS, 0.05, NAN)
     r(source_parameters, 2.5, 4000.0, "P", None, None, None, None, moment_spectrum=True)   # Vs still required
-
-
-def test_radiation_pattern():
-    n, s = (0, 0, 1), (1, 0, 0)
-    pat = radiation_pattern(n, s, (0, 0, 1))                   # fault normal: P node, S maximum
-    assert pat.p == pytest.approx(0.0) and pat.s == pytest.approx(1.0) and pat.p_near_node
-    assert radiation_coefficient("P", n, s, (0, 0, 1)) == pytest.approx(0.0)
-    assert radiation_coefficient("S", n, s, (0, 0, 1)) == pytest.approx(1.0)
-    pat = radiation_pattern(n, s, (1, 0, 1))                   # 45 degrees, not normalised on purpose
-    assert pat.p == pytest.approx(1.0) and pat.s == pytest.approx(0.0, abs=1e-12) and not pat.p_near_node
-    # opposite quadrant: polarity flips, magnitude preserved
-    assert radiation_pattern(n, s, (-1, 0, 1)).p == pytest.approx(-1.0)
-    # sensor in the fault plane along the slip direction: n.g = 0 -> P node, S = |n| = 1
-    pat = radiation_pattern(n, s, (1, 0, 0))
-    assert pat.p == pytest.approx(0.0) and pat.s == pytest.approx(1.0)
-    assert isinstance(RadiationPattern(1.0, 0.0, False).as_dict(), dict)
-    # RMS over the focal sphere matches the constants
-    g = np.random.default_rng(0).normal(size=(200000, 3))
-    g /= np.linalg.norm(g, axis=1)[:, None]
-    n, s = np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])
-    ng, sg = g @ n, g @ s
-    rp = 2 * ng * sg
-    rs = np.linalg.norm(ng[:, None] * s + sg[:, None] * n - (2 * ng * sg)[:, None] * g, axis=1)
-    assert math.sqrt(np.mean(rp ** 2)) == pytest.approx(PHASE_CONSTANTS["P"]["radiation_rms"], rel=0.01)
-    assert math.sqrt(np.mean(rs ** 2)) == pytest.approx(PHASE_CONSTANTS["S"]["radiation_rms"], rel=0.01)
-    pat = radiation_pattern(n, s, g[0])                        # the vectorised check agrees with the function
-    assert pat.p == pytest.approx(rp[0]) and pat.s == pytest.approx(rs[0])
-
-
-# Poisson solid (vp/vs = sqrt 3), incidence 0..85 deg in steps of 5
-FREE_SURFACE_TABLE = (2.00, 1.99, 1.96, 1.92, 1.86, 1.79, 1.70, 1.60, 1.49, 1.38,
-                      1.26, 1.14, 1.02, 0.90, 0.79, 0.67, 0.54, 0.35)
-
-
-def test_free_surface_amplification():
-    vp, vs = math.sqrt(3.0), 1.0
-    angles = np.arange(0, 90, 5)
-    values = free_surface_amplification(angles, vp, vs)
-    assert values.shape == angles.shape and np.all(np.abs(values - np.array(FREE_SURFACE_TABLE)) < 0.03)
-    assert free_surface_amplification(0.0, vp, vs) == pytest.approx(2.0)
-    assert free_surface_amplification(60.0, vp, vs) == pytest.approx(1.0, abs=0.03)
-    assert free_surface_amplification(90.0, vp, vs) == 0.0
-    assert isinstance(free_surface_amplification(30.0, vp, vs), float)
-    # scale invariance: only vp/vs matters
-    assert free_surface_amplification(40.0, VP, VP / math.sqrt(3)) == pytest.approx(
-        free_surface_amplification(40.0, vp, vs))
-    # a NaN incidence (geometry without a sensor normal) propagates instead of crashing a view loop
-    out = free_surface_amplification(NAN, VP, VS)
-    assert isinstance(out, float) and math.isnan(out)
-    arr = free_surface_amplification(np.array([0.0, NAN, 90.0]), VP, VS)
-    assert arr[0] == pytest.approx(2.0) and math.isnan(arr[1]) and arr[2] == 0.0
-    # vp/vs = 1.154 < sqrt(2): the response changes sign at steep incidence; non-negative for a physical ratio
-    assert free_surface_amplification(80.0, 1500.0, 1300.0) < 0.0
-    assert np.all(free_surface_amplification(np.linspace(0, 90, 91), VP, VS) >= 0.0)
-
-
-def test_geometry():
-    g = geometry(sensor_xyz_m=(0.0, 0.0, 0.05), source_xyz_m=(0.0, 0.0, 0.0), sensor_normal=(0.0, 0.0, -1.0))
-    assert isinstance(g, Geometry) and g.distance_m == pytest.approx(0.05)
-    assert g.ray == pytest.approx((0.0, 0.0, 1.0)) and g.as_dict()["ray"] == [0.0, 0.0, 1.0]
-    assert g.incidence_deg == pytest.approx(0.0)               # normal sign does not matter
-    g = geometry((0.05, 0.0, 0.05), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
-    assert g.distance_m == pytest.approx(0.05 * math.sqrt(2)) and g.incidence_deg == pytest.approx(45.0)
-    assert math.isnan(geometry((0.0, 0.0, 0.05), (0.0, 0.0, 0.0)).incidence_deg)
 
 
 def test_source_parameters_p_and_s_phases():
@@ -144,15 +68,8 @@ def test_source_parameters_p_and_s_phases():
     assert sp.source_radius_m == pytest.approx(0.372 * VS / 40e3)
     assert math.isnan(sp.kR) and sp.far_field_ok is None
     assert sp.constants["f_plateau_hz"] is None and sp.warnings == []
-    omega0 = plateau_from_moment(0.5, RHO, VP, 0.04, 0.7)              # round trip through the plateau
-    assert source_parameters(omega0, 30e3, "P", RHO, VP, VS, 0.04, 0.7).seismic_moment_nm == pytest.approx(0.5)
-    # end to end: fault in the x-y plane at z=0, slip along x, sensor on the free surface at 45 deg
-    geo = geometry((0.03, 0.0, 0.03), (0.0, 0.0, 0.0), sensor_normal=(0, 0, 1))
-    rad = radiation_coefficient("P", (0, 0, 1), (1, 0, 0), geo.ray)
-    fsf = free_surface_amplification(geo.incidence_deg, VP, VS)
-    assert rad == pytest.approx(1.0) and geo.incidence_deg == pytest.approx(45.0)
-    sp = source_parameters(1e-10, 60e3, "P", RHO, VP, VS, geo.distance_m, rad, fsf, f_plateau_hz=10e3)
-    assert sp.valid and sp.seismic_moment_nm == pytest.approx(seismic_moment(1e-10, RHO, VP, geo.distance_m, rad, fsf))
+    sp = source_parameters(1e-10, 60e3, "P", RHO, VP, VS, 0.042, 1.0, 1.5, f_plateau_hz=10e3)
+    assert sp.valid and sp.seismic_moment_nm == pytest.approx(seismic_moment(1e-10, RHO, VP, 0.042, 1.0, 1.5))
 
 
 def test_source_parameters_warnings():
@@ -178,15 +95,14 @@ def test_source_parameters_invalid_without_raising():
         json.dumps(sp.as_dict())
     node = source_parameters(1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.0)
     assert not node.valid and "node" in node.reason
-    # grazing incidence: the analytic free-surface response is exactly 0
-    sp = source_parameters(1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.8,
-                           free_surface_factor=free_surface_amplification(90.0, VP, VS))
+    # grazing incidence: the free-surface response is exactly 0
+    sp = source_parameters(1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.8, free_surface_factor=0.0)
     assert not sp.valid and "free-surface" in sp.reason and "grazing" in sp.reason
     assert math.isnan(sp.seismic_moment_nm) and sp.far_field_ok is None
     assert sp.constants["free_surface_factor"] == 0.0 and sp.warnings == []
     json.dumps(sp.as_dict())
     # vp/vs < sqrt(2): negative factor; invalid AND the vp/vs warning still fires
-    neg = free_surface_amplification(80.0, 1500.0, 1300.0)
+    neg = -0.3
     sp = source_parameters(1e-10, 40e3, "P", RHO, 1500.0, 1300.0, 0.05, 0.8, free_surface_factor=neg, f_plateau_hz=NAN)
     assert not sp.valid and "free-surface" in sp.reason and sp.constants["free_surface_factor"] == pytest.approx(neg)
     assert "vp/vs" in " | ".join(sp.warnings) and PLATEAU_UNAVAILABLE_WARNING in sp.warnings
@@ -195,12 +111,10 @@ def test_source_parameters_invalid_without_raising():
         assert not sp.valid and "free-surface" in sp.reason
         assert math.isnan(sp.seismic_moment_nm) and math.isnan(sp.stress_drop_pa)
         json.dumps(sp.as_dict())
-    # the whole chain from geometry without a sensor normal must not raise; the documented fallback 1.0 is valid
-    geo = geometry((0.0, 0.0, 0.05), (0.0, 0.0, 0.0))
-    fsf = free_surface_amplification(geo.incidence_deg, VP, VS)
-    sp = source_parameters(1e-10, 40e3, "P", RHO, VP, VS, geo.distance_m, 0.8, free_surface_factor=fsf)
+    # an unknown incidence (NaN factor) must not raise; the documented fallback 1.0 is valid
+    sp = source_parameters(1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.8, free_surface_factor=NAN)
     assert not sp.valid and "incidence" in sp.reason
-    assert source_parameters(1e-10, 40e3, "P", RHO, VP, VS, geo.distance_m, 0.8, free_surface_factor=1.0).valid
+    assert source_parameters(1e-10, 40e3, "P", RHO, VP, VS, 0.05, 0.8, free_surface_factor=1.0).valid
 
 
 def test_source_parameters_unusable_plateau_frequency_skips_far_field_check():
