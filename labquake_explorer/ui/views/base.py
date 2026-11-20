@@ -13,7 +13,7 @@ Subclasses implement ``build_ui()`` to create their widgets and
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any, Optional
 
 import numpy as np
@@ -108,6 +108,19 @@ class BaseView(tk.Toplevel):
         self.app.unregister_child(self)
         self.destroy()
 
+    def has_unsaved_edits(self) -> bool:
+        """True while the view holds edits its Save has not stored (views that
+        track them override this)."""
+        return False
+
+    def confirm_leave(self, what: str = "go on") -> bool:
+        """Before a user's click that would drop unsaved edits: True to go on.
+        Only widget callbacks ask; the methods a script calls never do."""
+        if not self.has_unsaved_edits():
+            return True
+        return bool(messagebox.askyesno("Unsaved edits", f"The edits shown here are not saved.\n\n"
+                                        f"Discard them and {what}?", icon=messagebox.WARNING, parent=self))
+
 
 class EventView(BaseView):
     """A view of one event, with an event selector and a result namespace.
@@ -195,8 +208,19 @@ class EventView(BaseView):
         self.event_combobox.grid(row=grid.get("row", 0), column=grid.get("column", 0) + 1,
                                  padx=5, pady=5, sticky="w")
         self.refresh_event_selector()
-        self.event_combobox.bind("<<ComboboxSelected>>", self.on_event_selected)
+        self.event_combobox.bind("<<ComboboxSelected>>", self._event_chosen)
         return self.event_combobox
+
+    def _event_chosen(self, event=None) -> None:
+        if self.event_combobox.get() != str(self.event_idx) and not self.confirm_leave("open another event"):
+            self.refresh_event_selector()
+            return
+        self.on_event_selected(event)
+
+    def step_event_asked(self, step: int) -> None:
+        """The arrow buttons: ``step_event`` once unsaved edits may go."""
+        if self.confirm_leave("open another event"):
+            self.step_event(step)
 
     def refresh_event_selector(self) -> None:
         if self.event_combobox is None:

@@ -82,12 +82,13 @@ from labquake_explorer.analysis import spectrum as sp
 from labquake_explorer.analysis.spectrum import N_BOUNDS
 from labquake_explorer.analysis import spectrum_ensemble as se
 from labquake_explorer.data.spectrum_store import DEFAULT_SET, ensure_set, set_channels, set_name, set_names
-from labquake_explorer.data.settings import delete_setting, get_setting, set_setting
+from labquake_explorer.data.settings import get_setting, set_setting
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
 from labquake_explorer.ui.views.base import EventView
 from labquake_explorer.ui.views.scroll_panel import ScrollPanel
-from labquake_explorer.data.sources import (pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
+from labquake_explorer.data.migrate import upgrade_spectrum_settings
+from labquake_explorer.data.sources import (current_arrival_set, pick_waveform_block, read_arrivals, waveform_block, waveform_blocks,
                                             waveform_channels, waveform_data, waveform_time, waveform_trigger_time)
 
 RESULT_VERSION = 1
@@ -333,6 +334,7 @@ class PZTSpectrumView(EventView):
         self.record: Optional[dict] = None       # working record of the current channel
         self.result_set: str = DEFAULT_SET       # the result set shown and saved into
         self.calibration_table: Optional[dict] = None   # the loaded gain table (Calibration.as_dict + gain_db)
+        self.trigger_pick_set: Optional[str] = None     # pick set of a saved "picked arrival" record; None: current
         self._first_load = True
         super().__init__(app, run_idx, event_idx)
 
@@ -408,11 +410,11 @@ class PZTSpectrumView(EventView):
         ttk.Label(frame, text="Record:").grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self.record_combobox = ttk.Combobox(frame, width=14, state="readonly")
         self.record_combobox.grid(row=1, column=1, padx=4, pady=2, sticky="w")
-        self.record_combobox.bind("<<ComboboxSelected>>", self.on_record_selected)
+        self.record_combobox.bind("<<ComboboxSelected>>", self._record_chosen)
         ttk.Label(frame, text="Channel:").grid(row=2, column=0, padx=4, pady=2, sticky="e")
         self.channel_combobox = ttk.Combobox(frame, width=14, state="readonly")
         self.channel_combobox.grid(row=2, column=1, padx=4, pady=2, sticky="w")
-        self.channel_combobox.bind("<<ComboboxSelected>>", self.on_channel_selected)
+        self.channel_combobox.bind("<<ComboboxSelected>>", self._channel_chosen)
         ttk.Label(frame, text="Trigger:").grid(row=3, column=0, padx=4, pady=2, sticky="e")
         self.trigger_combobox = ttk.Combobox(frame, width=14, state="readonly", values=list(TRIGGERS))
         self.trigger_combobox.set(TRIGGER_EVENT_TIME)
@@ -423,7 +425,7 @@ class PZTSpectrumView(EventView):
         self.set_combobox.set(DEFAULT_SET)
         self.set_combobox.grid(row=4, column=1, padx=4, pady=2, sticky="w")
         for sequence in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
-            self.set_combobox.bind(sequence, self.on_set_changed, add="+")
+            self.set_combobox.bind(sequence, self._set_chosen, add="+")
         ttk.Label(frame, text="type a new name to start another set (e.g. BAC, EGF)",
                   foreground="#606060").grid(row=5, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w")
 
@@ -668,6 +670,33 @@ class PZTSpectrumView(EventView):
         self.record_combobox.set(self.record_key or "")
         self._load_record()
 
+    def has_unsaved_edits(self) -> bool:
+        """The channel has a saved record and the controls now give a different one."""
+        saved = getattr(self, "_saved_for_compare", None)
+        return (isinstance(saved, dict) and isinstance(self.record, dict)
+                and self.compare_with_saved(saved) != "matches the saved record")
+
+    def _record_chosen(self, event=None) -> None:
+        if self.record_combobox.get().strip() != self.record_key and not self.confirm_leave("open another record"):
+            self.record_combobox.set(self.record_key or "")
+            return
+        self.on_record_selected(event)
+
+    def _channel_chosen(self, event=None) -> None:
+        if not self.confirm_leave("open another channel"):
+            channel = getattr(self, "_shown_channel", None)
+            if channel is not None:
+                self.channel_combobox.set(self._channel_label(channel))
+            return
+        self.on_channel_selected(event)
+
+    def _set_chosen(self, event=None) -> None:
+        typed = self.set_combobox.get().strip()
+        if typed and typed != self.result_set and not self.confirm_leave(f"open result set '{typed}'"):
+            self.set_combobox.set(self.result_set)
+            return
+        self.on_set_changed(event)
+
     def on_record_selected(self, event=None) -> None:
         key = self.record_combobox.get().strip()
         if key and key != self.record_key:
@@ -887,6 +916,7 @@ class PZTSpectrumView(EventView):
         self._clear_channel_state()
         self._saved_for_compare = None
         channel = self.current_channel()
+        self._shown_channel = channel
         rec = self.saved_channels().get(channel) if channel is not None else None
         if not isinstance(rec, dict):
             self.apply_sensor(self.experiment_sensor(channel))      # the sensor's own stored values, if any
@@ -1004,6 +1034,7 @@ class PZTSpectrumView(EventView):
     def apply_record(self, rec: dict) -> None:
         """Put a record's parameters into the controls."""
         g = rec.get
+        self.trigger_pick_set = g("trigger_pick_set") if isinstance(g("trigger_pick_set"), str) else None
         self.trigger_combobox.set(g("trigger", TRIGGER_EVENT_TIME) if g("trigger") in TRIGGERS else TRIGGER_EVENT_TIME)
         self.pre_var.set(_text(g("pre_ms", DEFAULTS["pre_ms"])))
         self.post_var.set(_text(g("post_ms", DEFAULTS["post_ms"])))
@@ -1173,25 +1204,7 @@ class PZTSpectrumView(EventView):
                      "attenuation": copy.deepcopy(self.attenuation_table)}
             set_setting(data, entry, SETTING, SETS_SETTING, name, "sensors", key)
         set_setting(data, name, SETTING, CURRENT_SET_SETTING)
-        self._move_flat_settings()
-
-    def _move_flat_settings(self) -> None:
-        """The ``settings`` and ``sensors`` a file kept directly under
-        ``analysis['pzt_spectrum']`` (written before result sets) belong to the
-        default set; what the default set already has wins."""
-        data = self.data_manager.data
-        for key in ("settings", "sensors"):
-            flat = get_setting(data, SETTING, key)
-            if flat is None:
-                continue
-            if isinstance(flat, dict):
-                if key == "sensors":
-                    for sensor, entry in flat.items():
-                        if get_setting(data, SETTING, SETS_SETTING, DEFAULT_SET, key, sensor) is None:
-                            set_setting(data, entry, SETTING, SETS_SETTING, DEFAULT_SET, key, sensor)
-                elif get_setting(data, SETTING, SETS_SETTING, DEFAULT_SET, key) is None:
-                    set_setting(data, flat, SETTING, SETS_SETTING, DEFAULT_SET, key)
-            delete_setting(data, SETTING, key)
+        upgrade_spectrum_settings(data)          # settings kept before result sets belong to the default set
 
     # ---------------------------------------------------------- parameters
     def read_parameters(self) -> dict:
@@ -1317,13 +1330,16 @@ class PZTSpectrumView(EventView):
                                  "older event): use event_time or a picked arrival")
             t = t_rec
         else:
+            block = waveform_block(self.event, self.record_key)
+            name = self.trigger_pick_set or current_arrival_set(block)
             try:
-                picks = read_arrivals(waveform_block(self.event, self.record_key), self.event)
+                picks = read_arrivals(block, self.event, set_name=name)
                 arrivals = np.asarray(picks["arrival_time"], dtype=float).ravel()
                 t = float(arrivals[p["channel"]])
             except (KeyError, TypeError, ValueError, IndexError):
-                raise ValueError(f"no picked arrival for channel {p['channel']} "
+                raise ValueError(f"no picked arrival for channel {p['channel']} in pick set {name!r} "
                                  f"({self.record_key}: run Pick Arrivals on this record first)") from None
+            p["trigger_pick_set"] = name
         if not math.isfinite(t):
             raise ValueError("trigger time is not finite")
         if not (self.strain_time[0] <= t <= self.strain_time[-1]):
@@ -1529,7 +1545,8 @@ class PZTSpectrumView(EventView):
                      fit: sp.SpectralFit) -> dict:
         """The JSON-like record stored per channel.
 
-        Keys: version, channel, trigger, trigger_time_s, fs_hz, pre_ms, post_ms,
+        Keys: version, channel, trigger, trigger_pick_set (the Pick Arrivals set a
+        "picked arrival" trigger came from), trigger_time_s, fs_hz, pre_ms, post_ms,
         taper, baseline, highpass_hz, remove_step, calibration_path,
         calibration_unit, calibration_db, calibration_divisor, t_star_s, fmin_hz, fmax_hz,
         bins_per_decade, snr_min, n_fixed, n_max (the ceiling of a free n;
@@ -1548,6 +1565,7 @@ class PZTSpectrumView(EventView):
             "field": p.get("field"),
             "channel": int(p["channel"]),
             "trigger": p["trigger"],
+            "trigger_pick_set": p.get("trigger_pick_set") if p["trigger"] == TRIGGER_PICKED else None,
             "trigger_time_s": float(trigger_time),
             "fs_hz": float(spectrum.meta.get("fs", float("nan"))),
             "pre_ms": float(p["pre_ms"]),
@@ -1813,6 +1831,8 @@ class PZTSpectrumView(EventView):
         """Merge the current channel's record into the selected record's
         ``spectrum`` map (keys ``'ch<k>'``).  Channels of this record still in
         the older event-level map move here too, legacy digit keys renamed."""
+        if getattr(self, "_compute_after_id", None) is not None:   # an edit still waiting for the keys to settle
+            self.schedule_compute(now=True)
         if not isinstance(self.record, dict):
             self.status_var.set("nothing to save - the current controls give no spectrum")
             return False

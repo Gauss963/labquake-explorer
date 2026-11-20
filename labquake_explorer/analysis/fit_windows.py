@@ -14,7 +14,8 @@ the record allows:
 
 * before: the window ends ``before_gap_s`` ahead of the onset, where the slip
   rate, followed back from ``t_i``, last rose through ``onset_fraction`` of
-  its value at ``t_i``; the gap keeps the precursory slip out of the line.  It
+  the event's peak rate (the largest from ``t_i`` to ``t_i + min_start_s``,
+  so the rule does not depend on the t_i method); the gap keeps the precursory slip out of the line.  It
   starts no earlier than the previous event, and is shortened (and flagged)
   when it does not fit.  The slope of its line is the sensor's background
   (pre-event) slip rate.
@@ -38,8 +39,8 @@ the record allows:
   by hand.  A decay window that would run past the next event or the end of
   the record is moved earlier, to the latest start that fits, and flagged.
 
-A sensor whose background rate is more than ``creep_ratio`` of its slip rate
-at ``t_i`` creeps nearly as fast before the event as it slips during it: its
+A sensor whose background rate is more than ``creep_ratio`` of its peak slip
+rate creeps nearly as fast before the event as it slips during it: its
 coseismic step does not stand out from the creep, the windows (whichever
 rule placed them) decide much of its slip, and it is flagged for a check by
 hand.  A slip that comes out negative with the placed windows (``FLAG_NEGATIVE``,
@@ -75,7 +76,7 @@ DEFAULT_BACKGROUND_FACTOR = 5.0       # no plateau: the rate falls to this many 
 DEFAULT_RATE_SMOOTHING_S = 0.05       # ... averaged over this ...
 DEFAULT_MIN_AFTER_S = 0.2             # ... the window starting no earlier than t_i + this ...
 DEFAULT_MAX_DECAY_S = 0.8             # ... and no later than t_i + this (provisional, flagged)
-DEFAULT_CREEP_RATIO = 0.1             # flag a background rate above this fraction of the rate at t_i
+DEFAULT_CREEP_RATIO = 0.1             # flag a background rate above this fraction of the peak rate
 DEFAULT_ONSET_FRACTION = 0.1         # before: the onset, where the rate rises through this fraction
 DEFAULT_BEFORE_GAP_S = 0.4            # before: the window ends this far ahead of the onset
 DEFAULT_ONSET_SEARCH_S = 1.0          # before: the onset is searched back to t_i - this
@@ -103,7 +104,7 @@ class AutoWindows:
     kind: str = ""                    # KIND_PLATEAU or KIND_DECAY ("" without an after window)
     onset_s: float = float("nan")     # the onset, relative to the event time
     background_rate: float = float("nan")   # slope of the before line (unit/s)
-    creep_ratio: float = float("nan")       # background_rate / slip rate at t_i
+    creep_ratio: float = float("nan")       # background_rate / the event's peak slip rate (peak_rate)
     flags: list = field(default_factory=list)
 
 
@@ -153,16 +154,35 @@ def settle_time(time, rate_row, t_i: float, threshold: float,
     return float(t[k + below[0]] - t_i) if below.size else None
 
 
+def peak_rate(time, rate_row, t_i: float, span_s: float = DEFAULT_MIN_START_S) -> float:
+    """The event's peak slip rate: the largest finite rate from ``t_i`` to
+    ``t_i + span_s`` (an onset or step pick sits below the peak, a max-rate
+    pick on it); NaN when there is none.
+
+    shortcut: an onset pick more than ``span_s`` (0.1 s) ahead of the peak (a
+    rise slower than about 70 ms) misses the peak; widen the span if such
+    events need auto windows."""
+    t = np.asarray(time, dtype=float)
+    r = np.asarray(rate_row, dtype=float)
+    k0 = int(np.argmin(np.abs(t - t_i)))
+    k1 = max(k0 + 1, int(np.searchsorted(t, t_i + span_s, side="right")))
+    part = r[k0:k1]
+    part = part[np.isfinite(part)]
+    return float(part.max()) if part.size else float("nan")
+
+
 def choose_before(time, rate_row, t_i: float, *, limit_s: float,
                   width_s: float = DEFAULT_WIDTH_S, onset_fraction: float = DEFAULT_ONSET_FRACTION,
                   before_gap_s: float = DEFAULT_BEFORE_GAP_S,
-                  onset_search_s: float = DEFAULT_ONSET_SEARCH_S) -> tuple:
+                  onset_search_s: float = DEFAULT_ONSET_SEARCH_S,
+                  peak_span_s: float = DEFAULT_MIN_START_S) -> tuple:
     """``(window, onset, flags)``: the before window ``(start, end)`` and the
-    onset, both relative to ``t_i``; the window is None when less than
-    ``MIN_WIDTH_FRACTION`` of it fits after ``t_i + limit_s`` (``limit_s`` < 0)."""
+    onset (where the rate last rose through ``onset_fraction`` of
+    :func:`peak_rate`), both relative to ``t_i``; the window is None when less
+    than ``MIN_WIDTH_FRACTION`` of it fits after ``t_i + limit_s`` (``limit_s`` < 0)."""
     flags: list[str] = []
     k = int(np.argmin(np.abs(time - t_i)))
-    peak = float(rate_row[k])
+    peak = peak_rate(time, rate_row, t_i, peak_span_s)
     onset = 0.0
     if math.isfinite(peak) and peak > 0:
         first = int(np.searchsorted(time, t_i - onset_search_s, side="left"))
@@ -279,7 +299,7 @@ def auto_windows(time, data, event_time: float, t_shift_s: Sequence[float], rate
         t_i = event_time + shift
         before, onset, flags_b = choose_before(t, r[i], t_i, limit_s=before_limit - shift, width_s=width_s,
                                                onset_fraction=onset_fraction, before_gap_s=before_gap_s,
-                                               onset_search_s=onset_search_s)
+                                               onset_search_s=onset_search_s, peak_span_s=min_start_s)
         background = float("nan")
         if before is not None:
             line = fit_line(t, d[i], t_i, before)
@@ -292,7 +312,7 @@ def auto_windows(time, data, event_time: float, t_shift_s: Sequence[float], rate
                                       rate_smoothing_s=rate_smoothing_s, min_after_s=min_after_s,
                                       max_decay_s=max_decay_s)
         ratio = float("nan")
-        peak = float(r[i][int(np.argmin(np.abs(t - t_i)))])
+        peak = peak_rate(t, r[i], t_i, min_start_s)
         if math.isfinite(background) and math.isfinite(peak) and peak > 0:
             ratio = background / peak
             if ratio > creep_ratio:
@@ -312,6 +332,6 @@ __all__ = [
     "MIN_WIDTH_FRACTION", "FLAG_NO_DECAY", "FLAG_NO_BACKGROUND", "FLAG_CREEP", "FLAG_NEGATIVE", "FLAG_NO_ROOM_AFTER",
     "FLAG_AFTER_MOVED",
     "FLAG_NO_ONSET", "FLAG_BEFORE_SHORT", "FLAG_NO_ROOM_BEFORE", "FLAG_NO_RATE", "AutoWindows",
-    "after_line_values", "plateau_start",
+    "after_line_values", "plateau_start", "peak_rate",
     "settle_time", "choose_before", "choose_after", "auto_windows",
 ]

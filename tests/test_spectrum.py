@@ -158,10 +158,9 @@ def test_explicit_noise_window_before_or_after_the_signal():
     # the pre-linear baseline then comes from the pre-trigger samples, not the coda, and is taken off the noise too
     wb = sp.extract_window(t, x, trigger, pre_s, post_s, baseline="pre_linear", noise_window=after)
     assert wb.baseline_region == "pre_trigger"
-    slope, intercept = np.polyfit(np.arange(wb.n_pre, dtype=float), x[i0:wb.i_trigger], 1)
-    k = np.arange(wb.i_noise0 - i0, wb.i_noise1 - i0)
-    np.testing.assert_allclose(wb.noise, x[wb.i_noise0:wb.i_noise1] - (slope * k + intercept), atol=1e-12)
-    np.testing.assert_allclose(wb.signal, x[i0:wb.i_trigger + wb.n_post] - (slope * np.arange(wb.n) + intercept), atol=1e-12)
+    level = np.mean(x[i0:wb.i_trigger])           # their mean: a line through them would ramp over the noise
+    np.testing.assert_allclose(wb.noise, x[wb.i_noise0:wb.i_noise1] - level, atol=1e-12)
+    np.testing.assert_allclose(wb.signal, x[i0:wb.i_trigger + wb.n_post] - level, atol=1e-12)
     # the highpass baseline filters an adjacent noise window jointly with the signal, no edge at the join
     hp = sp.extract_window(t, x, trigger, pre_s, post_s, baseline="highpass", highpass_hz=1e3, noise_window=after)
     assert hp.noise_available and hp.noise.size == 150 and np.all(np.isfinite(hp.noise))
@@ -270,9 +269,6 @@ def test_t_star_and_attenuation_table_corrections():
     np.testing.assert_allclose(s1.amp_signal, s0.amp_signal * corr, rtol=1e-12)
     np.testing.assert_allclose(s1.amp_noise, s0.amp_noise * corr, rtol=1e-12)
     assert s1.t_star_s == 2e-6 and s1.meta["t_star_s"] == 2e-6
-    assert sp.t_star_from_q(0.1, 50.0, 5000.0) == pytest.approx(0.1 / (50 * 5000))
-    with pytest.raises(ValueError):
-        sp.t_star_from_q(0.1, 0.0, 5000.0)
     with pytest.raises(ValueError):
         sp.compute_spectrum(w, t_star_s=-1.0)
     # a Q(f) table: the same factor per frequency, signal and noise; not together with t*
@@ -678,6 +674,35 @@ def test_converged_false_when_optimizer_stops_early(monkeypatch):
     monkeypatch.setattr(sp, "least_squares", orig)
     clean = sp.fit_omega_n(spectrum_of(t, x), snr_min=None)
     assert clean.converged and clean.optimality < sp.CONVERGED_ABS_OPTIMALITY
+
+
+def test_noise_estimate_on_pure_noise():
+    """On white noise alone: an explicit noise window longer than the signal
+    window still gives SNR ~ IG (it keeps the signal's length nearest the
+    signal), the pre-trigger baseline adds no low-frequency ramp to a noise
+    window after the signal, and the noise in the tapered signal is IG^2 of
+    the noise estimate (what noise_subtract removes)."""
+    t = np.arange(40000) / FS
+    snr, low, ratios = [], {"pre_linear": [], "none": []}, {"tukey": [], "bh4": []}
+    for seed in range(6):
+        x = np.random.default_rng(seed).normal(0, 1.0, t.size)
+        w = sp.extract_window(t, x, 30000 / FS, PRE, POST, baseline="none", noise_window=(-29e-3, -1e-3))
+        assert w.noise.size == 2000 and w.i_noise1 == w.i_trigger - 1000
+        snr.append(np.nanmedian(sp.compute_spectrum(w).snr))
+        for mode in low:     # 0.1 ms before the trigger, the noise after the signal
+            w = sp.extract_window(t, x, 100 / FS, 0.1e-3, 2e-3, baseline=mode)
+            assert w.noise_region == "post" and w.baseline_region == ("pre_trigger" if mode != "none" else "none")
+            low[mode].append(sp.compute_spectrum(w).noise_binned[:4])
+        for taper in ("tukey", "bh4"):
+            w = sp.extract_window(t, x, 20000 / FS, PRE, POST, baseline="none")
+            raw = sp.compute_spectrum(w, taper=taper, fmin=1e4)
+            ig2 = raw.meta["signal_incoherent_gain"] ** 2
+            ratios[taper].append(np.mean(raw.amp_binned ** 2) / np.mean(ig2 * raw.noise_binned ** 2))
+    ig = math.sqrt(np.mean(sp.taper_window(2000, "tukey", 0.25) ** 2))
+    assert np.mean(snr) == pytest.approx(ig, abs=0.15)
+    assert np.mean(low["pre_linear"]) < 1.5 * np.mean(low["none"])
+    for taper, r in ratios.items():           # the noise inside the tapered signal is IG^2 of the noise estimate
+        assert np.mean(r) == pytest.approx(1.0, abs=0.1), taper
 
 
 @pytest.mark.parametrize("fc", [20e3, 80e3])

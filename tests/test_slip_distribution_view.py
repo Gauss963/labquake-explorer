@@ -235,6 +235,15 @@ def test_a_typed_value_is_applied_before_save_navigation_and_dropped_on_close(sl
     view.schedule(view.on_t_shift_edited)
     view.step_sensor(+1)                                  # goes to sensor 2, then the view moves on
     assert view.sensor == 3 and view.t_shift[2] == pytest.approx(0.013) and view.methods[3] == cs.METHOD_MAX_RATE
+    # the arrows ask before the edit (t_i of sensor 2 = 13 ms, not saved) goes; "No" stays
+    from tkinter import messagebox
+    asked = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(messagebox, "askyesno", lambda *a, **k: asked.append(a) or False)
+        assert view.has_unsaved_edits()
+        event_idx = view.event_idx
+        view.next_event_button.invoke()
+        assert len(asked) == 1 and view.event_idx == event_idx and view.t_shift[2] == pytest.approx(0.013)
     view.before_end_var.set("abc")                        # a bad value in an entry is never saved past
     assert not view.save() and "not saved" in view.status_var.get()
     assert view.event["slip_analysis"]["t_shift_s"][2] == pytest.approx(0.0125)
@@ -300,7 +309,8 @@ def test_mouse_events_grab_handles_and_drags_start_from_the_windows_shown(slip_a
     view.on_motion(mouse("motion_notify_event", ti + 0.5))
     view.on_release(mouse("button_release_event", ti + 0.5))
     assert view._drag is None and view.methods[4] == cs.METHOD_MANUAL
-    assert view.t_shift[4] == pytest.approx(ti + 0.5, abs=0.02)
+    one_px = abs(ax.transData.inverted().transform((1.0, 0.0))[0] - ax.transData.inverted().transform((0.0, 0.0))[0])
+    assert view.t_shift[4] == pytest.approx(ti + 0.5, abs=one_px)    # mouse events carry whole pixels
     ti = view.t_shift[4]
     view.on_press(mouse("button_press_event", 1.25, dx_px=-3))
     assert view._drag["what"] == "after_start"
@@ -1015,9 +1025,11 @@ def test_waveform_field_and_burst_tab(slip_app):
     with opened(slip_app, 1) as view:
         assert list(view.field_combobox["values"]) == ["slip", "waveform/elsys"] and view.field == "slip"
         assert view.pzt is None
+        assert view.save()
         view.field_combobox.set("waveform/elsys")
         view.on_field_selected()
         assert view.field == "waveform/elsys" and view.time.size == 120000 and view.pzt is not None
+        assert "the event's record is for slip, Save replaces it" in view.status_var.get()
         assert view.start_s == pytest.approx(-0.04, abs=1e-3) and view.end_s == pytest.approx(0.02, abs=1e-3)
         assert view.result is not None and view.result.window_mode == "lines"
         view.select_t_i_method(cs.METHOD_BURST)

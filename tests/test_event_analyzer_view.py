@@ -131,22 +131,23 @@ def test_dragging_onto_nan_gap_snaps_to_finite_sample(app, view):
     view.plot_data()
     view.plot_picked_points()
     marker = view.markers[0]
-    view.current_artist = marker
-    view.currently_dragging = True
-    view.offset = [0.0, 0.0]
+    view.picker.current_artist = marker
+    view.picker.currently_dragging = True
+    view.picker.offset = [0.0, 0.0]
     ax = view.ax
     target_x = float(view.data_x[150])
     target_y = float(np.nanmean(y))
     px, py = ax.transData.transform((target_x, target_y))
-    view.on_motion(MouseEvent("motion_notify_event", view.canvas, px, py))
+    view.picker.on_motion(MouseEvent("motion_notify_event", view.canvas, px, py))
     idx = view.picked_idx[0]
     assert not 100 <= idx < 200
+    assert view.loading_line.get_data()[0][0] == view.data_x[idx]          # the line follows the drag
     assert np.isfinite(view.data_y[idx]) and np.isfinite(marker.center[1])
     # an all-NaN trace leaves the pick alone instead of stranding it
     y[:] = np.nan
     view.plot_data()
     before = list(view.picked_idx)
-    view.on_motion(MouseEvent("motion_notify_event", view.canvas, px, py))
+    view.picker.on_motion(MouseEvent("motion_notify_event", view.canvas, px, py))
     assert view.picked_idx == before
 
 

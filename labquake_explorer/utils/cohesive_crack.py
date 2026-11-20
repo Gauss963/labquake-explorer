@@ -1,20 +1,9 @@
 """Cohesive crack analytical calculations module."""
 import numpy as np
-import matplotlib.pyplot as plt
 
 class CohesiveCrack:
     """Analytical calculations for cohesive crack models."""
     
-    default_params = {
-        'Gamma': 0.21,   # Fracture energy (J/m^2)
-        'E': 51e9,       # Young's modulus (Pa)
-        'nu': 0.25,      # Poisson's ratio
-        'C_f': 2404,     # Rupture speed (m/s)
-        'C_s': 2760,     # Shear wave speed (m/s)
-        'C_d': 4790,     # Longitudinal wave speed (m/s)
-        'X_c': 13.8e-3   # Cohesive zone size (m)
-    }
-
     @classmethod
     def delta_sigmas(cls, x, y, X_c, C_f, C_s, C_d, nu, Gamma, E):
         """Calculate stress fluctuations with explicit parameters."""
@@ -61,34 +50,6 @@ class CohesiveCrack:
     @staticmethod
     def compute_tau_p(K2, X_c):
         return K2 * np.sqrt(9 * np.pi / (32 * X_c))
-
-    @classmethod
-    def plot_stress_fluctuation(cls, output_path='./Plot/example_xx.pdf'):
-        """Plot stress fluctuation with configurable parameters."""
-        y_values = [1e-8, 0.1e-3, 0.5e-3, 1.0e-3, 2.0e-3, 5e-3, 10e-3, 15e-3]
-        x = np.linspace(-50e-3, 50e-3, 8192)
-
-        plt.figure(figsize=(8, 6))
-        for i, y in enumerate(y_values):
-            Sxy, _ = cls.delta_sigmas(x, y, 
-                                    cls.default_params['X_c'],
-                                    cls.default_params['C_f'],
-                                    cls.default_params['C_s'],
-                                    cls.default_params['C_d'],
-                                    cls.default_params['nu'],
-                                    cls.default_params['Gamma'],
-                                    cls.default_params['E'])
-            plt.plot(x * 1000, Sxy / 1e5 + i * 5, '-.', label=f'y = {y * 1e3:.1f} mm')
-
-        plt.xlabel('Rupture tip position x (mm)')
-        plt.ylabel('Stress fluctuation (MPa)')
-        plt.title('Stress fluctuation along the fault')
-        plt.axvline(0, color='k', linestyle='--', linewidth=1)
-        plt.legend()
-        plt.grid()
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=900)
-        plt.close()
 
     @staticmethod
     def _M_of_z(tau_p, X_c, z):
@@ -260,10 +221,19 @@ def cohesive_gamma(tau_p, X_c, C_f, C_s, C_d, nu, E) -> float:
     return float((tau_p / unit) ** 2) if np.isfinite(unit) and unit > 0 else float("nan")
 
 
-def main():
-    """Example usage of CohesiveCrack"""
-    crack = CohesiveCrack()
-    crack.plot_stress_fluctuation()
+def voltage_to_strain(raw_voltage):
+    """Strain from the voltage of a quarter-bridge strain gauge: excitation
+    4.98 V, gauge factor 2.12, amplifier gain 1000."""
+    Vex = 4.98    # excitation voltage (V)
+    GF = 2.12     # gauge factor
+    Gain = 1000   # amplification
+    return raw_voltage / Vex / Gain * 2 / GF
 
-if __name__ == "__main__":
-    main()
+
+def stress_to_strain(E, poisson_ratio, sigma_xx, sigma_xy, sigma_yy):
+    """Plane-stress Hooke's law: ``(e_xx, e_xy, e_yy)`` from the stress
+    components, with Young's modulus ``E`` in the stresses' unit."""
+    epsilon_xx = (sigma_xx - poisson_ratio * sigma_yy) / E
+    epsilon_yy = (sigma_yy - poisson_ratio * sigma_xx) / E
+    epsilon_xy = (1 + poisson_ratio) / E * sigma_xy
+    return epsilon_xx, epsilon_xy, epsilon_yy

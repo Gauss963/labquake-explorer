@@ -173,3 +173,46 @@ def test_hdf5_legacy_file_without_container_markers(tmp_path):
     assert isinstance(other.get_data("runs"), list)
     assert [e["event_time"] for e in other.get_data("runs/[0]/events")] == [1.0, 2.0]
     assert other.get_data("runs/[0]/channels/[0]/warnings") == ["one"]   # the string dataset stays a list
+
+
+def test_save_safety(tmp_path, dm):
+    """Nothing the user saved is dropped without an error: unreadable members
+    block a save over their file, unstorable values fail the save, a failed load
+    keeps the experiment and its folder, and Save As keeps raw links working."""
+    import os
+    from pathlib import Path
+    path = tmp_path / "exp.h5"
+    dm.data["runs"][0]["strain"] = {"format": "tpc5", "filename": "raw/run1.tpc5", "time_offset": 0.0,
+                                    "fields": ["a"], "channel_numbers": [1], "blocks": []}
+    dm.save_file(path)
+    os.chmod(path, 0o644)
+    with h5py.File(path, "a") as f:
+        f["runs/0/broken"] = h5py.SoftLink("/nowhere")
+    m = loaded(path)
+    assert not m.modified() and m.load_errors and "broken" in m.load_errors[0]
+    with pytest.raises(ValueError, match="could not be read"):
+        m.save_file(path)
+    # a value of a type the file cannot hold fails the save and keeps the old file
+    other = tmp_path / "copy.h5"
+    m.data["runs"][0]["bad"] = {1, 2}
+    assert m.modified()
+    with pytest.raises(TypeError, match="bad"):
+        m.save_file(other)
+    assert not other.exists()
+    del m.data["runs"][0]["bad"]
+    # Save As into another folder: the raw link still points at the same file; the mode stays
+    sub = tmp_path / "reanalysis"
+    sub.mkdir()
+    m.save_file(sub / "exp.h5")
+    assert m.data_path == sub / "exp.h5" and m.load_errors == [] and not m.modified()
+    assert m.event_processor.base_dir == sub
+    assert loaded(sub / "exp.h5").get_data("runs/[0]/strain/filename") == os.path.join("..", "raw", "run1.tpc5")
+    m.save_file(path)                                 # the copy has everything memory has: saving over is fine now
+    assert loaded(path).get_data("runs/[0]/strain/filename") == os.path.join("raw", "run1.tpc5")
+    assert os.name == "nt" or os.stat(path).st_mode & 0o777 == 0o644   # Windows has no mode bits
+    # a failed load changes neither the data nor the folder raw files are read from
+    bad = sub / "broken.h5"
+    bad.write_bytes(b"not hdf5")
+    pytest.raises(OSError, m.load_file, bad)
+    assert m.data_path == path and m.event_processor.base_dir == Path(tmp_path)
+    assert m.get_data("runs/[0]/strain/filename") == os.path.join("raw", "run1.tpc5")

@@ -163,6 +163,14 @@ def test_opens_computed_and_fits_the_uncalibrated_channels(brune_app, view):
     time = np.asarray(event["strain"]["original"]["time"], dtype=float)
     assert view.window.i_trigger == int(np.argmin(np.abs(time - arrivals[TANH_CH])))
     assert view.record["trigger"] == TRIGGER_PICKED and view.record["trigger_time_s"] == pytest.approx(arrivals[TANH_CH])
+    assert view.record["trigger_pick_set"] == "default"
+    # a pick set saved later becomes the current one; the saved record keeps reading the set it was made with
+    assert view.save()
+    from labquake_explorer.data.sources import write_arrivals
+    write_arrivals(event["strain"], {"arrival_time": arrivals + 1e-4}, event, set_name="manual2")
+    view.set_channel(BRUNE_CH)
+    view.set_channel(TANH_CH)
+    assert view.record["trigger_pick_set"] == "default" and "matches the saved record" in view.status_var.get()
     view.trigger_combobox.set(TRIGGER_EVENT_TIME)
     # the tanh step removed: the window ends near zero
     view.remove_step_var.set(True)
@@ -225,6 +233,20 @@ def test_controls_reach_the_analysis_live_and_errors_go_to_status(brune_app, vie
     assert view.record["pre_ms"] == 0.5 and view._compute_after_id is not None
     view.schedule_compute(now=True)                      # what the timer does
     assert view.record["pre_ms"] == 0.6 and view._compute_after_id is None
+    view.pre_var.set("0.55")
+    view.schedule_compute()
+    assert view.save() and view.record["pre_ms"] == 0.55  # Save straight after typing saves what was typed
+    assert stored(view)[f"ch{BRUNE_CH}"]["pre_ms"] == 0.55
+    # another channel chosen with the saved record edited asks first; "No" keeps the channel
+    from tkinter import messagebox
+    view.pre_var.set("0.6")
+    view.schedule_compute(now=True)
+    assert view.has_unsaved_edits()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(messagebox, "askyesno", lambda *a, **k: False)
+        view.channel_combobox.set(view._channel_label(TANH_CH))
+        view.channel_combobox.event_generate("<<ComboboxSelected>>")
+    assert view.current_channel() == BRUNE_CH and view.record["pre_ms"] == 0.6
     # a combobox and a checkbox recompute at once
     view.taper_combobox.set("bh4")
     view.taper_combobox.event_generate("<<ComboboxSelected>>")

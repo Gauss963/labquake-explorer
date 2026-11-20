@@ -12,7 +12,6 @@ from labquake_explorer.ui.views.run_signals_view import RunSignalsView
 from labquake_explorer.ui.views.pzt_spectrum_view import PZTSpectrumView
 from labquake_explorer.ui.views.source_scaling_view import SourceScalingView
 from labquake_explorer.ui.views.slip_distribution_view import SlipDistributionView
-from labquake_explorer.ui.views.misc import *
 
 __all__ = [
     'SimplePlotView',

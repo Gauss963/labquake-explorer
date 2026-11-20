@@ -450,8 +450,13 @@ class EventPickerView(RunView):
                 return 0
         picks = self.save_picks(refresh=False)
         fields = self.waveform_fields()
-        events = self.data_manager.event_processor.extract_events(
-            self.run, picks, window=max(-start, end), pre=-start, post=end, fields=fields)
+        try:
+            events = self.data_manager.event_processor.extract_events(
+                self.run, picks, window=max(-start, end), pre=-start, post=end, fields=fields,
+                require_sources=True)
+        except ValueError as e:
+            self.update_status(str(e))
+            return 0
         self.data_manager.set_data(f"{self.run_path}/events", events, add_key=True)
         self.result = {
             "version": RESULT_VERSION,

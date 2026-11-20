@@ -487,14 +487,14 @@ class SlipDistributionView(EventView):
         self.build_event_selector(frame, row=0, column=0)
         arrows = ttk.Frame(frame)                # previous / next event, as for the sensors
         arrows.grid(row=0, column=2, padx=(0, 4), sticky="w")
-        self.prev_event_button = ttk.Button(arrows, text="◀", width=2, command=lambda: self.step_event(-1))
+        self.prev_event_button = ttk.Button(arrows, text="◀", width=2, command=lambda: self.step_event_asked(-1))
         self.prev_event_button.pack(side="left")
-        self.next_event_button = ttk.Button(arrows, text="▶", width=2, command=lambda: self.step_event(+1))
+        self.next_event_button = ttk.Button(arrows, text="▶", width=2, command=lambda: self.step_event_asked(+1))
         self.next_event_button.pack(side="left")
         ttk.Label(frame, text="Field:").grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self.field_combobox = ttk.Combobox(frame, width=10, state="readonly")
         self.field_combobox.grid(row=1, column=1, padx=4, pady=2, sticky="w")
-        self.field_combobox.bind("<<ComboboxSelected>>", self.on_field_selected)
+        self.field_combobox.bind("<<ComboboxSelected>>", self._field_chosen)
 
         frame = ttk.LabelFrame(left, text="Sensor")
         frame.pack(fill="x", pady=4)
@@ -958,6 +958,21 @@ class SlipDistributionView(EventView):
         self.field_combobox.config(values=fields)
         self.field_combobox.set(field)
         self.load_field(field, saved)
+
+    def has_unsaved_edits(self) -> bool:
+        """The saved record's inputs differ from those shown, or, with no record
+        saved, a sensor's windows were placed by hand."""
+        if self.result is None:
+            return False
+        if isinstance(self.saved, dict):
+            return not self.matches_saved()
+        return any(m == cs.METHOD_MANUAL for m in self.methods)
+
+    def _field_chosen(self, event=None) -> None:
+        if self.field_combobox.get() != self.field and not self.confirm_leave("open another field"):
+            self.field_combobox.set(self.field)
+            return
+        self.on_field_selected(event)
 
     def on_field_selected(self, event=None) -> None:
         field = self.field_combobox.get()
@@ -3048,7 +3063,10 @@ class SlipDistributionView(EventView):
         if error is not None:
             parts.append(f"entry not applied: {error}")
         elif self.saved is None:
-            parts.append("not saved")
+            stored = self.event.get(self.result_key) if isinstance(self.event, dict) else None
+            other = stored.get("field") if isinstance(stored, dict) else None
+            parts.append(f"not saved; the event's record is for {other}, Save replaces it"
+                         if other is not None and str(other) != self.field else "not saved")
         else:
             parts.append("matches the saved record" if self.matches_saved() else "differs from the saved record (Save to update)")
         self.status_var.set(" | ".join(parts))

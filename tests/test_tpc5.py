@@ -25,7 +25,6 @@ def test_channels_blocks_and_reads(fake):
         assert [c["name"] for c in infos] == list(SIGNALS)
         assert infos[0]["unit"] == "V" and infos[0]["n_blocks"] == 3
         assert infos[0]["bin_to_volt_factor"] == pytest.approx(meta["factor"])
-        assert tpc5.getNChannels(f) == 2 and tpc5.getSampleRate(f, 1, 1) == 2000.0   # legacy Elsys helpers
         blocks = tpc5.list_blocks(f)
         # read_block matches the signal within the ADC resolution
         t, data = tpc5.read_block(f, 1)

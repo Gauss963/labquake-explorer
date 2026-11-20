@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from labquake_explorer.ui import context as C
 from labquake_explorer.ui.views import EventAnalyzerView
+from tests.synthetic import load_manager, make_experiment
 
 
 def labels(app, path):
@@ -118,3 +119,30 @@ def test_right_click_acts_on_the_row_under_the_pointer(app, monkeypatch):
     assert app.data_tree.selection() == (run,)
     assert "Plot Run Signals" in [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
     app.on_left_click(None)
+
+
+def test_load_closes_views_and_unsaved_changes_ask_first(tmp_path, app_from_file, monkeypatch):
+    """Loading another file closes the open views (they hold the old file's
+    data); loading or closing with unsaved changes asks first."""
+    from tkinter import filedialog, messagebox
+    from tests.synthetic import save_data
+    a, b = tmp_path / "a.h5", tmp_path / "b.h5"
+    save_data(make_experiment(recurrence=12.0)[0], a)
+    save_data(make_experiment(recurrence=12.0)[0], b)
+    app = app_from_file(a)
+    view = EventAnalyzerView(app, 0, 1)
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **kw: str(b))
+    answers = []
+    monkeypatch.setattr(messagebox, "askyesnocancel", lambda *a, **k: answers.append(a) or None)
+    app.load_file()                                   # unchanged: no question, the view is closed
+    assert answers == [] and not view.winfo_exists() and app.child_windows == []
+    assert app.data_manager.data_path == b
+    app.data_manager.set_data("runs/[0]/note", "edited", add_key=True)
+    app.load_file()                                   # changed, and the user cancels: nothing happens
+    assert len(answers) == 1 and app.data_manager.get_data("runs/[0]/note") == "edited"
+    app.on_closing()                                  # the close button asks too; cancel keeps the window
+    assert len(answers) == 2 and app.root.winfo_exists()
+    monkeypatch.setattr(messagebox, "askyesnocancel", lambda *a, **k: True)      # "save first"
+    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **kw: str(b))
+    app.load_file()
+    assert "note" in load_manager(b).get_data("runs/[0]")

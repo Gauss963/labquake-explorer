@@ -89,7 +89,10 @@ def ensure_set(store: dict, name: str = DEFAULT_SET) -> dict:
     if not isinstance(entry, dict):
         entry = {}
         store[SETS_KEY][name] = entry
-    if not isinstance(entry.get(CHANNELS_KEY), dict):
+    channels = entry.get(CHANNELS_KEY)
+    if isinstance(channels, (list, tuple)):      # the list an older HDF5 file gives: keep its records
+        entry[CHANNELS_KEY] = {f"ch{r.get('channel', i)}": r for i, r in enumerate(channels) if isinstance(r, dict)}
+    elif not isinstance(channels, dict):
         entry[CHANNELS_KEY] = {}
     return entry
 

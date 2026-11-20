@@ -69,7 +69,7 @@ class EventProcessor:
     # ------------------------------------------------------------- events
     def extract_events(self, run_data: Dict[str, Any], event_indices: List[int], window: float,
                        pre: Optional[float] = None, post: Optional[float] = None,
-                       dtype=np.float32, fields=None) -> List[Dict]:
+                       dtype=np.float32, fields=None, require_sources: bool = False) -> List[Dict]:
         """Slice the run around each picked index.
 
         ``window`` is the half-width in seconds; ``pre``/``post`` override it on
@@ -78,11 +78,19 @@ class EventProcessor:
         ``waveform`` record: None for the reference's ``event_fields`` (the
         PZTs, say), ``'all'`` for every channel of the recorder (the eddy
         probes at the full rate too), or a list of field names (channels a
-        recorder does not have are left out).
+        recorder does not have are left out).  With ``require_sources`` a raw
+        file that cannot be opened raises ``ValueError`` instead of giving
+        events without its waveform.
         """
         pre = float(window) if pre is None else float(pre)
         post = float(window) if post is None else float(post)
         sources = self.open_sources(run_data)
+        missing = [key for key in run_sources(run_data)
+                   if key not in sources or not Path(getattr(sources[key], "path", "")).is_file()]
+        if require_sources and missing:
+            where = self.base_dir if self.base_dir is not None else "an unsaved experiment"
+            raise ValueError(f"raw data of {', '.join(missing)} cannot be opened (files relative to {where}); "
+                             f"nothing extracted")
         time = np.asarray(run_data["time"], dtype=np.float64)
         events = []
         for i, idx in enumerate(event_indices):
@@ -90,6 +98,8 @@ class EventProcessor:
             try:
                 events.append(self.extract_event(run_data, event_time, pre, post, sources, dtype, fields))
             except Exception as exc:
+                if require_sources:
+                    raise ValueError(f"event {i} at {event_time:.4f} s: {exc}; nothing extracted") from exc
                 print(f"Warning: event {i} at {event_time:.4f} s: {exc}")
                 events.append({"event_time": event_time, "time": np.array([event_time]), "notes": [str(exc)]})
         return events
@@ -195,28 +205,3 @@ class EventProcessor:
             "raw": np.asarray(ref["raw"])[:, sl],
             "original": {"time": win.time, "raw": raw},
         }
-
-    # ------------------------------------------------------------- paths
-    def get_data_at_path(self, data: Dict[str, Any], path: str) -> Any:
-        """Get data at specified path"""
-        current = data
-        for key in path.split('/'):
-            if key[0] == '[' and key[-1] == ']':
-                key = int(key[1:-1])
-            current = current[key]
-        return current
-
-    def set_data_at_path(self, data: Dict[str, Any], path: str, value: Any, add_key: bool = False) -> None:
-        """Set data at specified path"""
-        parts = path.split('/')
-        current = data
-        for i, part in enumerate(parts[:-1]):
-            if part[0] == '[' and part[-1] == ']':
-                part = int(part[1:-1])
-            if part not in current and add_key:
-                current[part] = {} if i < len(parts) - 2 else None
-            current = current[part]
-        last_key = parts[-1]
-        if last_key[0] == '[' and last_key[-1] == ']':
-            last_key = int(last_key[1:-1])
-        current[last_key] = value

@@ -1,7 +1,6 @@
 """Pick three ranges on one event and read off slopes and differences."""
 import tkinter as tk
 from tkinter import ttk, messagebox
-import matplotlib.patches as patches
 import numpy as np
 
 from labquake_explorer.analysis.event_metrics import (
@@ -10,7 +9,8 @@ from labquake_explorer.analysis.event_metrics import (
 from labquake_explorer.data.channels import aligned_fields, get_field as resolve_field
 from labquake_explorer.ui.actions import register_view
 from labquake_explorer.ui.context import EVENT
-from labquake_explorer.ui.views.base import EventView, nearest_sample
+from labquake_explorer.ui.views.base import EventView
+from labquake_explorer.ui.views.point_picker import PointPicker
 
 MARKER_COLORS = ['#33CCC4', '#33CCC4', '#CC3366', '#CC3366', '#33CC66', '#33CC66']
 N_PICKS = 6
@@ -46,11 +46,7 @@ class EventAnalyzerView(EventView):
         self.data_x = np.array([])
         self.data_y = np.array([])
         self.data_t = np.array([])
-        self.markers = []
-        self.current_artist = None
-        self.currently_dragging = False
-        self.offset = [0, 0]
-        self.picked_idx = []
+        self.picker = None
         self.loading_line = None
         self.unloading_line = None
         self.delta_span = None
@@ -104,12 +100,22 @@ class EventAnalyzerView(EventView):
         self.figure.set_facecolor('#f5f5f5')
         self.ax = self.figure.add_subplot(111)
         self.ax.set_facecolor('#ffffff')
+        self.picker = PointPicker(self.ax, self.canvas, self.data_x, self.data_y, add_remove=False,
+                                  toolbar_active=self.toolbar_active, color=MARKER_COLORS,
+                                  on_drag=lambda position, idx: self.point_moved(position))
 
-        self.figure.canvas.mpl_connect('pick_event', self.on_pick)
-        self.figure.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.figure.canvas.mpl_connect('button_press_event', self.on_press)
-        self.figure.canvas.mpl_connect('button_release_event', self.on_release)
-        self.figure.canvas.mpl_connect('resize_event', self.on_resize)
+    @property
+    def picked_idx(self) -> list:
+        """The six picked sample indices (the picker's list)."""
+        return self.picker.picks if self.picker is not None else []
+
+    @picked_idx.setter
+    def picked_idx(self, value) -> None:
+        self.picker.picks = [int(i) for i in value]
+
+    @property
+    def markers(self) -> list:
+        return self.picker.markers if self.picker is not None else []
 
     def on_event_loaded(self):
         saved = self.load_results()
@@ -213,6 +219,7 @@ class EventAnalyzerView(EventView):
             self.data_t = np.asarray(time, dtype=float)
         else:
             self.data_t = np.arange(len(self.data_y), dtype=float)
+        self.picker.set_curve(self.data_x, self.data_y)
         self.ax.plot(self.data_x, self.data_y, zorder=-100, linewidth=1.5)
         self.ax.set_ylabel(self.item_y)
         self.ax.grid(True, linestyle='--', alpha=0.3)
@@ -226,11 +233,6 @@ class EventAnalyzerView(EventView):
         """Plot the marker points, the two range lines and the delta span"""
         if len(self.picked_idx) != N_PICKS or len(self.data_y) == 0:
             return
-        width, height = self.get_circle_dims()
-        for marker in self.markers:
-            if marker in self.ax.patches:
-                marker.remove()
-        self.markers = []
         for line in (self.loading_line, self.unloading_line):
             if line is not None and line in self.ax.lines:
                 line.remove()
@@ -238,12 +240,7 @@ class EventAnalyzerView(EventView):
 
         if max(self.picked_idx) >= len(self.data_y):
             self._set_default_point_positions()
-
-        for i, idx in enumerate(self.picked_idx):
-            marker = patches.Ellipse((self.data_x[idx], self.data_y[idx]), width=width, height=height,
-                                     color=MARKER_COLORS[i], fill=False, lw=2, picker=8, label=str(i))
-            self.ax.add_patch(marker)
-            self.markers.append(marker)
+        self.picker.draw_markers()
 
         self.loading_line, = self.ax.plot(*self._segment(0, 1), '--', color=MARKER_COLORS[0],
                                           linewidth=2, zorder=-50, label='Loading')
@@ -268,17 +265,6 @@ class EventAnalyzerView(EventView):
             except Exception:
                 pass
             self.delta_span = None
-
-    def get_circle_dims(self):
-        """Calculate appropriate dimensions for marker circles based on plot scaling"""
-        self.canvas.draw()
-        xl = self.ax.get_xlim()
-        yl = self.ax.get_ylim()
-        ratio = (yl[-1] - yl[0]) / (xl[-1] - xl[0])
-        fig_size = self.figure.get_size_inches()
-        ratio *= fig_size[0] / fig_size[1]
-        width = (xl[-1] - xl[0]) / fig_size[0] * 0.15
-        return width, width * ratio
 
     # ------------------------------------------------------------ analysis
     def update_analysis(self):
@@ -311,28 +297,17 @@ class EventAnalyzerView(EventView):
         textbox.config(state="readonly")
 
     # ------------------------------------------------------------- dragging
-    def on_pick(self, event):
-        if self.toolbar_active():
-            return
-        if self.current_artist is None and isinstance(event.artist, patches.Ellipse):
-            self.current_artist = event.artist
-            x0, y0 = self.current_artist.center
-            self.offset = [(x0 - event.mouseevent.xdata), (y0 - event.mouseevent.ydata)]
-
-    def on_press(self, event):
-        self.currently_dragging = True
-
-    def on_release(self, event):
-        self.current_artist = None
-        self.currently_dragging = False
-        self.on_resize(None)
-
     def move_point(self, point_idx: int, idx: int) -> None:
         """Move marker ``point_idx`` to sample ``idx`` and refresh lines and results."""
         idx = int(min(max(idx, 0), len(self.data_y) - 1))
         self.picked_idx[point_idx] = idx
         if point_idx < len(self.markers):
             self.markers[point_idx].set_center((self.data_x[idx], self.data_y[idx]))
+        self.point_moved(point_idx)
+        self.canvas.draw_idle()
+
+    def point_moved(self, point_idx: int) -> None:
+        """The lines, the span and the results after marker ``point_idx`` moved."""
         if point_idx in (0, 1):
             self.loading_line.set_data(*self._segment(0, 1))
         elif point_idx in (2, 3):
@@ -341,35 +316,6 @@ class EventAnalyzerView(EventView):
             self._remove_span()
             self._draw_span()
         self.update_analysis()
-        self.canvas.draw_idle()
-
-    def on_motion(self, event):
-        """Handle mouse motion events for dragging markers"""
-        if not self.currently_dragging or self.current_artist is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        if not isinstance(self.current_artist, patches.Ellipse):
-            return
-        try:
-            dx, dy = self.offset
-            cx, cy = event.xdata + dx, event.ydata + dy
-            # nearest FINITE sample: a NaN gap must never capture the marker
-            idx = nearest_sample(self.data_x, self.data_y, cx, cy, self.ax.get_xlim(), self.ax.get_ylim())
-            if idx is None:
-                return
-            self.move_point(int(self.current_artist.get_label()), idx)
-        except Exception as e:
-            print(f"Error in on_motion: {e}")
-
-    def on_resize(self, event):
-        """Handle window resize events to adjust marker sizes"""
-        if hasattr(self, 'ax') and self.markers:
-            width, height = self.get_circle_dims()
-            for marker in self.markers:
-                marker.set_width(width)
-                marker.set_height(height)
-            self.canvas.draw()
 
     # ---------------------------------------------------------------- save
     def apply_to_all_events(self, confirm=True):

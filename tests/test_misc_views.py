@@ -55,10 +55,14 @@ def test_slope_analyzer_on_a_run(app):
     xs, ys = view.slope_line.get_data()
     assert list(xs) == [truth.time[i0], truth.time[i1]]
     assert list(ys) == [truth.shear_stress[i0], truth.shear_stress[i1]]
-    # dragging-path update keeps the line and the readout in sync
-    view.picked_idx[1] = truth.event_indices[1] - 100
-    view.update_overlays()
-    view.update_readout()
+    # a drag keeps the line and the readout in sync
+    from matplotlib.backend_bases import MouseEvent
+    target = truth.event_indices[1] - 100
+    view.picker.current_artist, view.picker.currently_dragging = view.markers[1], True
+    px, py = view.ax.transData.transform((truth.time[target], truth.shear_stress[target]))
+    view.picker.on_motion(MouseEvent("motion_notify_event", view.canvas, px, py))
+    view.picker.on_release(None)
+    assert abs(view.picked_idx[1] - target) <= 50
     assert float(view.slope_textbox.get()) == pytest.approx(truth.loading_rate, rel=1e-6)
     assert view.slope_line.get_data()[0][1] == truth.time[view.picked_idx[1]]
     view.on_close()
@@ -101,14 +105,14 @@ def test_index_picker(app):
     assert view.index_textbox.get() == "[10, 20]"
     assert [m.center for m in view.markers] == [(view.data_x[10], view.data_y[10]),
                                                 (view.data_x[20], view.data_y[20])]
-    assert view.nearest_index(view.data_x[15], view.data_y[15]) == 15
+    assert view.picker.nearest_index(view.data_x[15], view.data_y[15]) == 15
     view.on_close()
     assert view not in app.child_windows
 
     # a drag onto a NaN gap snaps to a finite sample
     app.data_manager.get_data("runs/[0]/events/[1]")["shear_stress"][100:200] = np.nan
     view = IndexPickerView(app, item_y="runs/[0]/events/[1]/shear_stress")
-    idx = view.nearest_index(view.data_x[150], float(np.nanmean(view.data_y)))
+    idx = view.picker.nearest_index(view.data_x[150], float(np.nanmean(view.data_y)))
     assert not 100 <= idx < 200 and np.isfinite(view.data_y[idx])
     view.on_close()
 
