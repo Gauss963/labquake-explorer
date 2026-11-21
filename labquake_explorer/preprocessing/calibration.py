@@ -233,16 +233,48 @@ PRESSURE_PRESETS = {
     "2D-50cm": {"normal_v_per_mpa": 0.739, "normal_offset_v": 0.091, "shear_v_per_mpa": 1.087},
 }
 
+# Shear-line transducer calibrated in place against the e-pump (T0238, five runs, and T0239;
+# 2026-11): the e-pump pressure with the pump stopped, so that no flow gives no pressure drop
+# along the line, against the shear-line voltage at the same time, six points from 346 to
+# 1485 psi, plus 0 psi with the line unloaded (-16.5 mV): P = 59.147 V + 1.254 bar.  The
+# conversion behind Table B.1, P = 60.482 V - 5.497 bar, reads 70 to 94 psi low on this line
+# (and the shear presets above drop its offset as well).  With the pump running at 8 mL/min the
+# e-pump reads 24-29 psi more than the piston side, so only points without flow are used.
+# The normal line is not part of this calibration.
+SHEAR_LINE_CALIBRATIONS = {
+    "e-pump-2026-11": {"bar_per_v": 59.147, "bar_at_0_v": 1.254},
+}
+
+# MPa of shear stress per bar of shear-line oil pressure: 0.1 MPa/bar times the area of the
+# jacks pressed (12.67e-3 m^2 each; one on a 1D sample, three on the 2D one) over the fault area.
+SHEAR_MPA_PER_BAR = {
+    "1D-5cm": 0.1 * 12.67e-3 / (0.05 * 0.5),
+    "1D-10cm": 0.1 * 12.67e-3 / (0.10 * 0.5),
+    "2D-50cm": 0.1 * 3 * 12.67e-3 / (0.5 * 0.5),
+}
+
 
 def pressure_transducers(section: str = "1D-5cm", normal_source: str = "pressure_1",
-                         shear_source: str = "pressure_2") -> list:
-    """``normal_stress`` and ``shear_stress`` (MPa) from the two pressure voltages."""
+                         shear_source: str = "pressure_2", shear_calibration: Optional[str] = None) -> list:
+    """``normal_stress`` and ``shear_stress`` (MPa) from the two pressure voltages.
+
+    ``shear_calibration`` None keeps the shear factor of ``PRESSURE_PRESETS``; a key of
+    ``SHEAR_LINE_CALIBRATIONS`` (``"e-pump-2026-11"``) converts the shear line with that
+    transducer calibration instead, through the jack and fault areas of ``section``.
+    """
     p = PRESSURE_PRESETS[section]
+    if shear_calibration is None:
+        shear = Linear("shear_stress", shear_source, 1.0 / p["shear_v_per_mpa"], 0.0, "MPa")
+    else:
+        line, mpa_per_bar = SHEAR_LINE_CALIBRATIONS[shear_calibration], SHEAR_MPA_PER_BAR[section]
+        shear = Linear("shear_stress", shear_source, line["bar_per_v"] * mpa_per_bar,
+                       line["bar_at_0_v"] * mpa_per_bar, "MPa")
     return [
         Linear("normal_stress", normal_source, 1.0 / p["normal_v_per_mpa"],
                -p["normal_offset_v"] / p["normal_v_per_mpa"], "MPa"),
-        Linear("shear_stress", shear_source, 1.0 / p["shear_v_per_mpa"], 0.0, "MPa"),
+        shear,
     ]
 
 
-__all__ = ["Step", "Linear", "EddySlip", "Friction", "Calibration", "PRESSURE_PRESETS", "pressure_transducers"]
+__all__ = ["Step", "Linear", "EddySlip", "Friction", "Calibration", "PRESSURE_PRESETS", "SHEAR_LINE_CALIBRATIONS",
+           "SHEAR_MPA_PER_BAR", "pressure_transducers"]
