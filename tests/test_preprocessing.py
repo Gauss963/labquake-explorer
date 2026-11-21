@@ -5,7 +5,7 @@ from labquake_explorer.data import channels as C
 from labquake_explorer.data import sources as S
 from labquake_explorer.preprocessing import (
     Calibration, EddySlip, Friction, Linear, experiment, offset_from_trigger, parse_run_name,
-    pressure_transducers, run_from_sources, run_from_tpc5, run_from_tpc5_ni, slip_step_table,
+    pressure_transducers, run_from_sources, run_from_tpc5, run_from_tpc5_ni, slip_step_table, PRESSURE_MPA_PER_BAR,
 )
 from tests.synthetic import write_ni_npz, write_tpc5
 
@@ -43,6 +43,19 @@ def test_linear_friction_presets_and_run_names():
     for section, area in (("1D-5cm", 0.1), ("1D-10cm", 0.2)):
         assert P[section]["normal_v_per_mpa"] == pytest.approx(P["2D-50cm"]["normal_v_per_mpa"] * area * 9 / 3, rel=2e-3)
         assert P[section]["shear_v_per_mpa"] == pytest.approx(P["2D-50cm"]["shear_v_per_mpa"] * area * 3 / 1, rel=2e-3)
+    # both lines can use the in-place calibration against the e-pump instead of the Table B.1 factors
+    normal, shear = pressure_transducers("1D-5cm", calibration="e-pump-2026-11")
+    assert (normal.field, normal.source, shear.field, shear.source) == ("normal_stress", "pressure_1", "shear_stress", "pressure_2")
+    for volts, bar in ((0.0, 1.254), (1.0, 60.401), (2.0, 119.548)):          # P = 59.147 V + 1.254 bar
+        assert normal.factor * volts + normal.offset == pytest.approx(bar * 0.1 * 3 * 6.21e-3 / (0.05 * 0.5), rel=1e-12)
+        assert shear.factor * volts + shear.offset == pytest.approx(bar * 0.1 * 12.67e-3 / (0.05 * 0.5), rel=1e-12)
+    for section in ("1D-10cm", "2D-50cm"):                                       # same transducers, other areas
+        n, s = pressure_transducers(section, calibration="e-pump-2026-11")
+        assert n.factor / normal.factor == pytest.approx(PRESSURE_MPA_PER_BAR[section]["normal"] / PRESSURE_MPA_PER_BAR["1D-5cm"]["normal"])
+        assert s.factor / shear.factor == pytest.approx(PRESSURE_MPA_PER_BAR[section]["shear"] / PRESSURE_MPA_PER_BAR["1D-5cm"]["shear"])
+    assert [s.factor for s in pressure_transducers("1D-5cm")] == [1 / 0.222, 1 / 0.326]   # the default is unchanged
+    with pytest.raises(KeyError):
+        pressure_transducers("1D-5cm", calibration="no such calibration")
     # a missing source is skipped, not an error
     run2 = {"time": np.arange(5.0), "x": np.ones(5, dtype=np.float32)}
     Calibration(Linear("y", "nope", 2.0, unit="u"), Friction()).apply(run2)

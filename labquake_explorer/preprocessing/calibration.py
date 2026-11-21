@@ -234,9 +234,40 @@ PRESSURE_PRESETS = {
 }
 
 
+# Pressure transducers calibrated in place against the e-pump (T0238, five runs, and T0239;
+# 2026-11): the e-pump pressure with the pump stopped, so that no flow gives no pressure drop
+# along the line, against the shear-line voltage at the same time, six points from 346 to
+# 1485 psi, plus 0 psi with the line unloaded (-16.5 mV): P = 59.147 V + 1.254 bar, used for
+# both lines.  The conversion behind Table B.1, P = 60.482 V - 5.497 bar, reads 70 to 94 psi low
+# (and the shear presets above also drop its offset).  With the pump running at 8 mL/min the
+# e-pump reads 24-29 psi more than the piston side, so only points without flow are used.
+PRESSURE_CALIBRATIONS = {
+    "e-pump-2026-11": {"bar_per_v": 59.147, "bar_at_0_v": 1.254},
+}
+
+# MPa of stress per bar of oil pressure: 0.1 MPa/bar times the area of the jacks a line presses
+# over the fault area.  Normal jacks 6.21e-3 m^2 each (three on a 1D sample, nine on the 2D one),
+# shear jacks 12.67e-3 m^2 each (one on a 1D sample, three on the 2D one).
+PRESSURE_MPA_PER_BAR = {
+    "1D-5cm": {"normal": 0.1 * 3 * 6.21e-3 / (0.05 * 0.5), "shear": 0.1 * 12.67e-3 / (0.05 * 0.5)},
+    "1D-10cm": {"normal": 0.1 * 3 * 6.21e-3 / (0.10 * 0.5), "shear": 0.1 * 12.67e-3 / (0.10 * 0.5)},
+    "2D-50cm": {"normal": 0.1 * 9 * 6.21e-3 / (0.5 * 0.5), "shear": 0.1 * 3 * 12.67e-3 / (0.5 * 0.5)},
+}
+
+
 def pressure_transducers(section: str = "1D-5cm", normal_source: str = "pressure_1",
-                         shear_source: str = "pressure_2") -> list:
-    """``normal_stress`` and ``shear_stress`` (MPa) from the two pressure voltages."""
+                         shear_source: str = "pressure_2", calibration: Optional[str] = None) -> list:
+    """``normal_stress`` and ``shear_stress`` (MPa) from the two pressure voltages.
+
+    ``calibration`` None uses the factors of ``PRESSURE_PRESETS`` (Table B.1); a key of
+    ``PRESSURE_CALIBRATIONS`` (``"e-pump-2026-11"``) converts both lines with that transducer
+    calibration instead, through the jack and fault areas of ``section``.
+    """
+    if calibration is not None:
+        line, mpa_per_bar = PRESSURE_CALIBRATIONS[calibration], PRESSURE_MPA_PER_BAR[section]
+        return [Linear(field, source, line["bar_per_v"] * mpa_per_bar[kind], line["bar_at_0_v"] * mpa_per_bar[kind], "MPa")
+                for field, source, kind in (("normal_stress", normal_source, "normal"),
+                                            ("shear_stress", shear_source, "shear"))]
     p = PRESSURE_PRESETS[section]
     return [
         Linear("normal_stress", normal_source, 1.0 / p["normal_v_per_mpa"],
@@ -245,4 +276,5 @@ def pressure_transducers(section: str = "1D-5cm", normal_source: str = "pressure
     ]
 
 
-__all__ = ["Step", "Linear", "EddySlip", "Friction", "Calibration", "PRESSURE_PRESETS", "pressure_transducers"]
+__all__ = ["Step", "Linear", "EddySlip", "Friction", "Calibration", "PRESSURE_PRESETS", "PRESSURE_CALIBRATIONS",
+           "PRESSURE_MPA_PER_BAR", "pressure_transducers"]

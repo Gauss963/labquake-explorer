@@ -13,7 +13,8 @@ clocks; :mod:`.build` assembles run and experiment dicts in the layout the
 explorer reads.  Everything here is pure (no GUI, no global state).
 """
 from labquake_explorer.preprocessing.calibration import (
-    Calibration, EddySlip, Friction, Linear, pressure_transducers, PRESSURE_PRESETS,
+    Calibration, EddySlip, Friction, Linear, pressure_transducers, PRESSURE_PRESETS, PRESSURE_CALIBRATIONS,
+    PRESSURE_MPA_PER_BAR,
 )
 from labquake_explorer.preprocessing.alignment import offset_from_trigger, slip_step_table
 from labquake_explorer.preprocessing.build import (
@@ -22,6 +23,7 @@ from labquake_explorer.preprocessing.build import (
 
 __all__ = [
     "Calibration", "EddySlip", "Friction", "Linear", "pressure_transducers", "PRESSURE_PRESETS",
+    "PRESSURE_CALIBRATIONS", "PRESSURE_MPA_PER_BAR",
     "offset_from_trigger", "slip_step_table",
     "experiment", "parse_run_name", "run_from_sources", "run_from_tpc5", "run_from_tpc5_ni",
 ]
